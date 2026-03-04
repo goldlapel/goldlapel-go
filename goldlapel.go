@@ -129,9 +129,7 @@ func (gl *GoldLapel) Start() (string, error) {
 	gl.done = make(chan struct{})
 	go func() {
 		<-stderrDone
-		gl.mu.Lock()
 		gl.stderr = stderrBuf.String()
-		gl.mu.Unlock()
 		gl.cmd.Wait()
 		close(gl.done)
 	}()
