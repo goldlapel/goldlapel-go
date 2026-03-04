@@ -55,6 +55,7 @@ type GoldLapel struct {
 	cmd       *exec.Cmd
 	proxyURL  string
 	stderr    string
+	done      chan struct{} // closed when process exits
 	mu        sync.Mutex
 }
 
@@ -75,8 +76,14 @@ func (gl *GoldLapel) Start() (string, error) {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 
-	if gl.cmd != nil && gl.cmd.Process != nil && gl.cmd.ProcessState == nil {
-		return gl.proxyURL, nil
+	if gl.done != nil {
+		select {
+		case <-gl.done:
+			// Process exited, fall through to restart
+		default:
+			// Still running
+			return gl.proxyURL, nil
+		}
 	}
 
 	bin, err := FindBinary()
@@ -119,12 +126,14 @@ func (gl *GoldLapel) Start() (string, error) {
 			gl.port, int(startupTimeout.Seconds()), gl.stderr)
 	}
 
-	// Capture stderr reference for later
+	gl.done = make(chan struct{})
 	go func() {
 		<-stderrDone
 		gl.mu.Lock()
 		gl.stderr = stderrBuf.String()
 		gl.mu.Unlock()
+		gl.cmd.Wait()
+		close(gl.done)
 	}()
 
 	gl.proxyURL = MakeProxyURL(gl.upstream, gl.port)
@@ -136,27 +145,32 @@ func (gl *GoldLapel) Stop() error {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 
-	if gl.cmd == nil || gl.cmd.Process == nil || gl.cmd.ProcessState != nil {
+	if gl.done == nil {
 		return nil
+	}
+
+	// Check if already exited
+	select {
+	case <-gl.done:
+		gl.done = nil
+		gl.proxyURL = ""
+		return nil
+	default:
 	}
 
 	// SIGTERM for graceful shutdown
 	gl.cmd.Process.Signal(syscall.SIGTERM)
 
-	done := make(chan error, 1)
-	go func() {
-		done <- gl.cmd.Wait()
-	}()
-
 	select {
-	case <-done:
+	case <-gl.done:
 		// Exited gracefully
 	case <-time.After(shutdownTimeout):
 		// Force kill
 		gl.cmd.Process.Kill()
-		<-done
+		<-gl.done
 	}
 
+	gl.done = nil
 	gl.proxyURL = ""
 	return nil
 }
@@ -177,7 +191,15 @@ func (gl *GoldLapel) Port() int {
 func (gl *GoldLapel) Running() bool {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
-	return gl.cmd != nil && gl.cmd.Process != nil && gl.cmd.ProcessState == nil
+	if gl.done == nil {
+		return false
+	}
+	select {
+	case <-gl.done:
+		return false
+	default:
+		return true
+	}
 }
 
 // --- Singleton API ---
