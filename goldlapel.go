@@ -95,8 +95,6 @@ func (gl *GoldLapel) Start() (string, error) {
 	args = append(args, gl.extraArgs...)
 
 	gl.cmd = exec.Command(bin, args...)
-	gl.cmd.Stdin = nil
-	gl.cmd.Stdout = nil
 
 	stderrPipe, err := gl.cmd.StderrPipe()
 	if err != nil {
@@ -213,6 +211,9 @@ func Start(upstream string, opts ...Option) (string, error) {
 	defer singletonMu.Unlock()
 
 	if instance != nil && instance.Running() {
+		if instance.upstream != upstream {
+			return "", fmt.Errorf("Gold Lapel is already running for a different upstream. Call goldlapel.Stop() before starting with a new upstream.")
+		}
 		return instance.URL(), nil
 	}
 
