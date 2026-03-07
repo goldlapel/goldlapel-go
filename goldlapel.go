@@ -274,6 +274,9 @@ func FindBinary() (string, error) {
 	}
 
 	binaryName := fmt.Sprintf("goldlapel-%s-%s", osName, arch)
+	if osName == "linux" && isMusl(arch) {
+		binaryName += "-musl"
+	}
 	if osName == "windows" {
 		binaryName += ".exe"
 	}
@@ -291,6 +294,11 @@ func FindBinary() (string, error) {
 	}
 
 	return "", fmt.Errorf("Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, install the platform-specific package, or ensure 'goldlapel' is on PATH.")
+}
+
+func isMusl(arch string) bool {
+	_, err := os.Stat(fmt.Sprintf("/lib/ld-musl-%s.so.1", arch))
+	return err == nil
 }
 
 // --- URL rewriting ---
