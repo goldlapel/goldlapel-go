@@ -154,14 +154,18 @@ func (gl *GoldLapel) Stop() error {
 	default:
 	}
 
-	// SIGTERM for graceful shutdown
-	gl.cmd.Process.Signal(syscall.SIGTERM)
+	// Graceful shutdown: SIGTERM on Unix, Kill on Windows (no SIGTERM support)
+	if runtime.GOOS == "windows" {
+		gl.cmd.Process.Kill()
+	} else {
+		gl.cmd.Process.Signal(syscall.SIGTERM)
+	}
 
 	select {
 	case <-gl.done:
-		// Exited gracefully
+		// Exited
 	case <-time.After(shutdownTimeout):
-		// Force kill
+		// Force kill (only needed for Unix SIGTERM path)
 		gl.cmd.Process.Kill()
 		<-gl.done
 	}
@@ -270,6 +274,9 @@ func FindBinary() (string, error) {
 	}
 
 	binaryName := fmt.Sprintf("goldlapel-%s-%s", osName, arch)
+	if osName == "windows" {
+		binaryName += ".exe"
+	}
 	_, thisFile, _, ok := runtime.Caller(0)
 	if ok {
 		bundled := filepath.Join(filepath.Dir(thisFile), "bin", binaryName)
