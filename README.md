@@ -49,7 +49,7 @@ Gold Lapel is driver-agnostic. `Start` returns a connection string (`postgresql:
 Starts the Gold Lapel proxy (singleton) and returns the proxy connection string.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
-- `opts` — functional options: `WithPort(port)`, `WithExtraArgs(args...)`
+- `opts` — functional options: `WithPort(port)`, `WithConfig(config)`, `WithExtraArgs(args...)`
 
 ### `goldlapel.Stop() error`
 
@@ -77,7 +77,34 @@ Instance methods: `Start()`, `Stop()`, `URL()`, `Port()`, `Running()`.
 
 ## Configuration
 
-The proxy binary accepts all standard Gold Lapel flags. Pass them via `WithExtraArgs`:
+Pass a config map using `WithConfig`:
+
+```go
+import goldlapel "github.com/goldlapel/goldlapel-go"
+
+url, err := goldlapel.Start("postgresql://user:pass@localhost/mydb",
+    goldlapel.WithConfig(map[string]interface{}{
+        "mode":              "butler",
+        "pool_size":         50,
+        "disable_matviews":  true,
+        "replica":           []interface{}{"postgresql://user:pass@replica1/mydb"},
+    }),
+)
+```
+
+Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Boolean keys are flags — `true` enables them. Slice keys produce repeated flags.
+
+Unknown keys return an error. To see all valid keys:
+
+```go
+goldlapel.ConfigKeys()
+```
+
+For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+
+### Raw flags
+
+You can also pass raw CLI flags via `WithExtraArgs`:
 
 ```go
 url, err := goldlapel.Start(

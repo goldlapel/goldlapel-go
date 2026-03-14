@@ -369,6 +369,48 @@ func TestConfigToArgs_BooleanNonBool(t *testing.T) {
 	}
 }
 
+// --- ConfigKeys tests ---
+
+func TestConfigKeys_ReturnsSlice(t *testing.T) {
+	keys := ConfigKeys()
+	if keys == nil {
+		t.Fatal("expected non-nil slice")
+	}
+	if len(keys) == 0 {
+		t.Fatal("expected non-empty slice")
+	}
+}
+
+func TestConfigKeys_ContainsKnownKeys(t *testing.T) {
+	keys := ConfigKeys()
+	keySet := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		keySet[k] = true
+	}
+	for _, expected := range []string{"mode", "pool_size", "disable_matviews", "replica"} {
+		if !keySet[expected] {
+			t.Fatalf("expected ConfigKeys() to contain %q", expected)
+		}
+	}
+}
+
+func TestConfigKeys_MatchesValidConfigKeysCount(t *testing.T) {
+	keys := ConfigKeys()
+	// Must match the number of entries in validConfigKeys
+	if len(keys) != len(validConfigKeys) {
+		t.Fatalf("expected %d keys, got %d", len(validConfigKeys), len(keys))
+	}
+}
+
+func TestConfigKeys_IsSorted(t *testing.T) {
+	keys := ConfigKeys()
+	for i := 1; i < len(keys); i++ {
+		if keys[i] < keys[i-1] {
+			t.Fatalf("keys not sorted: %q came after %q", keys[i], keys[i-1])
+		}
+	}
+}
+
 func TestWithConfig_Integration(t *testing.T) {
 	config := map[string]interface{}{
 		"mode":      "butler",

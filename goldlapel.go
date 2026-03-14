@@ -148,6 +148,16 @@ func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 	return args, nil
 }
 
+// ConfigKeys returns a sorted list of all valid configuration key names.
+func ConfigKeys() []string {
+	keys := make([]string, 0, len(validConfigKeys))
+	for k := range validConfigKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // GoldLapel manages a Gold Lapel proxy process.
 type GoldLapel struct {
 	upstream  string
