@@ -411,6 +411,58 @@ func TestConfigKeys_IsSorted(t *testing.T) {
 	}
 }
 
+// --- DashboardURL tests ---
+
+func TestDashboardURLDefaultPort(t *testing.T) {
+	gl := New("postgresql://localhost:5432/mydb")
+	if gl.dashboardPort != 7933 {
+		t.Fatalf("expected default dashboard port 7933, got %d", gl.dashboardPort)
+	}
+}
+
+func TestDashboardURLCustomPort(t *testing.T) {
+	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+		"dashboard_port": 8080,
+	}))
+	if gl.dashboardPort != 8080 {
+		t.Fatalf("expected dashboard port 8080, got %d", gl.dashboardPort)
+	}
+}
+
+func TestDashboardURLDisabled(t *testing.T) {
+	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+		"dashboard_port": 0,
+	}))
+	if gl.dashboardPort != 0 {
+		t.Fatalf("expected dashboard port 0, got %d", gl.dashboardPort)
+	}
+	if url := gl.DashboardURL(); url != "" {
+		t.Fatalf("expected empty DashboardURL when disabled, got %q", url)
+	}
+}
+
+func TestDashboardURLNotRunning(t *testing.T) {
+	gl := New("postgresql://localhost:5432/mydb")
+	if url := gl.DashboardURL(); url != "" {
+		t.Fatalf("expected empty DashboardURL when not running, got %q", url)
+	}
+}
+
+func TestDashboardPortFromConfigString(t *testing.T) {
+	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+		"dashboard_port": "9090",
+	}))
+	if gl.dashboardPort != 9090 {
+		t.Fatalf("expected dashboard port 9090, got %d", gl.dashboardPort)
+	}
+}
+
+func TestDashboardURLSingletonEmptyWhenNotStarted(t *testing.T) {
+	if url := DashboardURL(); url != "" {
+		t.Fatalf("expected empty DashboardURL(), got %q", url)
+	}
+}
+
 func TestWithConfig_Integration(t *testing.T) {
 	config := map[string]interface{}{
 		"mode":      "butler",

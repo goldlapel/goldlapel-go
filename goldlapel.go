@@ -17,11 +17,12 @@ import (
 )
 
 const (
-	DefaultPort         = 7932
-	startupTimeout      = 10 * time.Second
-	startupPollInterval = 50 * time.Millisecond
-	shutdownTimeout     = 5 * time.Second
-	dialTimeout         = 500 * time.Millisecond
+	DefaultPort          = 7932
+	DefaultDashboardPort = 7933
+	startupTimeout       = 10 * time.Second
+	startupPollInterval  = 50 * time.Millisecond
+	shutdownTimeout      = 5 * time.Second
+	dialTimeout          = 500 * time.Millisecond
 )
 
 var (
@@ -160,25 +161,32 @@ func ConfigKeys() []string {
 
 // GoldLapel manages a Gold Lapel proxy process.
 type GoldLapel struct {
-	upstream  string
-	port      int
-	config    map[string]interface{}
-	extraArgs []string
-	cmd       *exec.Cmd
-	proxyURL  string
-	stderr    string
-	done      chan struct{} // closed when process exits
-	mu        sync.Mutex
+	upstream      string
+	port          int
+	dashboardPort int
+	config        map[string]interface{}
+	extraArgs     []string
+	cmd           *exec.Cmd
+	proxyURL      string
+	stderr        string
+	done          chan struct{} // closed when process exits
+	mu            sync.Mutex
 }
 
 // New creates a new GoldLapel instance.
 func New(upstream string, opts ...Option) *GoldLapel {
 	gl := &GoldLapel{
-		upstream: upstream,
-		port:     DefaultPort,
+		upstream:      upstream,
+		port:          DefaultPort,
+		dashboardPort: DefaultDashboardPort,
 	}
 	for _, opt := range opts {
 		opt(gl)
+	}
+	if gl.config != nil {
+		if dp, ok := gl.config["dashboard_port"]; ok {
+			gl.dashboardPort = toInt(dp)
+		}
 	}
 	return gl
 }
@@ -252,6 +260,13 @@ func (gl *GoldLapel) Start() (string, error) {
 	}()
 
 	gl.proxyURL = MakeProxyURL(gl.upstream, gl.port)
+
+	if gl.dashboardPort > 0 {
+		fmt.Printf("goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
+	} else {
+		fmt.Printf("goldlapel → :%d (proxy)\n", gl.port)
+	}
+
 	return gl.proxyURL, nil
 }
 
@@ -321,6 +336,17 @@ func (gl *GoldLapel) Running() bool {
 	}
 }
 
+// DashboardURL returns the dashboard URL if the proxy is running and
+// the dashboard port is configured, or "" otherwise.
+func (gl *GoldLapel) DashboardURL() string {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	if gl.dashboardPort > 0 && gl.cmd != nil && gl.cmd.Process != nil {
+		return fmt.Sprintf("http://127.0.0.1:%d", gl.dashboardPort)
+	}
+	return ""
+}
+
 // --- Singleton API ---
 
 var (
@@ -367,6 +393,17 @@ func ProxyURL() string {
 		return ""
 	}
 	return instance.URL()
+}
+
+// DashboardURL returns the singleton's dashboard URL, or "" if not started.
+func DashboardURL() string {
+	singletonMu.Lock()
+	defer singletonMu.Unlock()
+
+	if instance == nil {
+		return ""
+	}
+	return instance.DashboardURL()
 }
 
 // --- Binary lookup ---
@@ -418,6 +455,21 @@ func FindBinary() (string, error) {
 func isMusl(arch string) bool {
 	_, err := os.Stat(fmt.Sprintf("/lib/ld-musl-%s.so.1", arch))
 	return err == nil
+}
+
+func toInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case float64:
+		return int(n)
+	case string:
+		var i int
+		fmt.Sscanf(n, "%d", &i)
+		return i
+	default:
+		return 0
+	}
 }
 
 // --- URL rewriting ---

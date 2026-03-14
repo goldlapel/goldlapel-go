@@ -59,6 +59,21 @@ Stops the singleton proxy.
 
 Returns the current proxy URL, or `""` if not running.
 
+### `goldlapel.DashboardURL() string`
+
+Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `""` if not running. The dashboard port defaults to 7933 and can be changed via config:
+
+```go
+url, err := goldlapel.Start("postgresql://user:pass@localhost:5432/mydb",
+    goldlapel.WithConfig(map[string]interface{}{
+        "dashboard_port": 8080,
+    }),
+)
+fmt.Println(goldlapel.DashboardURL()) // http://127.0.0.1:8080
+```
+
+Set `dashboard_port` to `0` to disable.
+
 ### Instance API
 
 For managing multiple proxy instances:
@@ -73,7 +88,7 @@ url, err := proxy.Start()
 proxy.Stop()
 ```
 
-Instance methods: `Start()`, `Stop()`, `URL()`, `Port()`, `Running()`.
+Instance methods: `Start()`, `Stop()`, `URL()`, `Port()`, `Running()`, `DashboardURL()`.
 
 ## Configuration
 
