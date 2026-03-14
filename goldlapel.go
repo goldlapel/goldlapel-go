@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +29,39 @@ var (
 	// We use regex instead of net/url to preserve percent-encoded characters.
 	withPortRe    = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$`)
 	withoutPortRe = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$`)
+
+	validConfigKeys = map[string]bool{
+		"mode": true, "min_pattern_count": true, "refresh_interval_secs": true,
+		"pattern_ttl_secs": true, "max_tables_per_view": true, "max_columns_per_view": true,
+		"deep_pagination_threshold": true, "report_interval_secs": true,
+		"result_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
+		"redis_url": true, "pool_size": true, "pool_timeout_secs": true, "pool_mode": true,
+		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
+		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
+		"tls_cert": true, "tls_key": true, "tls_client_ca": true, "config": true,
+		"dashboard_port": true,
+		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
+		"disable_trigram_indexes": true, "disable_expression_indexes": true,
+		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
+		"disable_result_cache": true, "disable_redis_cache": true, "disable_pool": true,
+		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
+		"enable_coalescing": true,
+		"replica": true, "exclude_tables": true,
+	}
+
+	booleanKeys = map[string]bool{
+		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
+		"disable_trigram_indexes": true, "disable_expression_indexes": true,
+		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
+		"disable_result_cache": true, "disable_redis_cache": true, "disable_pool": true,
+		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
+		"enable_coalescing": true,
+	}
+
+	listKeys = map[string]bool{
+		"replica":        true,
+		"exclude_tables": true,
+	}
 )
 
 // Option configures a GoldLapel instance.
@@ -47,10 +81,78 @@ func WithExtraArgs(args ...string) Option {
 	}
 }
 
+// WithConfig passes structured configuration as CLI flags to the binary.
+// Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
+func WithConfig(config map[string]interface{}) Option {
+	return func(gl *GoldLapel) {
+		gl.config = config
+	}
+}
+
+// ConfigToArgs converts a config map into CLI argument strings.
+// Keys are snake_case strings; each is validated against the known set of config keys.
+// Boolean keys emit a bare flag when true, nothing when false.
+// List keys emit repeated --flag value pairs for each element.
+// All other keys emit --flag value pairs.
+func ConfigToArgs(config map[string]interface{}) ([]string, error) {
+	if len(config) == 0 {
+		return nil, nil
+	}
+
+	// Sort keys for deterministic output
+	keys := make([]string, 0, len(config))
+	for k := range config {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var args []string
+	for _, key := range keys {
+		if !validConfigKeys[key] {
+			return nil, fmt.Errorf("unknown config key: %q", key)
+		}
+
+		value := config[key]
+		flag := "--" + strings.ReplaceAll(key, "_", "-")
+
+		if booleanKeys[key] {
+			b, ok := value.(bool)
+			if !ok {
+				return nil, fmt.Errorf("config key %q expects a bool value, got %T", key, value)
+			}
+			if b {
+				args = append(args, flag)
+			}
+			continue
+		}
+
+		if listKeys[key] {
+			switch v := value.(type) {
+			case []interface{}:
+				for _, item := range v {
+					args = append(args, flag, fmt.Sprint(item))
+				}
+			case []string:
+				for _, item := range v {
+					args = append(args, flag, item)
+				}
+			default:
+				return nil, fmt.Errorf("config key %q expects a list value, got %T", key, value)
+			}
+			continue
+		}
+
+		args = append(args, flag, fmt.Sprint(value))
+	}
+
+	return args, nil
+}
+
 // GoldLapel manages a Gold Lapel proxy process.
 type GoldLapel struct {
 	upstream  string
 	port      int
+	config    map[string]interface{}
 	extraArgs []string
 	cmd       *exec.Cmd
 	proxyURL  string
@@ -92,6 +194,13 @@ func (gl *GoldLapel) Start() (string, error) {
 	}
 
 	args := []string{"--upstream", gl.upstream, "--port", fmt.Sprintf("%d", gl.port)}
+	if gl.config != nil {
+		configArgs, err := ConfigToArgs(gl.config)
+		if err != nil {
+			return "", fmt.Errorf("invalid config: %w", err)
+		}
+		args = append(args, configArgs...)
+	}
 	args = append(args, gl.extraArgs...)
 
 	gl.cmd = exec.Command(bin, args...)

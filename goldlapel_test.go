@@ -4,6 +4,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -237,5 +239,149 @@ func TestStopIdempotent(t *testing.T) {
 func TestProxyURLEmptyWhenNotStarted(t *testing.T) {
 	if url := ProxyURL(); url != "" {
 		t.Fatalf("expected empty ProxyURL(), got %q", url)
+	}
+}
+
+// --- ConfigToArgs tests ---
+
+func TestConfigToArgs_StringValue(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"mode": "butler"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"--mode", "butler"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_NumericValue(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"pool_size": 20})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"--pool-size", "20"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_BooleanTrue(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"disable_pool": true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"--disable-pool"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_BooleanFalse(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"disable_pool": false})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("expected empty args for false boolean, got %v", args)
+	}
+}
+
+func TestConfigToArgs_ListValue(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{
+		"replica": []interface{}{"postgres://r1:5432/db", "postgres://r2:5432/db"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"--replica", "postgres://r1:5432/db", "--replica", "postgres://r2:5432/db"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_ExcludeTablesList(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{
+		"exclude_tables": []string{"sessions", "logs"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"--exclude-tables", "sessions", "--exclude-tables", "logs"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_UnknownKey(t *testing.T) {
+	_, err := ConfigToArgs(map[string]interface{}{"bogus_key": "value"})
+	if err == nil {
+		t.Fatal("expected error for unknown key")
+	}
+	if !strings.Contains(err.Error(), "unknown config key") {
+		t.Fatalf("expected 'unknown config key' in error, got: %v", err)
+	}
+}
+
+func TestConfigToArgs_MultipleKeys(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{
+		"mode":         "butler",
+		"pool_size":    10,
+		"disable_pool": true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Keys are sorted: disable_pool, mode, pool_size
+	want := []string{"--disable-pool", "--mode", "butler", "--pool-size", "10"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+}
+
+func TestConfigToArgs_EmptyConfig(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if args != nil {
+		t.Fatalf("expected nil for empty config, got %v", args)
+	}
+}
+
+func TestConfigToArgs_NilConfig(t *testing.T) {
+	args, err := ConfigToArgs(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if args != nil {
+		t.Fatalf("expected nil for nil config, got %v", args)
+	}
+}
+
+func TestConfigToArgs_BooleanNonBool(t *testing.T) {
+	_, err := ConfigToArgs(map[string]interface{}{"disable_pool": "yes"})
+	if err == nil {
+		t.Fatal("expected error for non-bool value on boolean key")
+	}
+	if !strings.Contains(err.Error(), "expects a bool value") {
+		t.Fatalf("expected 'expects a bool value' in error, got: %v", err)
+	}
+}
+
+func TestWithConfig_Integration(t *testing.T) {
+	config := map[string]interface{}{
+		"mode":      "butler",
+		"pool_size": 20,
+	}
+	gl := New("postgresql://user:pass@localhost:5432/mydb", WithConfig(config))
+	if gl.config == nil {
+		t.Fatal("expected config to be set")
+	}
+	if gl.config["mode"] != "butler" {
+		t.Fatalf("expected mode=butler, got %v", gl.config["mode"])
+	}
+	if gl.config["pool_size"] != 20 {
+		t.Fatalf("expected pool_size=20, got %v", gl.config["pool_size"])
 	}
 }
