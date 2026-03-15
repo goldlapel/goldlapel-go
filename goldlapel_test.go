@@ -43,6 +43,116 @@ func TestFindBinaryEnvVarMissingFile(t *testing.T) {
 	}
 }
 
+func TestIsExecutable(t *testing.T) {
+	dir := t.TempDir()
+
+	// File with execute permission
+	execFile := filepath.Join(dir, "exec")
+	if err := os.WriteFile(execFile, []byte("test"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := os.Stat(execFile)
+	if !isExecutable(info) {
+		t.Fatal("expected file with 0755 to be executable")
+	}
+
+	// File without execute permission
+	noExecFile := filepath.Join(dir, "noexec")
+	if err := os.WriteFile(noExecFile, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, _ = os.Stat(noExecFile)
+	if isExecutable(info) {
+		t.Fatal("expected file with 0644 to not be executable")
+	}
+
+	// Read-only file (simulates Go module cache)
+	readOnlyFile := filepath.Join(dir, "readonly")
+	if err := os.WriteFile(readOnlyFile, []byte("test"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	info, _ = os.Stat(readOnlyFile)
+	if isExecutable(info) {
+		t.Fatal("expected file with 0444 to not be executable")
+	}
+}
+
+func TestCopyToExecutableTemp(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a non-executable source file
+	src := filepath.Join(dir, "goldlapel-test-binary")
+	content := []byte("fake binary content")
+	if err := os.WriteFile(src, content, 0444); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := copyToExecutableTemp(src, "goldlapel-test-binary")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify the copy exists and is executable
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("expected temp copy to exist, got: %v", err)
+	}
+	if !isExecutable(info) {
+		t.Fatal("expected temp copy to be executable")
+	}
+
+	// Verify content matches
+	copied, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("failed to read temp copy: %v", err)
+	}
+	if string(copied) != string(content) {
+		t.Fatalf("content mismatch: got %q, want %q", string(copied), string(content))
+	}
+
+	// Clean up
+	os.RemoveAll(filepath.Dir(dst))
+}
+
+func TestCopyToExecutableTempReusesExisting(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "goldlapel-test-reuse")
+	content := []byte("fake binary content")
+	if err := os.WriteFile(src, content, 0444); err != nil {
+		t.Fatal(err)
+	}
+
+	// First call creates the copy
+	dst1, err := copyToExecutableTemp(src, "goldlapel-test-reuse")
+	if err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+
+	// Second call should reuse it
+	dst2, err := copyToExecutableTemp(src, "goldlapel-test-reuse")
+	if err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+
+	if dst1 != dst2 {
+		t.Fatalf("expected same path, got %q and %q", dst1, dst2)
+	}
+
+	// Clean up
+	os.RemoveAll(filepath.Dir(dst1))
+}
+
+func TestCopyToExecutableTempSourceNotFound(t *testing.T) {
+	_, err := copyToExecutableTemp("/nonexistent/path/binary", "test-binary")
+	if err == nil {
+		t.Fatal("expected error for missing source file")
+	}
+	if !strings.Contains(err.Error(), "failed to read bundled binary") {
+		t.Fatalf("expected 'failed to read bundled binary' in error, got: %v", err)
+	}
+}
+
 func TestFindBinaryNotFoundError(t *testing.T) {
 	t.Setenv("GOLDLAPEL_BINARY", "")
 	// Ensure goldlapel is not on PATH

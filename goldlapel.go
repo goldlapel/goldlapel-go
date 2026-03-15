@@ -440,7 +440,15 @@ func FindBinary() (string, error) {
 	if ok {
 		bundled := filepath.Join(filepath.Dir(thisFile), "bin", binaryName)
 		if info, err := os.Stat(bundled); err == nil && info.Mode().IsRegular() {
-			return bundled, nil
+			if isExecutable(info) {
+				return bundled, nil
+			}
+			// Binary exists but isn't executable (e.g. read-only Go module cache).
+			// Copy to a temp location and make it executable.
+			if tmp, err := copyToExecutableTemp(bundled, binaryName); err == nil {
+				return tmp, nil
+			}
+			// Fall through to PATH lookup
 		}
 	}
 
@@ -455,6 +463,38 @@ func FindBinary() (string, error) {
 func isMusl(arch string) bool {
 	_, err := os.Stat(fmt.Sprintf("/lib/ld-musl-%s.so.1", arch))
 	return err == nil
+}
+
+func isExecutable(info os.FileInfo) bool {
+	return info.Mode()&0111 != 0
+}
+
+func copyToExecutableTemp(src, name string) (string, error) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return "", fmt.Errorf("failed to read bundled binary: %w", err)
+	}
+
+	dir := filepath.Join(os.TempDir(), "goldlapel-bin")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	dst := filepath.Join(dir, name)
+
+	// If the temp copy already exists and is executable, reuse it
+	if info, err := os.Stat(dst); err == nil && info.Mode().IsRegular() && isExecutable(info) {
+		// Verify same size as a basic staleness check
+		if info.Size() == int64(len(data)) {
+			return dst, nil
+		}
+	}
+
+	if err := os.WriteFile(dst, data, 0755); err != nil {
+		return "", fmt.Errorf("failed to write executable copy: %w", err)
+	}
+
+	return dst, nil
 }
 
 func toInt(v interface{}) int {
