@@ -222,6 +222,10 @@ func (gl *GoldLapel) Start() (string, error) {
 	args = append(args, gl.extraArgs...)
 
 	gl.cmd = exec.Command(bin, args...)
+	gl.cmd.Env = os.Environ()
+	if os.Getenv("GOLDLAPEL_CLIENT") == "" {
+		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_CLIENT=go")
+	}
 
 	stderrPipe, err := gl.cmd.StderrPipe()
 	if err != nil {
