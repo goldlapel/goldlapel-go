@@ -40,7 +40,7 @@ var (
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
 		"tls_cert": true, "tls_key": true, "tls_client_ca": true, "config": true,
-		"dashboard_port": true,
+		"dashboard_port": true, "invalidation_port": true,
 		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
 		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
