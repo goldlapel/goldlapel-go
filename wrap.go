@@ -2,8 +2,13 @@ package goldlapel
 
 import (
 	"context"
+	"errors"
 	"reflect"
 )
+
+// ErrNoRows is returned by Row.Scan when the query returns no rows.
+// This mirrors pgx.ErrNoRows for code that checks errors.Is(err, ErrNoRows).
+var ErrNoRows = errors.New("no rows in result set")
 
 // Querier is the interface that CachedConn wraps. It matches the subset of
 // pgx.Conn and pgxpool.Pool used for queries. Any type with Query, QueryRow,
@@ -199,13 +204,13 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 	// Cache miss: use Query to fetch, cache, and return first row
 	rows, err := cc.Query(ctx, sql, args...)
 	if err != nil {
-		return &cachedRow{values: nil}
+		return &cachedRow{err: err}
 	}
 	if rows.Next() {
 		vals, vErr := rows.Values()
 		rows.Close()
 		if vErr != nil {
-			return &cachedRow{values: nil}
+			return &cachedRow{err: vErr}
 		}
 		return &cachedRow{values: vals}
 	}
@@ -284,11 +289,15 @@ func (cr *cachedRows) RawValues() [][]byte {
 
 type cachedRow struct {
 	values []interface{}
+	err    error
 }
 
 func (cr *cachedRow) Scan(dest ...interface{}) error {
+	if cr.err != nil {
+		return cr.err
+	}
 	if cr.values == nil {
-		return nil
+		return ErrNoRows
 	}
 	return scanRow(cr.values, dest)
 }

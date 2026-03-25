@@ -2,6 +2,7 @@ package goldlapel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -432,12 +433,67 @@ func TestCachedRow_Scan(t *testing.T) {
 	}
 }
 
-func TestCachedRow_ScanNil(t *testing.T) {
+func TestCachedRow_ScanNil_ReturnsErrNoRows(t *testing.T) {
 	row := &cachedRow{values: nil}
 	var id interface{}
 	err := row.Scan(&id)
+	if !errors.Is(err, ErrNoRows) {
+		t.Fatalf("expected ErrNoRows, got: %v", err)
+	}
+}
+
+func TestCachedRow_ScanWithError_ReturnsError(t *testing.T) {
+	testErr := errors.New("query failed")
+	row := &cachedRow{err: testErr}
+	var id interface{}
+	err := row.Scan(&id)
+	if !errors.Is(err, testErr) {
+		t.Fatalf("expected query error, got: %v", err)
+	}
+}
+
+func TestQueryRow_NoRows_ReturnsErrNoRows(t *testing.T) {
+	// Mock returns no rows
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+
+	row := cc.QueryRow(ctx, "SELECT * FROM users WHERE id = 999")
+	var id interface{}
+	err := row.Scan(&id)
+	if !errors.Is(err, ErrNoRows) {
+		t.Fatalf("expected ErrNoRows, got: %v", err)
+	}
+}
+
+func TestQueryRow_NoRows_CacheHit_ReturnsErrNoRows(t *testing.T) {
+	// Mock returns no rows; first call caches empty result, second call is cache hit
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+
+	// First call: cache miss, queries real, gets no rows, caches empty result
+	cc.Query(ctx, "SELECT * FROM users WHERE id = 999")
+
+	// Second call via QueryRow: cache hit with zero rows
+	row := cc.QueryRow(ctx, "SELECT * FROM users WHERE id = 999")
+	var id interface{}
+	err := row.Scan(&id)
+	if !errors.Is(err, ErrNoRows) {
+		t.Fatalf("expected ErrNoRows on cache hit with zero rows, got: %v", err)
+	}
+}
+
+func TestQueryRow_WithRows_NoError(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{42, "alice"}}, []FieldDescription{{Name: "id"}, {Name: "name"}})
+	ctx := context.Background()
+
+	row := cc.QueryRow(ctx, "SELECT * FROM users WHERE id = 42")
+	var id, name interface{}
+	err := row.Scan(&id, &name)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != 42 || name != "alice" {
+		t.Fatalf("expected id=42 name=alice, got id=%v name=%v", id, name)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,11 +53,12 @@ type NativeCache struct {
 	invStop      chan struct{}
 	invRunning   bool
 	invPort      int
+	invConn      net.Conn
 	reconnectN   int
 
-	StatsHits          int64
-	StatsMisses        int64
-	StatsInvalidations int64
+	statsHits          int64
+	statsMisses        int64
+	statsInvalidations int64
 }
 
 var (
@@ -112,6 +114,21 @@ func (nc *NativeCache) Enabled() bool {
 	return nc.enabled
 }
 
+// StatsHits returns the number of cache hits.
+func (nc *NativeCache) StatsHits() int64 {
+	return atomic.LoadInt64(&nc.statsHits)
+}
+
+// StatsMisses returns the number of cache misses.
+func (nc *NativeCache) StatsMisses() int64 {
+	return atomic.LoadInt64(&nc.statsMisses)
+}
+
+// StatsInvalidations returns the number of cache invalidations.
+func (nc *NativeCache) StatsInvalidations() int64 {
+	return atomic.LoadInt64(&nc.statsInvalidations)
+}
+
 func (nc *NativeCache) Size() int {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
@@ -132,10 +149,10 @@ func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
 	if ok {
 		nc.counter++
 		nc.accessOrder[key] = nc.counter
-		nc.StatsHits++
+		atomic.AddInt64(&nc.statsHits, 1)
 		return entry
 	}
-	nc.StatsMisses++
+	atomic.AddInt64(&nc.statsMisses, 1)
 	return nil
 }
 
@@ -190,7 +207,7 @@ func (nc *NativeCache) InvalidateTable(table string) {
 			}
 		}
 	}
-	nc.StatsInvalidations += int64(len(keys))
+	atomic.AddInt64(&nc.statsInvalidations, int64(len(keys)))
 }
 
 func (nc *NativeCache) InvalidateAll() {
@@ -200,7 +217,7 @@ func (nc *NativeCache) InvalidateAll() {
 	nc.cache = make(map[string]*cacheEntry)
 	nc.tableIndex = make(map[string]map[string]bool)
 	nc.accessOrder = make(map[string]uint64)
-	nc.StatsInvalidations += count
+	atomic.AddInt64(&nc.statsInvalidations, count)
 }
 
 func (nc *NativeCache) ConnectInvalidation(port int) {
@@ -227,7 +244,13 @@ func (nc *NativeCache) StopInvalidation() {
 	close(nc.invStop)
 	nc.invRunning = false
 	nc.invConnected = false
+	// Close the active connection to unblock any pending Read call
+	conn := nc.invConn
+	nc.invConn = nil
 	nc.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
 }
 
 func (nc *NativeCache) invalidationLoop() {
@@ -260,17 +283,22 @@ func (nc *NativeCache) invalidationLoop() {
 
 		nc.mu.Lock()
 		nc.invConnected = true
+		nc.invConn = conn
 		nc.reconnectN = 0
 		nc.mu.Unlock()
 
 		nc.readInvalidations(conn)
 
-		conn.Close()
-
 		nc.mu.Lock()
+		// Clear invConn only if it hasn't been cleared by StopInvalidation
+		if nc.invConn == conn {
+			nc.invConn = nil
+		}
 		wasConnected := nc.invConnected
 		nc.invConnected = false
 		nc.mu.Unlock()
+
+		conn.Close()
 
 		if wasConnected {
 			nc.InvalidateAll()

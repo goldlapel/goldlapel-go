@@ -338,11 +338,11 @@ func TestCache_StatsTracking(t *testing.T) {
 	cache.Put("SELECT 1", nil, []int{1}, nil)
 	cache.Get("SELECT 1", nil)
 	cache.Get("SELECT 2", nil)
-	if cache.StatsHits != 1 {
-		t.Fatalf("expected 1 hit, got %d", cache.StatsHits)
+	if cache.StatsHits() != 1 {
+		t.Fatalf("expected 1 hit, got %d", cache.StatsHits())
 	}
-	if cache.StatsMisses != 1 {
-		t.Fatalf("expected 1 miss, got %d", cache.StatsMisses)
+	if cache.StatsMisses() != 1 {
+		t.Fatalf("expected 1 miss, got %d", cache.StatsMisses())
 	}
 }
 
@@ -432,8 +432,8 @@ func TestInvalidation_Stats(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
 	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
 	cache.InvalidateTable("orders")
-	if cache.StatsInvalidations != 1 {
-		t.Fatalf("expected 1 invalidation, got %d", cache.StatsInvalidations)
+	if cache.StatsInvalidations() != 1 {
+		t.Fatalf("expected 1 invalidation, got %d", cache.StatsInvalidations())
 	}
 }
 
@@ -553,6 +553,45 @@ func TestPushInvalidation_ConnectionDropClearsCache(t *testing.T) {
 	cache.StopInvalidation()
 }
 
+func TestStopInvalidation_DoesNotBlock(t *testing.T) {
+	cache := makeTestCache(t, 100, true, false)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cache.ConnectInvalidation(port)
+
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Wait for connected
+	time.Sleep(100 * time.Millisecond)
+	if !cache.Connected() {
+		t.Fatal("expected connected")
+	}
+
+	// StopInvalidation should return quickly (not block for 30s read deadline)
+	done := make(chan struct{})
+	go func() {
+		cache.StopInvalidation()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good — returned quickly
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopInvalidation blocked for too long")
+	}
+}
+
 // --- Thread safety ---
 
 func TestConcurrentPutAndGet(t *testing.T) {
@@ -609,6 +648,45 @@ func TestConcurrentInvalidation(t *testing.T) {
 	go reader()
 	go reader()
 	wg.Wait()
+}
+
+func TestStats_ConcurrentAccess(t *testing.T) {
+	cache := makeTestCache(t, 1000, true, true)
+	cache.Put("SELECT 1", nil, []int{1}, nil)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Concurrent reads (cache hits + misses)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			cache.Get("SELECT 1", nil)
+			cache.Get("SELECT 2", nil)
+		}
+	}()
+
+	// Concurrent stats reads
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = cache.StatsHits()
+			_ = cache.StatsMisses()
+			_ = cache.StatsInvalidations()
+		}
+	}()
+
+	// Concurrent invalidations
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			cache.Put("SELECT temp", nil, []int{1}, nil)
+			cache.InvalidateAll()
+		}
+	}()
+
+	wg.Wait()
+	// No race condition — test passes if -race doesn't flag anything
 }
 
 // --- Singleton ---
