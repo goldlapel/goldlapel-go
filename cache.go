@@ -410,8 +410,37 @@ func detectWrite(sql string) string {
 			return bareTable(tokens[2])
 		}
 		return bareTable(tokens[1])
-	case "CREATE", "ALTER", "DROP":
+	case "CREATE", "ALTER", "DROP", "REFRESH", "DO", "CALL":
 		return ddlSentinel
+	case "MERGE":
+		if len(tokens) < 3 || !strings.EqualFold(tokens[1], "INTO") {
+			return ""
+		}
+		return bareTable(tokens[2])
+	case "SELECT":
+		sawInto := false
+		intoTarget := ""
+		for _, tok := range tokens[1:] {
+			upper := strings.ToUpper(tok)
+			if upper == "INTO" && !sawInto {
+				sawInto = true
+				continue
+			}
+			if sawInto && intoTarget == "" {
+				if upper == "TEMPORARY" || upper == "TEMP" || upper == "UNLOGGED" {
+					continue
+				}
+				intoTarget = tok
+				continue
+			}
+			if sawInto && intoTarget != "" && upper == "FROM" {
+				return ddlSentinel
+			}
+			if upper == "FROM" {
+				return ""
+			}
+		}
+		return ""
 	case "COPY":
 		if len(tokens) < 2 {
 			return ""
