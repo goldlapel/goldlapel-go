@@ -2,6 +2,7 @@ package goldlapel
 
 import (
 	"context"
+	"reflect"
 )
 
 // Querier is the interface that CachedConn wraps. It matches the subset of
@@ -195,8 +196,21 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		return &cachedRow{values: nil}
 	}
 
-	// Cache miss: forward to real
-	return cc.real.QueryRow(ctx, sql, args...)
+	// Cache miss: use Query to fetch, cache, and return first row
+	rows, err := cc.Query(ctx, sql, args...)
+	if err != nil {
+		return &cachedRow{values: nil}
+	}
+	if rows.Next() {
+		vals, vErr := rows.Values()
+		rows.Close()
+		if vErr != nil {
+			return &cachedRow{values: nil}
+		}
+		return &cachedRow{values: vals}
+	}
+	rows.Close()
+	return &cachedRow{values: nil}
 }
 
 // Exec intercepts write commands. It always forwards to the real connection
@@ -244,12 +258,7 @@ func (cr *cachedRows) Scan(dest ...interface{}) error {
 		return nil
 	}
 	row := cr.rows[cr.pos]
-	for i := 0; i < len(dest) && i < len(row); i++ {
-		if p, ok := dest[i].(*interface{}); ok {
-			*p = row[i]
-		}
-	}
-	return nil
+	return scanRow(row, dest)
 }
 
 func (cr *cachedRows) Close() {}
@@ -281,9 +290,29 @@ func (cr *cachedRow) Scan(dest ...interface{}) error {
 	if cr.values == nil {
 		return nil
 	}
-	for i := 0; i < len(dest) && i < len(cr.values); i++ {
+	return scanRow(cr.values, dest)
+}
+
+func scanRow(src []interface{}, dest []interface{}) error {
+	for i := 0; i < len(dest) && i < len(src); i++ {
 		if p, ok := dest[i].(*interface{}); ok {
-			*p = cr.values[i]
+			*p = src[i]
+			continue
+		}
+		// Use reflect for typed pointers (*string, *int, etc.)
+		dv := reflect.ValueOf(dest[i])
+		if dv.Kind() != reflect.Ptr || dv.IsNil() {
+			continue
+		}
+		sv := reflect.ValueOf(src[i])
+		if !sv.IsValid() {
+			dv.Elem().Set(reflect.Zero(dv.Elem().Type()))
+			continue
+		}
+		if sv.Type().AssignableTo(dv.Elem().Type()) {
+			dv.Elem().Set(sv)
+		} else if sv.Type().ConvertibleTo(dv.Elem().Type()) {
+			dv.Elem().Set(sv.Convert(dv.Elem().Type()))
 		}
 	}
 	return nil
