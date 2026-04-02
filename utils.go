@@ -133,3 +133,84 @@ func Zrange(db *sql.DB, table string, start, stop int, desc bool) ([]ZMember, er
 	}
 	return results, rows.Err()
 }
+
+// Hset sets a field in a hash. Like redis.hset().
+// Creates the hash table if it doesn't exist. Uses JSONB for storage.
+func Hset(db *sql.DB, table, key, field string, value interface{}) error {
+	_, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + table + " (" +
+			"key TEXT PRIMARY KEY, " +
+			"data JSONB NOT NULL DEFAULT '{}'::jsonb)")
+	if err != nil {
+		return fmt.Errorf("create hash table: %w", err)
+	}
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal value: %w", err)
+	}
+
+	_, err = db.Exec(
+		"INSERT INTO "+table+" (key, data) VALUES ($1, jsonb_build_object($2, $3::jsonb)) "+
+			"ON CONFLICT (key) DO UPDATE SET data = "+table+".data || jsonb_build_object($4, $5::jsonb)",
+		key, field, string(data), field, string(data))
+	return err
+}
+
+// Hget gets a field from a hash. Like redis.hget().
+// Returns the value as raw JSON, or nil if key or field doesn't exist.
+func Hget(db *sql.DB, table, key, field string) (json.RawMessage, error) {
+	var val *string
+	err := db.QueryRow(
+		"SELECT data->>$1 FROM "+table+" WHERE key = $2",
+		field, key).Scan(&val)
+
+	if err == sql.ErrNoRows || val == nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(*val), nil
+}
+
+// Hgetall gets all fields from a hash. Like redis.hgetall().
+// Returns the full JSONB object as raw JSON, or nil if key doesn't exist.
+func Hgetall(db *sql.DB, table, key string) (json.RawMessage, error) {
+	var data string
+	err := db.QueryRow(
+		"SELECT data FROM "+table+" WHERE key = $1",
+		key).Scan(&data)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(data), nil
+}
+
+// Hdel removes a field from a hash. Like redis.hdel().
+// Returns true if the field existed, false otherwise.
+func Hdel(db *sql.DB, table, key, field string) (bool, error) {
+	var existed bool
+	err := db.QueryRow(
+		"SELECT data ? $1 FROM "+table+" WHERE key = $2",
+		field, key).Scan(&existed)
+
+	if err == sql.ErrNoRows || !existed {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	_, err = db.Exec(
+		"UPDATE "+table+" SET data = data - $1 WHERE key = $2",
+		field, key)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
