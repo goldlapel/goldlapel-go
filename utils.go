@@ -214,3 +214,99 @@ func Hdel(db *sql.DB, table, key, field string) (bool, error) {
 	}
 	return true, nil
 }
+
+// Geoadd adds a location to a geo table. Like redis.geoadd().
+// Creates the table with PostGIS geometry column if it doesn't exist.
+// Requires PostGIS extension.
+func Geoadd(db *sql.DB, table, nameColumn, geomColumn, name string, lon, lat float64) error {
+	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS postgis")
+	if err != nil {
+		return fmt.Errorf("create postgis extension: %w", err)
+	}
+
+	_, err = db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + table + " (" +
+			"id BIGSERIAL PRIMARY KEY, " +
+			nameColumn + " TEXT NOT NULL, " +
+			geomColumn + " GEOMETRY(Point, 4326) NOT NULL)")
+	if err != nil {
+		return fmt.Errorf("create geo table: %w", err)
+	}
+
+	_, err = db.Exec(
+		"INSERT INTO "+table+" ("+nameColumn+", "+geomColumn+") "+
+			"VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))",
+		name, lon, lat)
+	return err
+}
+
+// Georadius finds rows within a radius of a point. Like redis.georadius().
+// Requires PostGIS extension. Uses ST_DWithin with geography type
+// for accurate distance on the Earth's surface.
+// Returns a slice of maps with all columns plus a "distance_m" field.
+func Georadius(db *sql.DB, table, geomColumn string, lon, lat, radiusMeters float64, limit int) ([]map[string]interface{}, error) {
+	rows, err := db.Query(
+		"SELECT *, ST_Distance("+
+			geomColumn+"::geography, "+
+			"ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography"+
+			") AS distance_m "+
+			"FROM "+table+" "+
+			"WHERE ST_DWithin("+
+			geomColumn+"::geography, "+
+			"ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, "+
+			"$5) "+
+			"ORDER BY distance_m "+
+			"LIMIT $6",
+		lon, lat, lon, lat, radiusMeters, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		ptrs := make([]interface{}, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]interface{}, len(columns))
+		for i, col := range columns {
+			val := values[i]
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = val
+			}
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+// Geodist gets the distance between two members in meters. Like redis.geodist().
+// Returns a pointer to the distance, or nil if either member doesn't exist.
+func Geodist(db *sql.DB, table, geomColumn, nameColumn, nameA, nameB string) (*float64, error) {
+	var dist float64
+	err := db.QueryRow(
+		"SELECT ST_Distance(a."+geomColumn+"::geography, b."+geomColumn+"::geography) "+
+			"FROM "+table+" a, "+table+" b "+
+			"WHERE a."+nameColumn+" = $1 AND b."+nameColumn+" = $2",
+		nameA, nameB).Scan(&dist)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &dist, nil
+}
