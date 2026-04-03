@@ -436,6 +436,17 @@ func Georadius(db *sql.DB, table, geomColumn string, lon, lat, radiusMeters floa
 	return results, rows.Err()
 }
 
+// CountDistinct counts the number of distinct values in a column. Like redis.pfcount().
+// This is an exact count, unlike HyperLogLog which is approximate.
+func CountDistinct(db *sql.DB, table, column string) (int64, error) {
+	var count int64
+	err := db.QueryRow("SELECT COUNT(DISTINCT " + column + ") FROM " + table).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // Geodist gets the distance between two members in meters. Like redis.geodist().
 // Returns a pointer to the distance, or nil if either member doesn't exist.
 func Geodist(db *sql.DB, table, geomColumn, nameColumn, nameA, nameB string) (*float64, error) {
