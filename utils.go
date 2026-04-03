@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -464,4 +466,51 @@ func Geodist(db *sql.DB, table, geomColumn, nameColumn, nameA, nameB string) (*f
 		return nil, err
 	}
 	return &dist, nil
+}
+
+// Script executes Lua code on PostgreSQL via the pllua extension.
+// Creates a temporary function from the Lua code, executes it with the
+// provided arguments, and returns the text result. Returns nil if the
+// function returns NULL. Requires the pllua extension.
+func Script(db *sql.DB, luaCode string, args ...string) (*string, error) {
+	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pllua")
+	if err != nil {
+		return nil, err
+	}
+
+	funcName := fmt.Sprintf("_gl_lua_%x", rand.Int63())[:16]
+
+	var params []string
+	for i := range args {
+		params = append(params, fmt.Sprintf("p%d text", i+1))
+	}
+	paramStr := strings.Join(params, ", ")
+
+	_, err = db.Exec(fmt.Sprintf(
+		`CREATE OR REPLACE FUNCTION pg_temp.%s(%s) RETURNS text LANGUAGE pllua AS $pllua$ %s $pllua$`,
+		funcName, paramStr, luaCode))
+	if err != nil {
+		return nil, err
+	}
+
+	var placeholders []string
+	var queryArgs []interface{}
+	for i, arg := range args {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+		queryArgs = append(queryArgs, arg)
+	}
+	phStr := strings.Join(placeholders, ", ")
+
+	query := fmt.Sprintf("SELECT pg_temp.%s(%s)", funcName, phStr)
+
+	var result sql.NullString
+	err = db.QueryRow(query, queryArgs...).Scan(&result)
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Valid {
+		return &result.String, nil
+	}
+	return nil, nil
 }
