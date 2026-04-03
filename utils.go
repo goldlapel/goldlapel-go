@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
+
+	"github.com/lib/pq"
 )
 
 // ZMember represents a member and its score in a sorted set.
@@ -17,6 +20,45 @@ type ZMember struct {
 func Publish(db *sql.DB, channel, message string) error {
 	_, err := db.Exec("SELECT pg_notify($1, $2)", channel, message)
 	return err
+}
+
+// Subscribe listens for messages on a channel. Like redis.subscribe().
+// Uses PostgreSQL LISTEN/NOTIFY under the hood. This blocks forever,
+// calling the callback for each received message. Pass a connection
+// string (DSN), not a *sql.DB, because LISTEN requires a dedicated connection.
+func Subscribe(conn string, channel string, callback func(channel, payload string)) error {
+	minReconn := 10 * time.Second
+	maxReconn := time.Minute
+	listener := pq.NewListener(conn, minReconn, maxReconn, nil)
+	defer listener.Close()
+
+	if err := listener.Listen(channel); err != nil {
+		return fmt.Errorf("listen on channel %q: %w", channel, err)
+	}
+
+	for {
+		n := <-listener.Notify
+		if n == nil {
+			// Connection lost, lib/pq will reconnect automatically.
+			// The next receive will block until reconnected.
+			continue
+		}
+		callback(n.Channel, n.Extra)
+	}
+}
+
+// SubscribeAsync listens for messages on a channel in a background goroutine.
+// Like redis.subscribe() but non-blocking. Returns immediately.
+// The returned channel receives an error if the initial LISTEN fails;
+// otherwise it is closed when the goroutine starts listening.
+func SubscribeAsync(conn string, channel string, callback func(channel, payload string)) chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if err := Subscribe(conn, channel, callback); err != nil {
+			errCh <- err
+		}
+	}()
+	return errCh
 }
 
 // Enqueue adds a job to a queue table. Like redis.lpush().
@@ -84,6 +126,23 @@ func Incr(db *sql.DB, table, key string, amount int64) (int64, error) {
 	return value, nil
 }
 
+// GetCounter reads a counter value. Like redis.get() for a counter key.
+// Returns the current value, or 0 if the key doesn't exist.
+func GetCounter(db *sql.DB, table, key string) (int64, error) {
+	var value int64
+	err := db.QueryRow(
+		"SELECT value FROM "+table+" WHERE key = $1",
+		key).Scan(&value)
+
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
 // Zadd adds a member with a score to a sorted set. Like redis.zadd().
 // Creates the sorted set table if it doesn't exist.
 // If the member already exists, updates the score.
@@ -132,6 +191,91 @@ func Zrange(db *sql.DB, table string, start, stop int, desc bool) ([]ZMember, er
 		results = append(results, m)
 	}
 	return results, rows.Err()
+}
+
+// Zincrby increments a member's score in a sorted set. Like redis.zincrby().
+// Creates the sorted set table if it doesn't exist.
+// If the member doesn't exist, it is created with the given amount as its score.
+// Returns the new score.
+func Zincrby(db *sql.DB, table, member string, amount float64) (float64, error) {
+	_, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + table + " (" +
+			"member TEXT PRIMARY KEY, " +
+			"score DOUBLE PRECISION NOT NULL)")
+	if err != nil {
+		return 0, fmt.Errorf("create sorted set table: %w", err)
+	}
+
+	var score float64
+	err = db.QueryRow(
+		"INSERT INTO "+table+" (member, score) VALUES ($1, $2) "+
+			"ON CONFLICT (member) DO UPDATE SET score = "+table+".score + $3 "+
+			"RETURNING score",
+		member, amount, amount).Scan(&score)
+	if err != nil {
+		return 0, err
+	}
+	return score, nil
+}
+
+// Zrank gets the rank of a member in a sorted set. Like redis.zrank().
+// Rank is 0-based. desc=true ranks by highest score first (leaderboard order).
+// Returns nil if the member doesn't exist.
+func Zrank(db *sql.DB, table, member string, desc bool) (*int, error) {
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+
+	var rank int
+	err := db.QueryRow(
+		"SELECT rank FROM ("+
+			"SELECT member, ROW_NUMBER() OVER (ORDER BY score "+order+") - 1 AS rank "+
+			"FROM "+table+
+			") ranked WHERE member = $1",
+		member).Scan(&rank)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rank, nil
+}
+
+// Zscore gets the score of a member in a sorted set. Like redis.zscore().
+// Returns nil if the member doesn't exist.
+func Zscore(db *sql.DB, table, member string) (*float64, error) {
+	var score float64
+	err := db.QueryRow(
+		"SELECT score FROM "+table+" WHERE member = $1",
+		member).Scan(&score)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &score, nil
+}
+
+// Zrem removes a member from a sorted set. Like redis.zrem().
+// Returns true if the member was removed, false if it didn't exist.
+func Zrem(db *sql.DB, table, member string) (bool, error) {
+	result, err := db.Exec(
+		"DELETE FROM "+table+" WHERE member = $1",
+		member)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 // Hset sets a field in a hash. Like redis.hset().
