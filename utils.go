@@ -468,6 +468,147 @@ func Geodist(db *sql.DB, table, geomColumn, nameColumn, nameA, nameB string) (*f
 	return &dist, nil
 }
 
+// StreamMessage represents a message from a stream.
+type StreamMessage struct {
+	ID        int64
+	Payload   string
+	CreatedAt string
+}
+
+// StreamAdd adds a message to a stream. Like redis.xadd().
+// Creates the stream table if it doesn't exist. Returns the message ID.
+func StreamAdd(db *sql.DB, stream string, payload string) (int64, error) {
+	_, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + stream + " (" +
+			"id BIGSERIAL PRIMARY KEY, " +
+			"payload JSONB NOT NULL, " +
+			"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+	if err != nil {
+		return 0, fmt.Errorf("create stream table: %w", err)
+	}
+
+	var id int64
+	err = db.QueryRow(
+		"INSERT INTO "+stream+" (payload) VALUES ($1::jsonb) RETURNING id",
+		payload).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// StreamCreateGroup creates a consumer group for a stream. Like redis.xgroup_create().
+// Creates the consumer group tracking table and initializes the group at position 0.
+func StreamCreateGroup(db *sql.DB, stream, group string) error {
+	_, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + stream + "_groups (" +
+			"group_name TEXT NOT NULL, " +
+			"consumer TEXT NOT NULL DEFAULT '', " +
+			"message_id BIGINT NOT NULL, " +
+			"acked BOOLEAN NOT NULL DEFAULT FALSE, " +
+			"claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
+			"PRIMARY KEY (group_name, message_id))")
+	if err != nil {
+		return fmt.Errorf("create consumer group table: %w", err)
+	}
+
+	_, err = db.Exec(
+		"CREATE TABLE IF NOT EXISTS " + stream + "_cursors (" +
+			"group_name TEXT PRIMARY KEY, " +
+			"last_id BIGINT NOT NULL DEFAULT 0)")
+	if err != nil {
+		return fmt.Errorf("create cursor table: %w", err)
+	}
+
+	_, err = db.Exec(
+		"INSERT INTO "+stream+"_cursors (group_name, last_id) VALUES ($1, 0) "+
+			"ON CONFLICT (group_name) DO NOTHING",
+		group)
+	return err
+}
+
+// StreamRead reads messages from a stream for a consumer group. Like redis.xreadgroup().
+// Returns up to count undelivered messages and assigns them to the consumer.
+func StreamRead(db *sql.DB, stream, group, consumer string, count int) ([]StreamMessage, error) {
+	rows, err := db.Query(
+		"WITH cursor AS ("+
+			"SELECT last_id FROM "+stream+"_cursors WHERE group_name = $1 FOR UPDATE"+
+			"), new_msgs AS ("+
+			"SELECT id, payload, created_at FROM "+stream+
+			" WHERE id > (SELECT last_id FROM cursor)"+
+			" ORDER BY id LIMIT $2"+
+			"), updated_cursor AS ("+
+			"UPDATE "+stream+"_cursors SET last_id = COALESCE((SELECT MAX(id) FROM new_msgs), last_id)"+
+			" WHERE group_name = $3"+
+			"), inserted AS ("+
+			"INSERT INTO "+stream+"_groups (group_name, consumer, message_id)"+
+			" SELECT $4, $5, id FROM new_msgs"+
+			" ON CONFLICT (group_name, message_id) DO NOTHING"+
+			") SELECT id, payload, created_at FROM new_msgs ORDER BY id",
+		group, count, group, group, consumer)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []StreamMessage
+	for rows.Next() {
+		var m StreamMessage
+		if err := rows.Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
+// StreamAck acknowledges a message in a consumer group. Like redis.xack().
+// Returns true if the message was acknowledged, false if it didn't exist.
+func StreamAck(db *sql.DB, stream, group string, messageID int64) (bool, error) {
+	result, err := db.Exec(
+		"UPDATE "+stream+"_groups SET acked = TRUE "+
+			"WHERE group_name = $1 AND message_id = $2 AND acked = FALSE",
+		group, messageID)
+	if err != nil {
+		return false, err
+	}
+
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// StreamClaim claims idle messages from other consumers. Like redis.xclaim().
+// Returns messages that have been pending (unacked) longer than minIdleMs milliseconds
+// and reassigns them to the specified consumer.
+func StreamClaim(db *sql.DB, stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
+	rows, err := db.Query(
+		"WITH claimed AS ("+
+			"UPDATE "+stream+"_groups SET consumer = $1, claimed_at = NOW()"+
+			" WHERE group_name = $2 AND acked = FALSE"+
+			" AND claimed_at < NOW() - ($3 || ' milliseconds')::interval"+
+			" RETURNING message_id"+
+			") SELECT s.id, s.payload, s.created_at FROM "+stream+" s"+
+			" INNER JOIN claimed c ON c.message_id = s.id ORDER BY s.id",
+		consumer, group, fmt.Sprintf("%d", minIdleMs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []StreamMessage
+	for rows.Next() {
+		var m StreamMessage
+		if err := rows.Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
 // Script executes Lua code on PostgreSQL via the pllua extension.
 // Creates a temporary function from the Lua code, executes it with the
 // provided arguments, and returns the text result. Returns nil if the
