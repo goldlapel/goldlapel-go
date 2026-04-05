@@ -21,10 +21,13 @@ func validateIdentifier(name string) error {
 
 // searchOptions holds configuration for search functions.
 type searchOptions struct {
-	limit     int
-	lang      string
-	threshold float64
-	highlight bool
+	limit       int
+	lang        string
+	threshold   float64
+	highlight   bool
+	query       string
+	queryColumn interface{}
+	groupBy     string
 }
 
 // SearchOption configures a search call.
@@ -48,6 +51,21 @@ func WithThreshold(t float64) SearchOption {
 // WithHighlight enables ts_headline highlighting for full-text search.
 func WithHighlight(on bool) SearchOption {
 	return func(o *searchOptions) { o.highlight = on }
+}
+
+// WithQuery sets the full-text search query string for filtering.
+func WithQuery(q string) SearchOption {
+	return func(o *searchOptions) { o.query = q }
+}
+
+// WithQueryColumn sets the column(s) to search against. Accepts string or []string.
+func WithQueryColumn(col interface{}) SearchOption {
+	return func(o *searchOptions) { o.queryColumn = col }
+}
+
+// WithGroupBy sets the GROUP BY column for aggregate queries.
+func WithGroupBy(col string) SearchOption {
+	return func(o *searchOptions) { o.groupBy = col }
 }
 
 // scanRows reads all rows from a *sql.Rows using dynamic column scanning.
@@ -295,4 +313,159 @@ func Suggest(db *sql.DB, table, column, prefix string, opts ...SearchOption) ([]
 	defer rows.Close()
 
 	return scanRows(rows)
+}
+
+// Facets performs a terms aggregation on a column.
+// Like Elasticsearch terms aggregation. Returns [{value, count}] sorted by
+// count descending. Optionally filters by full-text search when WithQuery
+// and WithQueryColumn are provided. Default limit=50, lang="english".
+func Facets(db *sql.DB, table, column string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	o := &searchOptions{limit: 50, lang: "english"}
+	for _, fn := range opts {
+		fn(o)
+	}
+
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(column); err != nil {
+		return nil, err
+	}
+
+	var q string
+	var params []interface{}
+
+	if o.query != "" && o.queryColumn != nil {
+		// Normalize queryColumn to a slice
+		var qCols []string
+		switch v := o.queryColumn.(type) {
+		case string:
+			qCols = []string{v}
+		case []string:
+			qCols = v
+		default:
+			return nil, fmt.Errorf("queryColumn must be a string or []string")
+		}
+
+		for _, col := range qCols {
+			if err := validateIdentifier(col); err != nil {
+				return nil, err
+			}
+		}
+
+		tsvParts := make([]string, len(qCols))
+		for i, col := range qCols {
+			tsvParts[i] = fmt.Sprintf("coalesce(%s, '')", col)
+		}
+		tsvExpr := fmt.Sprintf("to_tsvector($1, %s)", strings.Join(tsvParts, " || ' ' || "))
+
+		q = fmt.Sprintf(
+			"SELECT %s AS value, COUNT(*) AS count FROM %s WHERE %s @@ plainto_tsquery($2, $3) GROUP BY %s ORDER BY count DESC, %s LIMIT $4",
+			column, table, tsvExpr, column, column)
+		params = []interface{}{o.lang, o.lang, o.query, o.limit}
+	} else {
+		q = fmt.Sprintf(
+			"SELECT %s AS value, COUNT(*) AS count FROM %s GROUP BY %s ORDER BY count DESC, %s LIMIT $1",
+			column, table, column, column)
+		params = []interface{}{o.limit}
+	}
+
+	rows, err := db.Query(q, params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanRows(rows)
+}
+
+// validAggregateFuncs is the set of allowed SQL aggregate function names.
+var validAggregateFuncs = map[string]bool{
+	"count": true,
+	"sum":   true,
+	"avg":   true,
+	"min":   true,
+	"max":   true,
+}
+
+// Aggregate performs an aggregate function on a column.
+// Like Elasticsearch metric aggregations. funcName must be one of: count,
+// sum, avg, min, max. With WithGroupBy, groups results by that column.
+// Default limit=50.
+func Aggregate(db *sql.DB, table, column, funcName string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	o := &searchOptions{limit: 50}
+	for _, fn := range opts {
+		fn(o)
+	}
+
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(column); err != nil {
+		return nil, err
+	}
+
+	funcLower := strings.ToLower(funcName)
+	if !validAggregateFuncs[funcLower] {
+		return nil, fmt.Errorf("invalid aggregate function: %s (must be one of: count, sum, avg, min, max)", funcName)
+	}
+
+	var aggExpr string
+	if funcLower == "count" {
+		aggExpr = "COUNT(*)"
+	} else {
+		aggExpr = fmt.Sprintf("%s(%s)", strings.ToUpper(funcLower), column)
+	}
+
+	var q string
+	var params []interface{}
+
+	if o.groupBy != "" {
+		if err := validateIdentifier(o.groupBy); err != nil {
+			return nil, err
+		}
+		q = fmt.Sprintf(
+			"SELECT %s, %s AS value FROM %s GROUP BY %s ORDER BY value DESC LIMIT $1",
+			o.groupBy, aggExpr, table, o.groupBy)
+		params = []interface{}{o.limit}
+	} else {
+		q = fmt.Sprintf("SELECT %s AS value FROM %s", aggExpr, table)
+		params = nil
+	}
+
+	rows, err := db.Query(q, params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanRows(rows)
+}
+
+// CreateSearchConfig creates a custom text search configuration.
+// Copies from an existing configuration (default "english").
+// No-ops if the configuration already exists.
+func CreateSearchConfig(db *sql.DB, name, copyFrom string) error {
+	if copyFrom == "" {
+		copyFrom = "english"
+	}
+
+	if err := validateIdentifier(name); err != nil {
+		return err
+	}
+	if err := validateIdentifier(copyFrom); err != nil {
+		return err
+	}
+
+	var exists int
+	err := db.QueryRow("SELECT 1 FROM pg_ts_config WHERE cfgname = $1", name).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+
+	_, err = db.Exec(fmt.Sprintf("CREATE TEXT SEARCH CONFIGURATION %s (COPY = %s)", name, copyFrom))
+	return err
 }
