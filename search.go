@@ -448,6 +448,72 @@ func Aggregate(db *sql.DB, table, column, funcName string, opts ...SearchOption)
 	return scanRows(rows)
 }
 
+// Analyze shows how PostgreSQL breaks text into searchable tokens.
+// Returns one row per token with alias, description, token, dictionaries,
+// dictionary, and lexemes columns. Useful for understanding why a search
+// matches or doesn't match. Default lang="english".
+func Analyze(db *sql.DB, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	o := &searchOptions{lang: "english"}
+	for _, fn := range opts {
+		fn(o)
+	}
+
+	rows, err := db.Query(
+		"SELECT alias, description, token, dictionaries, dictionary, lexemes FROM ts_debug($1, $2)",
+		o.lang, text)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanRows(rows)
+}
+
+// ExplainScore shows why a specific row scores the way it does for a query.
+// Returns a single map with document_text, document_tokens, query_tokens,
+// matches, score, and headline fields. Returns nil (not an error) if the
+// row is not found. Default lang="english".
+func ExplainScore(db *sql.DB, table, column, query, idColumn string, idValue interface{}, opts ...SearchOption) (map[string]interface{}, error) {
+	o := &searchOptions{lang: "english"}
+	for _, fn := range opts {
+		fn(o)
+	}
+
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(column); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(idColumn); err != nil {
+		return nil, err
+	}
+
+	q := fmt.Sprintf(
+		`SELECT %s AS document_text, to_tsvector($1, %s)::text AS document_tokens,
+    plainto_tsquery($1, $2)::text AS query_tokens,
+    to_tsvector($1, %s) @@ plainto_tsquery($1, $2) AS matches,
+    ts_rank(to_tsvector($1, %s), plainto_tsquery($1, $2)) AS score,
+    ts_headline($1, %s, plainto_tsquery($1, $2), 'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS headline
+FROM %s WHERE %s = $3`,
+		column, column, column, column, column, table, idColumn)
+
+	rows, err := db.Query(q, o.lang, query, idValue)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results, err := scanRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
+}
+
 // CreateSearchConfig creates a custom text search configuration.
 // Copies from an existing configuration (default "english").
 // No-ops if the configuration already exists.
