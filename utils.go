@@ -619,7 +619,7 @@ func Script(db *sql.DB, luaCode string, args ...string) (*string, error) {
 		return nil, err
 	}
 
-	funcName := fmt.Sprintf("_gl_lua_%x", rand.Int63())[:16]
+	funcName := fmt.Sprintf("_gl_lua_%016x", rand.Int63())[:24]
 
 	var params []string
 	for i := range args {
