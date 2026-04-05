@@ -86,7 +86,9 @@ func scanRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 // Search performs full-text search using tsvector/tsquery.
 // Like Elasticsearch full-text queries. Returns rows with a _score field
 // ranked by relevance. Default limit=50, lang="english".
-func Search(db *sql.DB, table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+// Accepts one or more column names. Multiple columns are concatenated
+// for searching (like Python's multi-column support).
+func Search(db *sql.DB, table string, columns interface{}, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, lang: "english"}
 	for _, fn := range opts {
 		fn(o)
@@ -95,25 +97,47 @@ func Search(db *sql.DB, table, column, query string, opts ...SearchOption) ([]ma
 	if err := validateIdentifier(table); err != nil {
 		return nil, err
 	}
-	if err := validateIdentifier(column); err != nil {
-		return nil, err
+
+	// Normalize columns to a slice
+	var cols []string
+	switch v := columns.(type) {
+	case string:
+		cols = []string{v}
+	case []string:
+		cols = v
+	default:
+		return nil, fmt.Errorf("columns must be a string or []string")
 	}
 
-	tsv := fmt.Sprintf("to_tsvector($1, coalesce(%s, ''))", column)
+	for _, col := range cols {
+		if err := validateIdentifier(col); err != nil {
+			return nil, err
+		}
+	}
+
+	// Build tsvector expression: to_tsvector($1, coalesce(col1, '') || ' ' || coalesce(col2, ''))
+	tsvParts := make([]string, len(cols))
+	for i, col := range cols {
+		tsvParts[i] = fmt.Sprintf("coalesce(%s, '')", col)
+	}
+	tsvExpr := fmt.Sprintf("to_tsvector($1, %s)", strings.Join(tsvParts, " || ' ' || "))
 	tsq := "plainto_tsquery($2, $3)"
+
+	// For highlight, use the first column
+	highlightCol := cols[0]
 
 	var q string
 	var params []interface{}
 
 	if o.highlight {
 		q = fmt.Sprintf(
-			"SELECT *, ts_rank(%s, %s) AS _score, ts_headline($4, coalesce(%s, ''), %s) AS _highlight FROM %s WHERE %s @@ %s ORDER BY _score DESC LIMIT $5",
-			tsv, tsq, column, tsq, table, tsv, tsq)
+			"SELECT *, ts_rank(%s, %s) AS _score, ts_headline($4, coalesce(%s, ''), %s, 'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight FROM %s WHERE %s @@ %s ORDER BY _score DESC LIMIT $5",
+			tsvExpr, tsq, highlightCol, tsq, table, tsvExpr, tsq)
 		params = []interface{}{o.lang, o.lang, query, o.lang, o.limit}
 	} else {
 		q = fmt.Sprintf(
 			"SELECT *, ts_rank(%s, %s) AS _score FROM %s WHERE %s @@ %s ORDER BY _score DESC LIMIT $4",
-			tsv, tsq, table, tsv, tsq)
+			tsvExpr, tsq, table, tsvExpr, tsq)
 		params = []interface{}{o.lang, o.lang, query, o.limit}
 	}
 
