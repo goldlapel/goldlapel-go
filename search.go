@@ -28,6 +28,7 @@ type searchOptions struct {
 	query       string
 	queryColumn interface{}
 	groupBy     string
+	metadata    string
 }
 
 // SearchOption configures a search call.
@@ -66,6 +67,11 @@ func WithQueryColumn(col interface{}) SearchOption {
 // WithGroupBy sets the GROUP BY column for aggregate queries.
 func WithGroupBy(col string) SearchOption {
 	return func(o *searchOptions) { o.groupBy = col }
+}
+
+// WithMetadata sets JSON metadata for percolator queries.
+func WithMetadata(meta string) SearchOption {
+	return func(o *searchOptions) { o.metadata = meta }
 }
 
 // scanRows reads all rows from a *sql.Rows using dynamic column scanning.
