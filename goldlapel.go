@@ -211,7 +211,7 @@ func (gl *GoldLapel) Start() (string, error) {
 		return "", err
 	}
 
-	args := []string{"--upstream", gl.upstream, "--port", fmt.Sprintf("%d", gl.port)}
+	args := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.port)}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)
 		if err != nil {
