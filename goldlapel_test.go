@@ -92,6 +92,11 @@ func TestCopyToExecutableTemp(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	// Verify the path includes a hash suffix
+	if !strings.Contains(dst, "goldlapel-test-binary-") {
+		t.Fatalf("expected hashed filename, got %q", dst)
+	}
+
 	// Verify the copy exists and is executable
 	info, err := os.Stat(dst)
 	if err != nil {
@@ -129,7 +134,7 @@ func TestCopyToExecutableTempReusesExisting(t *testing.T) {
 		t.Fatalf("first call: unexpected error: %v", err)
 	}
 
-	// Second call should reuse it
+	// Second call should reuse it (same content → same hash → same path)
 	dst2, err := copyToExecutableTemp(src, "goldlapel-test-reuse")
 	if err != nil {
 		t.Fatalf("second call: unexpected error: %v", err)
@@ -141,6 +146,49 @@ func TestCopyToExecutableTempReusesExisting(t *testing.T) {
 
 	// Clean up
 	os.RemoveAll(filepath.Dir(dst1))
+}
+
+func TestCopyToExecutableTempDifferentContentGetsDifferentPath(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "goldlapel-test-upgrade")
+
+	// First version
+	if err := os.WriteFile(src, []byte("version 1 binary"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	dst1, err := copyToExecutableTemp(src, "goldlapel-test-upgrade")
+	if err != nil {
+		t.Fatalf("first version: unexpected error: %v", err)
+	}
+
+	// Second version (different content, could even be same size)
+	// chmod first since previous WriteFile created it read-only
+	os.Chmod(src, 0644)
+	if err := os.WriteFile(src, []byte("version 2 binary"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	dst2, err := copyToExecutableTemp(src, "goldlapel-test-upgrade")
+	if err != nil {
+		t.Fatalf("second version: unexpected error: %v", err)
+	}
+
+	if dst1 == dst2 {
+		t.Fatalf("expected different paths for different content, both got %q", dst1)
+	}
+
+	// Old version file should have been cleaned up
+	if _, err := os.Stat(dst1); !os.IsNotExist(err) {
+		t.Fatalf("expected old version %q to be cleaned up", dst1)
+	}
+
+	// New version file should exist
+	if _, err := os.Stat(dst2); err != nil {
+		t.Fatalf("expected new version %q to exist, got: %v", dst2, err)
+	}
+
+	// Clean up
+	os.RemoveAll(filepath.Dir(dst2))
 }
 
 func TestCopyToExecutableTempSourceNotFound(t *testing.T) {

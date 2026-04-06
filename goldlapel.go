@@ -1,6 +1,8 @@
 package goldlapel
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -484,21 +486,44 @@ func copyToExecutableTemp(src, name string) (string, error) {
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	dst := filepath.Join(dir, name)
+	// Include a content hash in the filename so different binary versions
+	// get different paths, even if the file size happens to be identical.
+	hash := sha256.Sum256(data)
+	hashPrefix := hex.EncodeToString(hash[:8]) // 16 hex chars
+	dst := filepath.Join(dir, name+"-"+hashPrefix)
 
-	// If the temp copy already exists and is executable, reuse it
+	// If the hashed temp copy already exists and is executable, reuse it
 	if info, err := os.Stat(dst); err == nil && info.Mode().IsRegular() && isExecutable(info) {
-		// Verify same size as a basic staleness check
-		if info.Size() == int64(len(data)) {
-			return dst, nil
-		}
+		return dst, nil
 	}
 
 	if err := os.WriteFile(dst, data, 0755); err != nil {
 		return "", fmt.Errorf("failed to write executable copy: %w", err)
 	}
 
+	// Clean up stale copies for this platform (old hashes)
+	cleanOldTempBinaries(dir, name, dst)
+
 	return dst, nil
+}
+
+// cleanOldTempBinaries removes old hashed copies for the same platform binary,
+// keeping only the current version to prevent /tmp clutter.
+func cleanOldTempBinaries(dir, namePrefix, keep string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := namePrefix + "-"
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		if strings.HasPrefix(e.Name(), prefix) && full != keep {
+			os.Remove(full)
+		}
+	}
 }
 
 func toInt(v interface{}) int {
