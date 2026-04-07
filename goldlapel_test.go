@@ -403,11 +403,11 @@ func TestProxyURLEmptyWhenNotStarted(t *testing.T) {
 // --- ConfigToArgs tests ---
 
 func TestConfigToArgs_StringValue(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"mode": "butler"})
+	args, err := ConfigToArgs(map[string]interface{}{"mode": "waiter"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"--mode", "butler"}
+	want := []string{"--mode", "waiter"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("got %v, want %v", args, want)
 	}
@@ -483,7 +483,7 @@ func TestConfigToArgs_UnknownKey(t *testing.T) {
 
 func TestConfigToArgs_MultipleKeys(t *testing.T) {
 	args, err := ConfigToArgs(map[string]interface{}{
-		"mode":         "butler",
+		"mode":         "waiter",
 		"pool_size":    10,
 		"disable_pool": true,
 	})
@@ -491,7 +491,7 @@ func TestConfigToArgs_MultipleKeys(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Keys are sorted: disable_pool, mode, pool_size
-	want := []string{"--disable-pool", "--mode", "butler", "--pool-size", "10"}
+	want := []string{"--disable-pool", "--mode", "waiter", "--pool-size", "10"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("got %v, want %v", args, want)
 	}
@@ -623,15 +623,15 @@ func TestDashboardURLSingletonEmptyWhenNotStarted(t *testing.T) {
 
 func TestWithConfig_Integration(t *testing.T) {
 	config := map[string]interface{}{
-		"mode":      "butler",
+		"mode":      "waiter",
 		"pool_size": 20,
 	}
 	gl := New("postgresql://user:pass@localhost:5432/mydb", WithConfig(config))
 	if gl.config == nil {
 		t.Fatal("expected config to be set")
 	}
-	if gl.config["mode"] != "butler" {
-		t.Fatalf("expected mode=butler, got %v", gl.config["mode"])
+	if gl.config["mode"] != "waiter" {
+		t.Fatalf("expected mode=waiter, got %v", gl.config["mode"])
 	}
 	if gl.config["pool_size"] != 20 {
 		t.Fatalf("expected pool_size=20, got %v", gl.config["pool_size"])

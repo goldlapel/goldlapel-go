@@ -95,7 +95,7 @@ import goldlapel "github.com/goldlapel/goldlapel-go"
 
 conn, err := goldlapel.Start("postgresql://user:pass@localhost/mydb",
     goldlapel.WithConfig(map[string]interface{}{
-        "mode":              "butler",
+        "mode":              "waiter",
         "pool_size":         50,
         "disable_matviews":  true,
         "replica":           []interface{}{"postgresql://user:pass@replica1/mydb"},
