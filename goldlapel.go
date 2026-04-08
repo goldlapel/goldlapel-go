@@ -2,7 +2,9 @@ package goldlapel
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -172,6 +176,7 @@ type GoldLapel struct {
 	proxyURL      string
 	stderr        string
 	done          chan struct{} // closed when process exits
+	db            *sql.DB
 	mu            sync.Mutex
 }
 
@@ -267,6 +272,13 @@ func (gl *GoldLapel) Start() (string, error) {
 
 	gl.proxyURL = MakeProxyURL(gl.upstream, gl.port)
 
+	db, err := sql.Open("postgres", gl.proxyURL)
+	if err != nil {
+		// Non-fatal: proxy is running, user can still call URL() and open their own db
+		db = nil
+	}
+	gl.db = db
+
 	if gl.dashboardPort > 0 {
 		fmt.Printf("goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
 	} else {
@@ -288,10 +300,20 @@ func (gl *GoldLapel) Stop() error {
 	// Check if already exited
 	select {
 	case <-gl.done:
+		if gl.db != nil {
+			gl.db.Close()
+			gl.db = nil
+		}
 		gl.done = nil
 		gl.proxyURL = ""
 		return nil
 	default:
+	}
+
+	// Close the database connection before stopping the proxy
+	if gl.db != nil {
+		gl.db.Close()
+		gl.db = nil
 	}
 
 	// Graceful shutdown: SIGTERM on Unix, Kill on Windows (no SIGTERM support)
@@ -351,6 +373,465 @@ func (gl *GoldLapel) DashboardURL() string {
 		return fmt.Sprintf("http://127.0.0.1:%d", gl.dashboardPort)
 	}
 	return ""
+}
+
+// ErrNotConnected is returned by receiver methods when the proxy has not been
+// started or the database connection is not available.
+var ErrNotConnected = fmt.Errorf("goldlapel: proxy not started or database connection unavailable")
+
+// DB returns the underlying *sql.DB connected to the proxy.
+// Returns nil if the proxy has not been started.
+func (gl *GoldLapel) DB() *sql.DB {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	return gl.db
+}
+
+// requireDB returns the stored *sql.DB or ErrNotConnected.
+func (gl *GoldLapel) requireDB() (*sql.DB, error) {
+	gl.mu.Lock()
+	db := gl.db
+	gl.mu.Unlock()
+	if db == nil {
+		return nil, ErrNotConnected
+	}
+	return db, nil
+}
+
+// --- Document store receiver methods ---
+
+func (gl *GoldLapel) DocInsert(collection string, document interface{}) (map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return DocInsert(db, collection, document)
+}
+
+func (gl *GoldLapel) DocInsertMany(collection string, documents []interface{}) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return DocInsertMany(db, collection, documents)
+}
+
+func (gl *GoldLapel) DocFind(collection string, filter interface{}, opts ...DocFindOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return DocFind(db, collection, filter, opts...)
+}
+
+func (gl *GoldLapel) DocFindOne(collection string, filter interface{}) (map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return DocFindOne(db, collection, filter)
+}
+
+func (gl *GoldLapel) DocUpdate(collection string, filter, update interface{}) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return DocUpdate(db, collection, filter, update)
+}
+
+func (gl *GoldLapel) DocUpdateOne(collection string, filter, update interface{}) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return DocUpdateOne(db, collection, filter, update)
+}
+
+func (gl *GoldLapel) DocDelete(collection string, filter interface{}) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return DocDelete(db, collection, filter)
+}
+
+func (gl *GoldLapel) DocDeleteOne(collection string, filter interface{}) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return DocDeleteOne(db, collection, filter)
+}
+
+func (gl *GoldLapel) DocCount(collection string, filter interface{}) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return DocCount(db, collection, filter)
+}
+
+func (gl *GoldLapel) DocCreateIndex(collection string, keys ...string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocCreateIndex(db, collection, keys...)
+}
+
+func (gl *GoldLapel) DocAggregate(collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return DocAggregate(db, collection, pipeline)
+}
+
+// --- Search receiver methods ---
+
+func (gl *GoldLapel) Search(table string, columns interface{}, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Search(db, table, columns, query, opts...)
+}
+
+func (gl *GoldLapel) SearchFuzzy(table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return SearchFuzzy(db, table, column, query, opts...)
+}
+
+func (gl *GoldLapel) SearchPhonetic(table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return SearchPhonetic(db, table, column, query, opts...)
+}
+
+func (gl *GoldLapel) Similar(table, column string, vector []float64, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Similar(db, table, column, vector, opts...)
+}
+
+func (gl *GoldLapel) Suggest(table, column, prefix string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Suggest(db, table, column, prefix, opts...)
+}
+
+func (gl *GoldLapel) Facets(table, column string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Facets(db, table, column, opts...)
+}
+
+func (gl *GoldLapel) Aggregate(table, column, funcName string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Aggregate(db, table, column, funcName, opts...)
+}
+
+func (gl *GoldLapel) CreateSearchConfig(name, copyFrom string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return CreateSearchConfig(db, name, copyFrom)
+}
+
+func (gl *GoldLapel) Analyze(text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Analyze(db, text, opts...)
+}
+
+func (gl *GoldLapel) ExplainScore(table, column, query, idColumn string, idValue interface{}, opts ...SearchOption) (map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return ExplainScore(db, table, column, query, idColumn, idValue, opts...)
+}
+
+// --- Pub/Sub receiver methods ---
+
+func (gl *GoldLapel) Publish(channel, message string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return Publish(db, channel, message)
+}
+
+func (gl *GoldLapel) Subscribe(channel string, callback func(channel, payload string)) error {
+	gl.mu.Lock()
+	url := gl.proxyURL
+	gl.mu.Unlock()
+	if url == "" {
+		return ErrNotConnected
+	}
+	return Subscribe(url, channel, callback)
+}
+
+func (gl *GoldLapel) SubscribeAsync(channel string, callback func(channel, payload string)) chan error {
+	gl.mu.Lock()
+	url := gl.proxyURL
+	gl.mu.Unlock()
+	if url == "" {
+		ch := make(chan error, 1)
+		ch <- ErrNotConnected
+		return ch
+	}
+	return SubscribeAsync(url, channel, callback)
+}
+
+// --- Queue receiver methods ---
+
+func (gl *GoldLapel) Enqueue(queueTable string, payload interface{}) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return Enqueue(db, queueTable, payload)
+}
+
+func (gl *GoldLapel) Dequeue(queueTable string) (json.RawMessage, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Dequeue(db, queueTable)
+}
+
+// --- Counter receiver methods ---
+
+func (gl *GoldLapel) Incr(table, key string, amount int64) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return Incr(db, table, key, amount)
+}
+
+func (gl *GoldLapel) GetCounter(table, key string) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return GetCounter(db, table, key)
+}
+
+// --- Hash receiver methods ---
+
+func (gl *GoldLapel) Hset(table, key, field string, value interface{}) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return Hset(db, table, key, field, value)
+}
+
+func (gl *GoldLapel) Hget(table, key, field string) (json.RawMessage, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Hget(db, table, key, field)
+}
+
+func (gl *GoldLapel) Hgetall(table, key string) (json.RawMessage, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Hgetall(db, table, key)
+}
+
+func (gl *GoldLapel) Hdel(table, key, field string) (bool, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return false, err
+	}
+	return Hdel(db, table, key, field)
+}
+
+// --- Sorted set receiver methods ---
+
+func (gl *GoldLapel) Zadd(table, member string, score float64) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return Zadd(db, table, member, score)
+}
+
+func (gl *GoldLapel) Zincrby(table, member string, amount float64) (float64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return Zincrby(db, table, member, amount)
+}
+
+func (gl *GoldLapel) Zrange(table string, start, stop int, desc bool) ([]ZMember, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Zrange(db, table, start, stop, desc)
+}
+
+func (gl *GoldLapel) Zrank(table, member string, desc bool) (*int, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Zrank(db, table, member, desc)
+}
+
+func (gl *GoldLapel) Zscore(table, member string) (*float64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Zscore(db, table, member)
+}
+
+func (gl *GoldLapel) Zrem(table, member string) (bool, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return false, err
+	}
+	return Zrem(db, table, member)
+}
+
+// --- Geo receiver methods ---
+
+func (gl *GoldLapel) Georadius(table, geomColumn string, lon, lat, radiusMeters float64, limit int) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Georadius(db, table, geomColumn, lon, lat, radiusMeters, limit)
+}
+
+func (gl *GoldLapel) Geoadd(table, nameColumn, geomColumn, name string, lon, lat float64) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return Geoadd(db, table, nameColumn, geomColumn, name, lon, lat)
+}
+
+func (gl *GoldLapel) Geodist(table, geomColumn, nameColumn, nameA, nameB string) (*float64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Geodist(db, table, geomColumn, nameColumn, nameA, nameB)
+}
+
+// --- Misc receiver methods ---
+
+func (gl *GoldLapel) CountDistinct(table, column string) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return CountDistinct(db, table, column)
+}
+
+func (gl *GoldLapel) Script(luaCode string, args ...string) (*string, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Script(db, luaCode, args...)
+}
+
+// --- Stream receiver methods ---
+
+func (gl *GoldLapel) StreamAdd(stream string, payload string) (int64, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return 0, err
+	}
+	return StreamAdd(db, stream, payload)
+}
+
+func (gl *GoldLapel) StreamCreateGroup(stream, group string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return StreamCreateGroup(db, stream, group)
+}
+
+func (gl *GoldLapel) StreamRead(stream, group, consumer string, count int) ([]StreamMessage, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return StreamRead(db, stream, group, consumer, count)
+}
+
+func (gl *GoldLapel) StreamAck(stream, group string, messageID int64) (bool, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return false, err
+	}
+	return StreamAck(db, stream, group, messageID)
+}
+
+func (gl *GoldLapel) StreamClaim(stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return StreamClaim(db, stream, group, consumer, minIdleMs)
+}
+
+// --- Percolate receiver methods ---
+
+func (gl *GoldLapel) PercolateAdd(name, queryID, query string, opts ...SearchOption) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return PercolateAdd(db, name, queryID, query, opts...)
+}
+
+func (gl *GoldLapel) Percolate(name, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return Percolate(db, name, text, opts...)
+}
+
+func (gl *GoldLapel) PercolateDelete(name, queryID string) (bool, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return false, err
+	}
+	return PercolateDelete(db, name, queryID)
 }
 
 // --- Singleton API ---
