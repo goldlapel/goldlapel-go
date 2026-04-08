@@ -1011,3 +1011,239 @@ func TestBuildFilter_OperatorsInDocCount(t *testing.T) {
 	assertContains(t, last.query, "SELECT COUNT(*) FROM users WHERE")
 	assertContains(t, last.query, "(data->>'score')::numeric >= $1")
 }
+
+// --- Composite $group _id ---
+
+func TestDocAggregate_CompositeID(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "total"},
+		[][]driver.Value{
+			{`{"dept":"eng","year":"2026"}`, int64(500)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   map[string]interface{}{"year": "$year", "dept": "$dept"},
+			"total": map[string]interface{}{"$sum": "$revenue"},
+		}},
+	}
+
+	results, err := DocAggregate(db, "sales", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// json_build_object with keys in alphabetical order
+	assertContains(t, last.query, "json_build_object('dept', data->>'dept', 'year', data->>'year') AS _id")
+	assertContains(t, last.query, "SUM((data->>'revenue')::numeric) AS total")
+	// Multi-expression GROUP BY
+	assertContains(t, last.query, "GROUP BY data->>'dept', data->>'year'")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	// _id should be parsed back into a map
+	idMap, ok := results[0]["_id"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected _id to be a map, got %T: %v", results[0]["_id"], results[0]["_id"])
+	}
+	if idMap["dept"] != "eng" {
+		t.Fatalf("expected dept=eng, got %v", idMap["dept"])
+	}
+	if idMap["year"] != "2026" {
+		t.Fatalf("expected year=2026, got %v", idMap["year"])
+	}
+}
+
+func TestDocAggregate_CompositeID_WithMatch(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "count"},
+		[][]driver.Value{
+			{`{"region":"us","status":"active"}`, int64(42)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$match": map[string]interface{}{"org": "acme"}},
+		{"$group": map[string]interface{}{
+			"_id":   map[string]interface{}{"region": "$region", "status": "$status"},
+			"count": map[string]interface{}{"$sum": float64(1)},
+		}},
+		{"$sort": map[string]interface{}{"count": float64(-1)}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "json_build_object('region', data->>'region', 'status', data->>'status') AS _id")
+	assertContains(t, last.query, "WHERE data @> $1::jsonb")
+	assertContains(t, last.query, "GROUP BY data->>'region', data->>'status'")
+	assertContains(t, last.query, "ORDER BY count DESC")
+}
+
+func TestDocAggregate_CompositeID_EmptyMap(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id": map[string]interface{}{},
+		}},
+	}
+
+	_, err := DocAggregate(db, "orders", pipeline)
+	if err == nil {
+		t.Fatal("expected error for empty composite _id map")
+	}
+	assertContains(t, err.Error(), "must not be empty")
+}
+
+func TestDocAggregate_CompositeID_InvalidField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id": map[string]interface{}{"ok": "$bad;field"},
+		}},
+	}
+
+	_, err := DocAggregate(db, "orders", pipeline)
+	if err == nil {
+		t.Fatal("expected error for invalid field in composite _id")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+}
+
+// --- $push and $addToSet accumulators ---
+
+func TestDocAggregate_Push(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "names"},
+		[][]driver.Value{
+			{"eng", "{alice,bob,alice}"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   "$dept",
+			"names": map[string]interface{}{"$push": "$name"},
+		}},
+	}
+
+	results, err := DocAggregate(db, "employees", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "array_agg(data->>'name') AS names")
+	assertContains(t, last.query, "GROUP BY data->>'dept'")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	names, ok := results[0]["names"].([]string)
+	if !ok {
+		t.Fatalf("expected names to be []string, got %T: %v", results[0]["names"], results[0]["names"])
+	}
+	if len(names) != 3 || names[0] != "alice" || names[1] != "bob" || names[2] != "alice" {
+		t.Fatalf("expected [alice bob alice], got %v", names)
+	}
+}
+
+func TestDocAggregate_AddToSet(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "cities"},
+		[][]driver.Value{
+			{"us", "{portland,seattle}"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":    "$country",
+			"cities": map[string]interface{}{"$addToSet": "$city"},
+		}},
+	}
+
+	results, err := DocAggregate(db, "offices", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "array_agg(DISTINCT data->>'city') AS cities")
+	assertContains(t, last.query, "GROUP BY data->>'country'")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	cities, ok := results[0]["cities"].([]string)
+	if !ok {
+		t.Fatalf("expected cities to be []string, got %T: %v", results[0]["cities"], results[0]["cities"])
+	}
+	if len(cities) != 2 || cities[0] != "portland" || cities[1] != "seattle" {
+		t.Fatalf("expected [portland seattle], got %v", cities)
+	}
+}
+
+func TestDocAggregate_PushWithCompositeID(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "items"},
+		[][]driver.Value{
+			{`{"category":"books","year":"2026"}`, "{novel,memoir}"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   map[string]interface{}{"category": "$category", "year": "$year"},
+			"items": map[string]interface{}{"$push": "$title"},
+		}},
+	}
+
+	results, err := DocAggregate(db, "products", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "json_build_object('category', data->>'category', 'year', data->>'year') AS _id")
+	assertContains(t, last.query, "array_agg(data->>'title') AS items")
+	assertContains(t, last.query, "GROUP BY data->>'category', data->>'year'")
+
+	// Verify composite _id is parsed as map
+	idMap, ok := results[0]["_id"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected _id to be a map, got %T", results[0]["_id"])
+	}
+	if idMap["category"] != "books" {
+		t.Fatalf("expected category=books, got %v", idMap["category"])
+	}
+
+	// Verify array is parsed
+	items, ok := results[0]["items"].([]string)
+	if !ok {
+		t.Fatalf("expected items to be []string, got %T", results[0]["items"])
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+}
+
+func TestDocAggregate_AddToSetInvalidField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   "$dept",
+			"names": map[string]interface{}{"$addToSet": "not_a_field_ref"},
+		}},
+	}
+
+	_, err := DocAggregate(db, "employees", pipeline)
+	if err == nil {
+		t.Fatal("expected error for invalid $addToSet field reference")
+	}
+	assertContains(t, err.Error(), "$addToSet")
+}

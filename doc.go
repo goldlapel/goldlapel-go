@@ -532,8 +532,32 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 			}
 			selectParts = append(selectParts, fmt.Sprintf("data->>'%s' AS _id", field))
 			groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", field))
+		} else if idMap, ok := idVal.(map[string]interface{}); ok {
+			// Composite _id: {alias: "$field", ...} → json_build_object + multi GROUP BY
+			if len(idMap) == 0 {
+				return nil, fmt.Errorf("$group _id map must not be empty")
+			}
+			idKeys := make([]string, 0, len(idMap))
+			for k := range idMap {
+				idKeys = append(idKeys, k)
+			}
+			sort.Strings(idKeys)
+
+			jboParts := make([]string, 0, len(idKeys)*2)
+			for _, alias := range idKeys {
+				if err := validateIdentifier(alias); err != nil {
+					return nil, fmt.Errorf("invalid $group _id key %q: %w", alias, err)
+				}
+				fieldRef, err := extractField(idMap[alias])
+				if err != nil {
+					return nil, fmt.Errorf("$group _id key %q: %w", alias, err)
+				}
+				jboParts = append(jboParts, fmt.Sprintf("'%s', data->>'%s'", alias, fieldRef))
+				groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", fieldRef))
+			}
+			selectParts = append(selectParts, fmt.Sprintf("json_build_object(%s) AS _id", strings.Join(jboParts, ", ")))
 		} else {
-			return nil, fmt.Errorf("$group _id must be null or a $field reference")
+			return nil, fmt.Errorf("$group _id must be null, a $field reference, or a map of $field references")
 		}
 
 		// Accumulators (all keys except _id)
@@ -678,6 +702,18 @@ func buildAccumulator(acc map[string]interface{}) (string, error) {
 			return fmt.Sprintf("MAX((data->>'%s')::numeric)", field), nil
 		case "$count":
 			return "COUNT(*)", nil
+		case "$push":
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$push: %w", err)
+			}
+			return fmt.Sprintf("array_agg(data->>'%s')", field), nil
+		case "$addToSet":
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$addToSet: %w", err)
+			}
+			return fmt.Sprintf("array_agg(DISTINCT data->>'%s')", field), nil
 		default:
 			return "", fmt.Errorf("unsupported accumulator: %s", op)
 		}
@@ -713,6 +749,8 @@ func numToInt(v interface{}) (int, bool) {
 
 // scanAggregateRows reads aggregate result rows by column names and returns
 // them as maps. Numeric string values are converted to float64.
+// JSON object strings (from json_build_object) in the _id column are parsed
+// back into maps. Postgres array strings (from array_agg) are parsed into slices.
 func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -733,14 +771,66 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 		for i, col := range columns {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				row[col] = string(b)
-			} else {
-				row[col] = val
+				val = string(b)
 			}
+			s, isStr := val.(string)
+			if isStr {
+				// Try to parse JSON objects (from json_build_object) and arrays
+				if len(s) > 0 && s[0] == '{' && col == "_id" {
+					var m map[string]interface{}
+					if err := json.Unmarshal([]byte(s), &m); err == nil {
+						row[col] = m
+						continue
+					}
+				}
+				// Parse Postgres array format {val1,val2,...} into a string slice
+				if len(s) > 1 && s[0] == '{' && s[len(s)-1] == '}' && col != "_id" {
+					row[col] = parsePgArray(s)
+					continue
+				}
+			}
+			row[col] = val
 		}
 		results = append(results, row)
 	}
 	return results, rows.Err()
+}
+
+// parsePgArray parses a Postgres text array literal like {a,b,c} into a string slice.
+// Handles quoted elements and NULL.
+func parsePgArray(s string) []string {
+	inner := s[1 : len(s)-1] // strip { }
+	if inner == "" {
+		return []string{}
+	}
+	var result []string
+	var current strings.Builder
+	inQuote := false
+	escaped := false
+	for i := 0; i < len(inner); i++ {
+		ch := inner[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inQuote {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if ch == ',' && !inQuote {
+			result = append(result, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(ch)
+	}
+	result = append(result, current.String())
+	return result
 }
 
 // comparisonOps maps MongoDB-style comparison operators to SQL operators.
