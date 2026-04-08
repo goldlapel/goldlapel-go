@@ -758,3 +758,256 @@ func TestDocAggregate_MultipleKeysInStage(t *testing.T) {
 	}
 	assertContains(t, err.Error(), "exactly one key")
 }
+
+// --- Comparison Operators ---
+
+func TestBuildFilter_GtNumeric(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"age": map[string]interface{}{"$gt": float64(21)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "(data->>'age')::numeric > $1")
+	assertNotContains(t, last.query, "@>")
+}
+
+func TestBuildFilter_GteLteRange(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"score": map[string]interface{}{
+			"$gte": float64(50),
+			"$lte": float64(100),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "(data->>'score')::numeric >= $1")
+	assertContains(t, last.query, "(data->>'score')::numeric <= $2")
+}
+
+func TestBuildFilter_LtString(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"name": map[string]interface{}{"$lt": "M"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'name' < $1")
+	assertNotContains(t, last.query, "numeric")
+}
+
+func TestBuildFilter_EqAndNe(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"role":   map[string]interface{}{"$eq": "admin"},
+		"status": map[string]interface{}{"$ne": "banned"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'role' = $1")
+	assertContains(t, last.query, "data->>'status' != $2")
+}
+
+func TestBuildFilter_In(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"role": map[string]interface{}{
+			"$in": []interface{}{"admin", "editor"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'role' IN ($1, $2)")
+}
+
+func TestBuildFilter_Nin(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"status": map[string]interface{}{
+			"$nin": []interface{}{"banned", "deleted"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'status' NOT IN ($1, $2)")
+}
+
+func TestBuildFilter_Exists(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"email": map[string]interface{}{"$exists": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data ? $1")
+}
+
+func TestBuildFilter_NotExists(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"phone": map[string]interface{}{"$exists": false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "NOT (data ? $1)")
+}
+
+func TestBuildFilter_Regex(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"email": map[string]interface{}{"$regex": ".*@example\\.com$"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'email' ~ $1")
+}
+
+func TestBuildFilter_DotNotation(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"address.city": map[string]interface{}{"$eq": "Portland"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->'address'->>'city' = $1")
+}
+
+func TestBuildFilter_MixedContainmentAndOperators(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"role": "admin",
+		"age":  map[string]interface{}{"$gte": float64(18)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// Containment clause first ($1), operator clause second ($2)
+	assertContains(t, last.query, "data @> $1::jsonb")
+	assertContains(t, last.query, "(data->>'age')::numeric >= $2")
+}
+
+func TestBuildFilter_InvalidDotKey(t *testing.T) {
+	db, _ := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"bad;key.field": map[string]interface{}{"$gt": float64(1)},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid dot-notation key")
+	}
+	assertContains(t, err.Error(), "invalid filter key")
+}
+
+func TestBuildFilter_UnsupportedOperator(t *testing.T) {
+	db, _ := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"age": map[string]interface{}{"$bogus": float64(1)},
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported operator")
+	}
+	assertContains(t, err.Error(), "unsupported filter operator")
+}
+
+func TestBuildFilter_OperatorsInDocDelete(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	_, err := DocDelete(db, "users", map[string]interface{}{
+		"age": map[string]interface{}{"$lt": float64(18)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "DELETE FROM users WHERE")
+	assertContains(t, last.query, "(data->>'age')::numeric < $1")
+}
+
+func TestBuildFilter_OperatorsInDocCount(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"count"},
+		[][]driver.Value{{int64(3)}})
+
+	_, err := DocCount(db, "users", map[string]interface{}{
+		"score": map[string]interface{}{"$gte": float64(90)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT COUNT(*) FROM users WHERE")
+	assertContains(t, last.query, "(data->>'score')::numeric >= $1")
+}

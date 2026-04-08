@@ -149,23 +149,18 @@ func DocFind(db *sql.DB, collection string, filter interface{}, opts ...DocFindO
 		fn(o)
 	}
 
-	var q string
-	var args []interface{}
+	q := "SELECT id, data, created_at FROM " + collection
 	paramIdx := 1
+	var args []interface{}
 
-	q = "SELECT id, data, created_at FROM " + collection
-
-	if filter != nil {
-		filterJSON, err := json.Marshal(filter)
-		if err != nil {
-			return nil, fmt.Errorf("marshal filter: %w", err)
-		}
-		filterStr := string(filterJSON)
-		if filterStr != "{}" && filterStr != "null" {
-			q += fmt.Sprintf(" WHERE data @> $%d::jsonb", paramIdx)
-			args = append(args, filterStr)
-			paramIdx++
-		}
+	whereClause, filterParams, nextParam, err := buildFilter(filter, paramIdx)
+	if err != nil {
+		return nil, err
+	}
+	if whereClause != "" {
+		q += " WHERE " + whereClause
+		args = append(args, filterParams...)
+		paramIdx = nextParam
 	}
 
 	// ORDER BY
@@ -200,28 +195,23 @@ func DocFind(db *sql.DB, collection string, filter interface{}, opts ...DocFindO
 }
 
 // DocFindOne queries a single document from a collection. Like MongoDB's findOne().
-// If filter is nil, returns the first document. Otherwise uses JSONB containment (@>).
-// Returns nil (not an error) if no document matches.
+// If filter is nil, returns the first document. Otherwise uses JSONB containment (@>)
+// or comparison operators. Returns nil (not an error) if no document matches.
 func DocFindOne(db *sql.DB, collection string, filter interface{}) (map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
 
-	var q string
+	q := "SELECT id, data, created_at FROM " + collection
 	var args []interface{}
 
-	q = "SELECT id, data, created_at FROM " + collection
-
-	if filter != nil {
-		filterJSON, err := json.Marshal(filter)
-		if err != nil {
-			return nil, fmt.Errorf("marshal filter: %w", err)
-		}
-		filterStr := string(filterJSON)
-		if filterStr != "{}" && filterStr != "null" {
-			q += " WHERE data @> $1::jsonb"
-			args = append(args, filterStr)
-		}
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
+	if err != nil {
+		return nil, err
+	}
+	if whereClause != "" {
+		q += " WHERE " + whereClause
+		args = append(args, filterParams...)
 	}
 
 	q += " ORDER BY id LIMIT 1"
@@ -243,24 +233,32 @@ func DocFindOne(db *sql.DB, collection string, filter interface{}) (map[string]i
 }
 
 // DocUpdate updates all documents matching a filter. Like MongoDB's updateMany().
-// Uses JSONB containment (@>) for matching and || for merging the update.
-// Returns the number of rows affected.
+// Uses JSONB containment (@>) or comparison operators for matching, and || for
+// merging the update. Returns the number of rows affected.
 func DocUpdate(db *sql.DB, collection string, filter, update interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
 
-	filterJSON, err := json.Marshal(filter)
-	if err != nil {
-		return 0, fmt.Errorf("marshal filter: %w", err)
-	}
 	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return 0, fmt.Errorf("marshal update: %w", err)
 	}
 
-	q := "UPDATE " + collection + " SET data = data || $1::jsonb WHERE data @> $2::jsonb"
-	result, err := db.Exec(q, string(updateJSON), string(filterJSON))
+	q := "UPDATE " + collection + " SET data = data || $1::jsonb"
+	args := []interface{}{string(updateJSON)}
+	paramIdx := 2
+
+	whereClause, filterParams, _, err := buildFilter(filter, paramIdx)
+	if err != nil {
+		return 0, err
+	}
+	if whereClause != "" {
+		q += " WHERE " + whereClause
+		args = append(args, filterParams...)
+	}
+
+	result, err := db.Exec(q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -275,20 +273,29 @@ func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (in
 		return 0, err
 	}
 
-	filterJSON, err := json.Marshal(filter)
-	if err != nil {
-		return 0, fmt.Errorf("marshal filter: %w", err)
-	}
 	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return 0, fmt.Errorf("marshal update: %w", err)
 	}
 
+	// Build WHERE clause for the CTE starting at $1
+	whereClause, filterParams, nextParam, err := buildFilter(filter, 1)
+	if err != nil {
+		return 0, err
+	}
+
+	cteWhere := ""
+	if whereClause != "" {
+		cteWhere = " WHERE " + whereClause
+	}
+
 	q := "WITH target AS (" +
-		"SELECT id FROM " + collection + " WHERE data @> $1::jsonb ORDER BY id LIMIT 1" +
-		") UPDATE " + collection + " SET data = data || $2::jsonb " +
+		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
+		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
 		"FROM target WHERE " + collection + ".id = target.id"
-	result, err := db.Exec(q, string(filterJSON), string(updateJSON))
+
+	args := append(filterParams, string(updateJSON))
+	result, err := db.Exec(q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -296,19 +303,26 @@ func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (in
 }
 
 // DocDelete deletes all documents matching a filter. Like MongoDB's deleteMany().
-// Uses JSONB containment (@>) for matching. Returns the number of rows deleted.
+// Uses JSONB containment (@>) or comparison operators for matching.
+// Returns the number of rows deleted.
 func DocDelete(db *sql.DB, collection string, filter interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
 
-	filterJSON, err := json.Marshal(filter)
+	q := "DELETE FROM " + collection
+	var args []interface{}
+
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
 	if err != nil {
-		return 0, fmt.Errorf("marshal filter: %w", err)
+		return 0, err
+	}
+	if whereClause != "" {
+		q += " WHERE " + whereClause
+		args = append(args, filterParams...)
 	}
 
-	q := "DELETE FROM " + collection + " WHERE data @> $1::jsonb"
-	result, err := db.Exec(q, string(filterJSON))
+	result, err := db.Exec(q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -323,15 +337,20 @@ func DocDeleteOne(db *sql.DB, collection string, filter interface{}) (int64, err
 		return 0, err
 	}
 
-	filterJSON, err := json.Marshal(filter)
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
 	if err != nil {
-		return 0, fmt.Errorf("marshal filter: %w", err)
+		return 0, err
+	}
+
+	cteWhere := ""
+	if whereClause != "" {
+		cteWhere = " WHERE " + whereClause
 	}
 
 	q := "WITH target AS (" +
-		"SELECT id FROM " + collection + " WHERE data @> $1::jsonb ORDER BY id LIMIT 1" +
+		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
 		") DELETE FROM " + collection + " USING target WHERE " + collection + ".id = target.id"
-	result, err := db.Exec(q, string(filterJSON))
+	result, err := db.Exec(q, filterParams...)
 	if err != nil {
 		return 0, err
 	}
@@ -345,25 +364,20 @@ func DocCount(db *sql.DB, collection string, filter interface{}) (int64, error) 
 		return 0, err
 	}
 
-	var q string
+	q := "SELECT COUNT(*) FROM " + collection
 	var args []interface{}
 
-	q = "SELECT COUNT(*) FROM " + collection
-
-	if filter != nil {
-		filterJSON, err := json.Marshal(filter)
-		if err != nil {
-			return 0, fmt.Errorf("marshal filter: %w", err)
-		}
-		filterStr := string(filterJSON)
-		if filterStr != "{}" && filterStr != "null" {
-			q += " WHERE data @> $1::jsonb"
-			args = append(args, filterStr)
-		}
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
+	if err != nil {
+		return 0, err
+	}
+	if whereClause != "" {
+		q += " WHERE " + whereClause
+		args = append(args, filterParams...)
 	}
 
 	var count int64
-	err := db.QueryRow(q, args...).Scan(&count)
+	err = db.QueryRow(q, args...).Scan(&count)
 	if err != nil {
 		return 0, err
 	}
@@ -554,15 +568,14 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 
 	// WHERE from $match
 	if matchFilter != nil {
-		filterJSON, err := json.Marshal(matchFilter)
+		whereClause, filterParams, nextP, err := buildFilter(matchFilter, paramIdx)
 		if err != nil {
-			return nil, fmt.Errorf("marshal match filter: %w", err)
+			return nil, fmt.Errorf("$match: %w", err)
 		}
-		filterStr := string(filterJSON)
-		if filterStr != "{}" && filterStr != "null" {
-			q += fmt.Sprintf(" WHERE data @> $%d::jsonb", paramIdx)
-			args = append(args, filterStr)
-			paramIdx++
+		if whereClause != "" {
+			q += " WHERE " + whereClause
+			args = append(args, filterParams...)
+			paramIdx = nextP
 		}
 	}
 
@@ -728,6 +741,202 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 		results = append(results, row)
 	}
 	return results, rows.Err()
+}
+
+// comparisonOps maps MongoDB-style comparison operators to SQL operators.
+var comparisonOps = map[string]string{
+	"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=",
+	"$eq": "=", "$ne": "!=",
+}
+
+// supportedFilterOps is the set of all recognized $-prefixed filter operators.
+var supportedFilterOps = map[string]bool{
+	"$gt": true, "$gte": true, "$lt": true, "$lte": true,
+	"$eq": true, "$ne": true, "$in": true, "$nin": true,
+	"$exists": true, "$regex": true,
+}
+
+// fieldPath converts a dot-notation key into a Postgres JSONB path expression.
+// "name" becomes "data->>'name'". "address.city" becomes "data->'address'->>'city'".
+// Each segment is validated against the identifier regex.
+func fieldPath(key string) (string, error) {
+	parts := strings.Split(key, ".")
+	for _, part := range parts {
+		if !identifierRe.MatchString(part) {
+			return "", fmt.Errorf("invalid filter key: %s", key)
+		}
+	}
+	if len(parts) == 1 {
+		return fmt.Sprintf("data->>'%s'", parts[0]), nil
+	}
+	expr := "data"
+	for _, part := range parts[:len(parts)-1] {
+		expr += fmt.Sprintf("->'%s'", part)
+	}
+	expr += fmt.Sprintf("->>'%s'", parts[len(parts)-1])
+	return expr, nil
+}
+
+// isOperatorMap checks if a map has at least one $-prefixed key, indicating
+// it contains comparison operators rather than a literal value.
+func isOperatorMap(m map[string]interface{}) bool {
+	for k := range m {
+		if len(k) > 0 && k[0] == '$' {
+			return true
+		}
+	}
+	return false
+}
+
+// buildFilter translates a MongoDB-style filter into a SQL WHERE clause
+// with numbered placeholders starting at startParam. Returns the clause
+// (without WHERE keyword), the parameter values, and the next available
+// parameter number.
+//
+// Plain key-value pairs use JSONB containment (@>). Keys whose values are
+// operator maps (e.g. {"$gt": 10}) are translated to individual comparison
+// clauses. Supported operators: $gt, $gte, $lt, $lte, $eq, $ne, $in, $nin,
+// $exists, $regex. Dot notation (e.g. "address.city") is supported.
+func buildFilter(filter interface{}, startParam int) (string, []interface{}, int, error) {
+	if filter == nil {
+		return "", nil, startParam, nil
+	}
+
+	filterMap, ok := filter.(map[string]interface{})
+	if !ok {
+		// Not a map — fall back to JSON containment of the whole thing
+		filterJSON, err := json.Marshal(filter)
+		if err != nil {
+			return "", nil, startParam, fmt.Errorf("marshal filter: %w", err)
+		}
+		filterStr := string(filterJSON)
+		if filterStr == "{}" || filterStr == "null" {
+			return "", nil, startParam, nil
+		}
+		clause := fmt.Sprintf("data @> $%d::jsonb", startParam)
+		return clause, []interface{}{filterStr}, startParam + 1, nil
+	}
+
+	if len(filterMap) == 0 {
+		return "", nil, startParam, nil
+	}
+
+	// First pass: separate plain key-value pairs (containment) from operator maps
+	containment := make(map[string]interface{})
+	var operatorKeys []string
+
+	keys := make([]string, 0, len(filterMap))
+	for k := range filterMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		value := filterMap[key]
+		valMap, isMap := value.(map[string]interface{})
+		if isMap && isOperatorMap(valMap) {
+			operatorKeys = append(operatorKeys, key)
+		} else {
+			containment[key] = value
+		}
+	}
+
+	// Build clauses with monotonically increasing param indices.
+	// Containment clause comes first (if any), then operator clauses.
+	var allClauses []string
+	var allParams []interface{}
+	paramIdx := startParam
+
+	if len(containment) > 0 {
+		cJSON, err := json.Marshal(containment)
+		if err != nil {
+			return "", nil, startParam, fmt.Errorf("marshal containment filter: %w", err)
+		}
+		allClauses = append(allClauses, fmt.Sprintf("data @> $%d::jsonb", paramIdx))
+		allParams = append(allParams, string(cJSON))
+		paramIdx++
+	}
+
+	for _, key := range operatorKeys {
+		valMap := filterMap[key].(map[string]interface{})
+		fieldExpr, err := fieldPath(key)
+		if err != nil {
+			return "", nil, startParam, err
+		}
+
+		// Process operators in sorted order for deterministic output
+		opKeys := make([]string, 0, len(valMap))
+		for k := range valMap {
+			opKeys = append(opKeys, k)
+		}
+		sort.Strings(opKeys)
+
+		for _, op := range opKeys {
+			operand := valMap[op]
+
+			if !supportedFilterOps[op] {
+				return "", nil, startParam, fmt.Errorf("unsupported filter operator: %s", op)
+			}
+
+			if sqlOp, isCmp := comparisonOps[op]; isCmp {
+				if isNumeric(operand) {
+					allClauses = append(allClauses, fmt.Sprintf("(%s)::numeric %s $%d", fieldExpr, sqlOp, paramIdx))
+				} else {
+					allClauses = append(allClauses, fmt.Sprintf("%s %s $%d", fieldExpr, sqlOp, paramIdx))
+				}
+				allParams = append(allParams, operand)
+				paramIdx++
+			} else if op == "$in" {
+				arr, ok := operand.([]interface{})
+				if !ok {
+					return "", nil, startParam, fmt.Errorf("$in requires an array")
+				}
+				placeholders := make([]string, len(arr))
+				for i, v := range arr {
+					placeholders[i] = fmt.Sprintf("$%d", paramIdx)
+					allParams = append(allParams, fmt.Sprintf("%v", v))
+					paramIdx++
+				}
+				allClauses = append(allClauses, fmt.Sprintf("%s IN (%s)", fieldExpr, strings.Join(placeholders, ", ")))
+			} else if op == "$nin" {
+				arr, ok := operand.([]interface{})
+				if !ok {
+					return "", nil, startParam, fmt.Errorf("$nin requires an array")
+				}
+				placeholders := make([]string, len(arr))
+				for i, v := range arr {
+					placeholders[i] = fmt.Sprintf("$%d", paramIdx)
+					allParams = append(allParams, fmt.Sprintf("%v", v))
+					paramIdx++
+				}
+				allClauses = append(allClauses, fmt.Sprintf("%s NOT IN (%s)", fieldExpr, strings.Join(placeholders, ", ")))
+			} else if op == "$exists" {
+				topKey := strings.Split(key, ".")[0]
+				if b, isBool := operand.(bool); isBool && b {
+					allClauses = append(allClauses, fmt.Sprintf("data ? $%d", paramIdx))
+				} else {
+					allClauses = append(allClauses, fmt.Sprintf("NOT (data ? $%d)", paramIdx))
+				}
+				allParams = append(allParams, topKey)
+				paramIdx++
+			} else if op == "$regex" {
+				allClauses = append(allClauses, fmt.Sprintf("%s ~ $%d", fieldExpr, paramIdx))
+				allParams = append(allParams, operand)
+				paramIdx++
+			}
+		}
+	}
+
+	return strings.Join(allClauses, " AND "), allParams, paramIdx, nil
+}
+
+// isNumeric returns true if the value is a numeric type (float64, int, int64).
+func isNumeric(v interface{}) bool {
+	switch v.(type) {
+	case float64, int, int64:
+		return true
+	}
+	return false
 }
 
 // buildSortClause generates ORDER BY expressions from a sort map.
