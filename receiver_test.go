@@ -310,6 +310,37 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 	if err != ErrNotConnected {
 		t.Fatalf("PercolateDelete: expected ErrNotConnected, got %v", err)
 	}
+
+	// Operational Doc methods
+	_, err = gl.DocWatch("test", func(op, data string) {})
+	if err != ErrNotConnected {
+		t.Fatalf("DocWatch: expected ErrNotConnected, got %v", err)
+	}
+
+	err = gl.DocUnwatch("test")
+	if err != ErrNotConnected {
+		t.Fatalf("DocUnwatch: expected ErrNotConnected, got %v", err)
+	}
+
+	err = gl.DocCreateTtlIndex("test", 3600)
+	if err != ErrNotConnected {
+		t.Fatalf("DocCreateTtlIndex: expected ErrNotConnected, got %v", err)
+	}
+
+	err = gl.DocRemoveTtlIndex("test")
+	if err != ErrNotConnected {
+		t.Fatalf("DocRemoveTtlIndex: expected ErrNotConnected, got %v", err)
+	}
+
+	err = gl.DocCreateCapped("test", 100)
+	if err != ErrNotConnected {
+		t.Fatalf("DocCreateCapped: expected ErrNotConnected, got %v", err)
+	}
+
+	err = gl.DocRemoveCap("test")
+	if err != ErrNotConnected {
+		t.Fatalf("DocRemoveCap: expected ErrNotConnected, got %v", err)
+	}
 }
 
 func TestErrNotConnected_ErrorMessage(t *testing.T) {

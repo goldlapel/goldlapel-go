@@ -1683,3 +1683,243 @@ func TestDocAggregate_LookupInvalidFrom(t *testing.T) {
 	assertContains(t, err.Error(), "$lookup")
 	assertContains(t, err.Error(), "invalid")
 }
+
+// --- DocWatch ---
+
+func TestDocWatch_TriggerDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	// DocWatch executes DDL synchronously then starts a listener goroutine.
+	// The goroutine will hang on a fake conn, but we only need to verify DDL.
+	_, err := DocWatch(db, "postgresql://127.0.0.1:1/db", "events", func(op, data string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	// Expect: CREATE TABLE, CREATE OR REPLACE FUNCTION, DROP TRIGGER, CREATE TRIGGER
+	found := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE OR REPLACE FUNCTION events_notify_changes") {
+			found = true
+			assertContains(t, c.query, "pg_notify('events_changes'")
+			assertContains(t, c.query, "TG_OP")
+			assertContains(t, c.query, "LANGUAGE plpgsql")
+		}
+	}
+	if !found {
+		t.Fatal("expected CREATE OR REPLACE FUNCTION for watch trigger")
+	}
+
+	// Verify trigger creation
+	triggerFound := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE TRIGGER events_watch_trigger") {
+			triggerFound = true
+			assertContains(t, c.query, "AFTER INSERT OR UPDATE OR DELETE")
+			assertContains(t, c.query, "FOR EACH ROW")
+			assertContains(t, c.query, "events_notify_changes()")
+		}
+	}
+	if !triggerFound {
+		t.Fatal("expected CREATE TRIGGER for watch")
+	}
+}
+
+func TestDocWatch_InvalidCollection(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	_, err := DocWatch(db, "postgresql://fake/db", "bad;name", func(op, data string) {})
+	if err == nil {
+		t.Fatal("expected error for invalid collection name")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+}
+
+// --- DocUnwatch ---
+
+func TestDocUnwatch_DropsDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	err := DocUnwatch(db, "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	if len(captures) < 2 {
+		t.Fatalf("expected at least 2 DDL statements, got %d", len(captures))
+	}
+	assertContains(t, captures[0].query, "DROP TRIGGER IF EXISTS events_watch_trigger ON events")
+	assertContains(t, captures[1].query, "DROP FUNCTION IF EXISTS events_notify_changes()")
+}
+
+func TestDocUnwatch_InvalidCollection(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	err := DocUnwatch(db, "bad name!")
+	if err == nil {
+		t.Fatal("expected error for invalid collection name")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+}
+
+// --- DocCreateTtlIndex ---
+
+func TestDocCreateTtlIndex_TriggerDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	err := DocCreateTtlIndex(db, "sessions", 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	// Expect: CREATE TABLE, CREATE OR REPLACE FUNCTION, DROP TRIGGER, CREATE TRIGGER
+	funcFound := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE OR REPLACE FUNCTION sessions_ttl_cleanup") {
+			funcFound = true
+			assertContains(t, c.query, "INTERVAL '3600 seconds'")
+			assertContains(t, c.query, "DELETE FROM sessions")
+			assertContains(t, c.query, "created_at < NOW()")
+		}
+	}
+	if !funcFound {
+		t.Fatal("expected CREATE OR REPLACE FUNCTION for TTL cleanup")
+	}
+
+	triggerFound := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE TRIGGER sessions_ttl_trigger") {
+			triggerFound = true
+			assertContains(t, c.query, "AFTER INSERT ON sessions")
+			assertContains(t, c.query, "FOR EACH STATEMENT")
+		}
+	}
+	if !triggerFound {
+		t.Fatal("expected CREATE TRIGGER for TTL")
+	}
+}
+
+func TestDocCreateTtlIndex_InvalidInputs(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	// Invalid collection
+	err := DocCreateTtlIndex(db, "bad;name", 3600)
+	if err == nil {
+		t.Fatal("expected error for invalid collection name")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+
+	// Zero TTL
+	err = DocCreateTtlIndex(db, "sessions", 0)
+	if err == nil {
+		t.Fatal("expected error for zero TTL")
+	}
+	assertContains(t, err.Error(), "ttlSeconds must be positive")
+
+	// Negative TTL
+	err = DocCreateTtlIndex(db, "sessions", -10)
+	if err == nil {
+		t.Fatal("expected error for negative TTL")
+	}
+	assertContains(t, err.Error(), "ttlSeconds must be positive")
+}
+
+// --- DocRemoveTtlIndex ---
+
+func TestDocRemoveTtlIndex_DropsDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	err := DocRemoveTtlIndex(db, "sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	if len(captures) < 2 {
+		t.Fatalf("expected at least 2 DDL statements, got %d", len(captures))
+	}
+	assertContains(t, captures[0].query, "DROP TRIGGER IF EXISTS sessions_ttl_trigger ON sessions")
+	assertContains(t, captures[1].query, "DROP FUNCTION IF EXISTS sessions_ttl_cleanup()")
+}
+
+// --- DocCreateCapped ---
+
+func TestDocCreateCapped_TriggerDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	err := DocCreateCapped(db, "logs", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	funcFound := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE OR REPLACE FUNCTION logs_cap_enforce") {
+			funcFound = true
+			assertContains(t, c.query, "DELETE FROM logs")
+			assertContains(t, c.query, "ORDER BY id DESC LIMIT 1000")
+		}
+	}
+	if !funcFound {
+		t.Fatal("expected CREATE OR REPLACE FUNCTION for cap enforcement")
+	}
+
+	triggerFound := false
+	for _, c := range captures {
+		if strings.Contains(c.query, "CREATE TRIGGER logs_cap_trigger") {
+			triggerFound = true
+			assertContains(t, c.query, "AFTER INSERT ON logs")
+			assertContains(t, c.query, "FOR EACH STATEMENT")
+		}
+	}
+	if !triggerFound {
+		t.Fatal("expected CREATE TRIGGER for cap")
+	}
+}
+
+func TestDocCreateCapped_InvalidInputs(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	// Invalid collection
+	err := DocCreateCapped(db, "bad;name", 100)
+	if err == nil {
+		t.Fatal("expected error for invalid collection name")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+
+	// Zero maxDocs
+	err = DocCreateCapped(db, "logs", 0)
+	if err == nil {
+		t.Fatal("expected error for zero maxDocs")
+	}
+	assertContains(t, err.Error(), "maxDocs must be positive")
+
+	// Negative maxDocs
+	err = DocCreateCapped(db, "logs", -5)
+	if err == nil {
+		t.Fatal("expected error for negative maxDocs")
+	}
+	assertContains(t, err.Error(), "maxDocs must be positive")
+}
+
+// --- DocRemoveCap ---
+
+func TestDocRemoveCap_DropsDDL(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	err := DocRemoveCap(db, "logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := drv.allCaptures()
+	if len(captures) < 2 {
+		t.Fatalf("expected at least 2 DDL statements, got %d", len(captures))
+	}
+	assertContains(t, captures[0].query, "DROP TRIGGER IF EXISTS logs_cap_trigger ON logs")
+	assertContains(t, captures[1].query, "DROP FUNCTION IF EXISTS logs_cap_enforce()")
+}

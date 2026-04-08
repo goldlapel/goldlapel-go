@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/lib/pq"
 )
 
 // DocFindOption configures a DocFind call.
@@ -1244,4 +1247,242 @@ func buildSortClause(sortMap map[string]int) ([]string, error) {
 		parts[i] = fmt.Sprintf("data->>'%s' %s", key, dir)
 	}
 	return parts, nil
+}
+
+// DocWatch listens for changes on a collection. Like MongoDB's change streams.
+// Creates a trigger that fires NOTIFY on INSERT, UPDATE, and DELETE, then
+// uses pq.NewListener (LISTEN/NOTIFY) to stream change events to the callback.
+// The callback receives an operation string ("INSERT", "UPDATE", or "DELETE")
+// and the affected row's data as a JSON string.
+// Runs in a background goroutine; returns immediately. The returned channel
+// receives an error if setup fails; otherwise it is closed on success.
+// Pass a connection string (DSN), not a *sql.DB, because LISTEN requires
+// a dedicated connection. The db parameter is used only for trigger DDL.
+func DocWatch(db *sql.DB, conn string, collection string, callback func(op, data string)) (chan error, error) {
+	if err := validateIdentifier(collection); err != nil {
+		return nil, err
+	}
+	if err := ensureCollection(db, collection); err != nil {
+		return nil, err
+	}
+
+	channel := collection + "_changes"
+	funcName := collection + "_notify_changes"
+	triggerName := collection + "_watch_trigger"
+
+	// Create the trigger function that sends NOTIFY with operation + row data.
+	createFunc := "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS trigger AS $$ " +
+		"BEGIN " +
+		"IF TG_OP = 'DELETE' THEN " +
+		"PERFORM pg_notify('" + channel + "', TG_OP || '|' || OLD.data::text); " +
+		"RETURN OLD; " +
+		"ELSE " +
+		"PERFORM pg_notify('" + channel + "', TG_OP || '|' || NEW.data::text); " +
+		"RETURN NEW; " +
+		"END IF; " +
+		"END; " +
+		"$$ LANGUAGE plpgsql"
+	if _, err := db.Exec(createFunc); err != nil {
+		return nil, fmt.Errorf("create watch function: %w", err)
+	}
+
+	// Create the trigger (drop first to ensure idempotency).
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return nil, fmt.Errorf("drop existing watch trigger: %w", err)
+	}
+
+	createTrigger := "CREATE TRIGGER " + triggerName +
+		" AFTER INSERT OR UPDATE OR DELETE ON " + collection +
+		" FOR EACH ROW EXECUTE FUNCTION " + funcName + "()"
+	if _, err := db.Exec(createTrigger); err != nil {
+		return nil, fmt.Errorf("create watch trigger: %w", err)
+	}
+
+	// Start listening in a background goroutine using pq.NewListener.
+	errCh := make(chan error, 1)
+	go func() {
+		minReconn := 10 * time.Second
+		maxReconn := time.Minute
+		listener := pq.NewListener(conn, minReconn, maxReconn, nil)
+		defer listener.Close()
+
+		if err := listener.Listen(channel); err != nil {
+			errCh <- fmt.Errorf("listen on channel %q: %w", channel, err)
+			return
+		}
+		close(errCh)
+
+		for {
+			n := <-listener.Notify
+			if n == nil {
+				continue
+			}
+			parts := strings.SplitN(n.Extra, "|", 2)
+			if len(parts) == 2 {
+				callback(parts[0], parts[1])
+			}
+		}
+	}()
+
+	return errCh, nil
+}
+
+// DocUnwatch removes the change stream trigger and function from a collection.
+// Reverses what DocWatch set up.
+func DocUnwatch(db *sql.DB, collection string) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+
+	triggerName := collection + "_watch_trigger"
+	funcName := collection + "_notify_changes"
+
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return fmt.Errorf("drop watch trigger: %w", err)
+	}
+
+	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
+	if _, err := db.Exec(dropFunc); err != nil {
+		return fmt.Errorf("drop watch function: %w", err)
+	}
+
+	return nil
+}
+
+// DocCreateTtlIndex creates a TTL (time-to-live) trigger on a collection.
+// Like MongoDB's TTL indexes. Rows whose created_at is older than ttlSeconds
+// are automatically deleted when any new INSERT occurs.
+// The TTL is baked into the PL/pgSQL trigger body as an integer constant.
+func DocCreateTtlIndex(db *sql.DB, collection string, ttlSeconds int) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+	if ttlSeconds <= 0 {
+		return fmt.Errorf("ttlSeconds must be positive, got %d", ttlSeconds)
+	}
+	if err := ensureCollection(db, collection); err != nil {
+		return err
+	}
+
+	funcName := collection + "_ttl_cleanup"
+	triggerName := collection + "_ttl_trigger"
+
+	createFunc := fmt.Sprintf(
+		"CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $$ "+
+			"BEGIN "+
+			"DELETE FROM %s WHERE created_at < NOW() - INTERVAL '%d seconds'; "+
+			"RETURN NEW; "+
+			"END; "+
+			"$$ LANGUAGE plpgsql",
+		funcName, collection, ttlSeconds)
+	if _, err := db.Exec(createFunc); err != nil {
+		return fmt.Errorf("create ttl function: %w", err)
+	}
+
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return fmt.Errorf("drop existing ttl trigger: %w", err)
+	}
+
+	createTrigger := "CREATE TRIGGER " + triggerName +
+		" AFTER INSERT ON " + collection +
+		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
+	if _, err := db.Exec(createTrigger); err != nil {
+		return fmt.Errorf("create ttl trigger: %w", err)
+	}
+
+	return nil
+}
+
+// DocRemoveTtlIndex removes the TTL trigger and function from a collection.
+// Reverses what DocCreateTtlIndex set up.
+func DocRemoveTtlIndex(db *sql.DB, collection string) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+
+	triggerName := collection + "_ttl_trigger"
+	funcName := collection + "_ttl_cleanup"
+
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return fmt.Errorf("drop ttl trigger: %w", err)
+	}
+
+	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
+	if _, err := db.Exec(dropFunc); err != nil {
+		return fmt.Errorf("drop ttl function: %w", err)
+	}
+
+	return nil
+}
+
+// DocCreateCapped creates a capped collection trigger. Like MongoDB's capped collections.
+// Limits the collection to maxDocs rows by deleting the oldest rows (by id)
+// whenever an INSERT would exceed the cap. The cap size is baked into the
+// PL/pgSQL trigger body as an integer constant.
+func DocCreateCapped(db *sql.DB, collection string, maxDocs int) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+	if maxDocs <= 0 {
+		return fmt.Errorf("maxDocs must be positive, got %d", maxDocs)
+	}
+	if err := ensureCollection(db, collection); err != nil {
+		return err
+	}
+
+	funcName := collection + "_cap_enforce"
+	triggerName := collection + "_cap_trigger"
+
+	createFunc := fmt.Sprintf(
+		"CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $$ "+
+			"BEGIN "+
+			"DELETE FROM %s WHERE id NOT IN (SELECT id FROM %s ORDER BY id DESC LIMIT %d); "+
+			"RETURN NULL; "+
+			"END; "+
+			"$$ LANGUAGE plpgsql",
+		funcName, collection, collection, maxDocs)
+	if _, err := db.Exec(createFunc); err != nil {
+		return fmt.Errorf("create cap function: %w", err)
+	}
+
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return fmt.Errorf("drop existing cap trigger: %w", err)
+	}
+
+	createTrigger := "CREATE TRIGGER " + triggerName +
+		" AFTER INSERT ON " + collection +
+		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
+	if _, err := db.Exec(createTrigger); err != nil {
+		return fmt.Errorf("create cap trigger: %w", err)
+	}
+
+	return nil
+}
+
+// DocRemoveCap removes the capped collection trigger and function.
+// Reverses what DocCreateCapped set up.
+func DocRemoveCap(db *sql.DB, collection string) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+
+	triggerName := collection + "_cap_trigger"
+	funcName := collection + "_cap_enforce"
+
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	if _, err := db.Exec(dropTrigger); err != nil {
+		return fmt.Errorf("drop cap trigger: %w", err)
+	}
+
+	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
+	if _, err := db.Exec(dropFunc); err != nil {
+		return fmt.Errorf("drop cap function: %w", err)
+	}
+
+	return nil
 }

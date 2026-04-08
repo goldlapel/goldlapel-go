@@ -834,6 +834,62 @@ func (gl *GoldLapel) PercolateDelete(name, queryID string) (bool, error) {
 	return PercolateDelete(db, name, queryID)
 }
 
+// --- Operational Doc receiver methods ---
+
+func (gl *GoldLapel) DocWatch(collection string, callback func(op, data string)) (chan error, error) {
+	db, err := gl.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	gl.mu.Lock()
+	url := gl.proxyURL
+	gl.mu.Unlock()
+	if url == "" {
+		return nil, ErrNotConnected
+	}
+	return DocWatch(db, url, collection, callback)
+}
+
+func (gl *GoldLapel) DocUnwatch(collection string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocUnwatch(db, collection)
+}
+
+func (gl *GoldLapel) DocCreateTtlIndex(collection string, ttlSeconds int) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocCreateTtlIndex(db, collection, ttlSeconds)
+}
+
+func (gl *GoldLapel) DocRemoveTtlIndex(collection string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocRemoveTtlIndex(db, collection)
+}
+
+func (gl *GoldLapel) DocCreateCapped(collection string, maxDocs int) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocCreateCapped(db, collection, maxDocs)
+}
+
+func (gl *GoldLapel) DocRemoveCap(collection string) error {
+	db, err := gl.requireDB()
+	if err != nil {
+		return err
+	}
+	return DocRemoveCap(db, collection)
+}
+
 // --- Singleton API ---
 
 var (
