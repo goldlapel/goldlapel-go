@@ -430,6 +430,306 @@ func scanDocRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 	return results, rows.Err()
 }
 
+// DocAggregate runs a MongoDB-style aggregation pipeline against a collection.
+// Supported stages: $match, $group, $sort, $limit, $skip.
+// $group translates to SQL GROUP BY with accumulators ($sum, $avg, $min, $max, $count).
+// Returns a slice of result maps.
+func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
+	if err := validateIdentifier(collection); err != nil {
+		return nil, err
+	}
+	if len(pipeline) == 0 {
+		return nil, nil
+	}
+
+	var (
+		matchFilter interface{}
+		groupStage  map[string]interface{}
+		sortStage   map[string]interface{}
+		limitVal    int
+		skipVal     int
+		hasGroup    bool
+		hasLimit    bool
+		hasSkip     bool
+	)
+
+	for _, stage := range pipeline {
+		if len(stage) != 1 {
+			return nil, fmt.Errorf("each pipeline stage must have exactly one key")
+		}
+		for key, val := range stage {
+			switch key {
+			case "$match":
+				matchFilter = val
+			case "$group":
+				gm, ok := val.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("$group stage must be a map")
+				}
+				groupStage = gm
+				hasGroup = true
+			case "$sort":
+				sm, ok := val.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("$sort stage must be a map")
+				}
+				sortStage = sm
+			case "$limit":
+				n, ok := numToInt(val)
+				if !ok {
+					return nil, fmt.Errorf("$limit must be a number")
+				}
+				limitVal = n
+				hasLimit = true
+			case "$skip":
+				n, ok := numToInt(val)
+				if !ok {
+					return nil, fmt.Errorf("$skip must be a number")
+				}
+				skipVal = n
+				hasSkip = true
+			default:
+				return nil, fmt.Errorf("unsupported pipeline stage: %s", key)
+			}
+		}
+	}
+
+	var args []interface{}
+	paramIdx := 1
+
+	// SELECT clause
+	var selectParts []string
+	var groupByParts []string
+
+	if hasGroup {
+		// _id field determines grouping
+		idVal, hasID := groupStage["_id"]
+		if !hasID {
+			return nil, fmt.Errorf("$group stage requires an _id field")
+		}
+
+		if idVal == nil {
+			// null _id → aggregate entire collection, no GROUP BY
+			selectParts = append(selectParts, "NULL AS _id")
+		} else if idStr, ok := idVal.(string); ok && len(idStr) > 0 && idStr[0] == '$' {
+			field := idStr[1:]
+			if err := validateIdentifier(field); err != nil {
+				return nil, fmt.Errorf("invalid $group _id field: %w", err)
+			}
+			selectParts = append(selectParts, fmt.Sprintf("data->>'%s' AS _id", field))
+			groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", field))
+		} else {
+			return nil, fmt.Errorf("$group _id must be null or a $field reference")
+		}
+
+		// Accumulators (all keys except _id)
+		accKeys := make([]string, 0, len(groupStage)-1)
+		for k := range groupStage {
+			if k != "_id" {
+				accKeys = append(accKeys, k)
+			}
+		}
+		sort.Strings(accKeys)
+
+		for _, accName := range accKeys {
+			if err := validateIdentifier(accName); err != nil {
+				return nil, fmt.Errorf("invalid accumulator name: %w", err)
+			}
+			accVal := groupStage[accName]
+			accMap, ok := accVal.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("accumulator %s must be a map with an operator key", accName)
+			}
+			expr, err := buildAccumulator(accMap)
+			if err != nil {
+				return nil, fmt.Errorf("accumulator %s: %w", accName, err)
+			}
+			selectParts = append(selectParts, fmt.Sprintf("%s AS %s", expr, accName))
+		}
+	} else {
+		selectParts = append(selectParts, "id AS _id", "data", "created_at")
+	}
+
+	q := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
+
+	// WHERE from $match
+	if matchFilter != nil {
+		filterJSON, err := json.Marshal(matchFilter)
+		if err != nil {
+			return nil, fmt.Errorf("marshal match filter: %w", err)
+		}
+		filterStr := string(filterJSON)
+		if filterStr != "{}" && filterStr != "null" {
+			q += fmt.Sprintf(" WHERE data @> $%d::jsonb", paramIdx)
+			args = append(args, filterStr)
+			paramIdx++
+		}
+	}
+
+	// GROUP BY
+	if len(groupByParts) > 0 {
+		q += " GROUP BY " + strings.Join(groupByParts, ", ")
+	}
+
+	// ORDER BY
+	if sortStage != nil {
+		sortKeys := make([]string, 0, len(sortStage))
+		for k := range sortStage {
+			sortKeys = append(sortKeys, k)
+		}
+		sort.Strings(sortKeys)
+
+		orderParts := make([]string, 0, len(sortKeys))
+		for _, key := range sortKeys {
+			dir := "ASC"
+			if v, ok := numToInt(sortStage[key]); ok && v < 0 {
+				dir = "DESC"
+			}
+			if hasGroup {
+				// After $group, sort keys refer to aliases
+				if err := validateIdentifier(key); err != nil {
+					return nil, fmt.Errorf("invalid sort key: %w", err)
+				}
+				orderParts = append(orderParts, fmt.Sprintf("%s %s", key, dir))
+			} else {
+				if err := validateIdentifier(key); err != nil {
+					return nil, fmt.Errorf("invalid sort key: %w", err)
+				}
+				orderParts = append(orderParts, fmt.Sprintf("data->>'%s' %s", key, dir))
+			}
+		}
+		q += " ORDER BY " + strings.Join(orderParts, ", ")
+	}
+
+	// LIMIT
+	if hasLimit {
+		q += fmt.Sprintf(" LIMIT $%d", paramIdx)
+		args = append(args, limitVal)
+		paramIdx++
+	}
+
+	// OFFSET
+	if hasSkip {
+		q += fmt.Sprintf(" OFFSET $%d", paramIdx)
+		args = append(args, skipVal)
+		paramIdx++
+	}
+
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if hasGroup {
+		return scanAggregateRows(rows)
+	}
+	return scanDocRows(rows)
+}
+
+// buildAccumulator translates a MongoDB accumulator map to a SQL expression.
+func buildAccumulator(acc map[string]interface{}) (string, error) {
+	if len(acc) != 1 {
+		return "", fmt.Errorf("accumulator must have exactly one operator")
+	}
+	for op, val := range acc {
+		switch op {
+		case "$sum":
+			// $sum: 1 → COUNT(*)
+			if n, ok := val.(float64); ok && n == 1 {
+				return "COUNT(*)", nil
+			}
+			// $sum: "$field" → SUM((data->>'field')::numeric)
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$sum: %w", err)
+			}
+			return fmt.Sprintf("SUM((data->>'%s')::numeric)", field), nil
+		case "$avg":
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$avg: %w", err)
+			}
+			return fmt.Sprintf("AVG((data->>'%s')::numeric)", field), nil
+		case "$min":
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$min: %w", err)
+			}
+			return fmt.Sprintf("MIN((data->>'%s')::numeric)", field), nil
+		case "$max":
+			field, err := extractField(val)
+			if err != nil {
+				return "", fmt.Errorf("$max: %w", err)
+			}
+			return fmt.Sprintf("MAX((data->>'%s')::numeric)", field), nil
+		case "$count":
+			return "COUNT(*)", nil
+		default:
+			return "", fmt.Errorf("unsupported accumulator: %s", op)
+		}
+	}
+	return "", fmt.Errorf("empty accumulator")
+}
+
+// extractField extracts and validates a field name from a $field reference.
+func extractField(val interface{}) (string, error) {
+	s, ok := val.(string)
+	if !ok || len(s) == 0 || s[0] != '$' {
+		return "", fmt.Errorf("expected a $field reference, got %v", val)
+	}
+	field := s[1:]
+	if err := validateIdentifier(field); err != nil {
+		return "", err
+	}
+	return field, nil
+}
+
+// numToInt converts a numeric value to int. Handles float64 (JSON default) and int.
+func numToInt(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// scanAggregateRows reads aggregate result rows by column names and returns
+// them as maps. Numeric string values are converted to float64.
+func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("get columns: %w", err)
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		ptrs := make([]interface{}, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]interface{}, len(columns))
+		for i, col := range columns {
+			val := values[i]
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = val
+			}
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
 // buildSortClause generates ORDER BY expressions from a sort map.
 // Keys are JSONB field names, values are 1 (ASC) or -1 (DESC).
 // Sort keys are validated as identifiers and applied in deterministic

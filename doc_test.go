@@ -466,6 +466,10 @@ func TestDoc_AllFunctions_RejectSQLInjection(t *testing.T) {
 		{"DocDeleteOne", func() error { _, err := DocDeleteOne(db, badName, nil); return err }},
 		{"DocCount", func() error { _, err := DocCount(db, badName, nil); return err }},
 		{"DocCreateIndex", func() error { return DocCreateIndex(db, badName) }},
+		{"DocAggregate", func() error {
+			_, err := DocAggregate(db, badName, []map[string]interface{}{{"$match": nil}})
+			return err
+		}},
 	}
 
 	for _, tt := range tests {
@@ -524,4 +528,233 @@ func TestDocFind_InvalidSortKey(t *testing.T) {
 		t.Fatal("expected error for invalid sort key")
 	}
 	assertContains(t, err.Error(), "invalid sort key")
+}
+
+// --- DocAggregate ---
+
+func TestDocAggregate_FullPipeline(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "total", "count"},
+		[][]driver.Value{
+			{"electronics", int64(500), int64(3)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$match": map[string]interface{}{"status": "active"}},
+		{"$group": map[string]interface{}{
+			"_id":   "$category",
+			"total": map[string]interface{}{"$sum": "$price"},
+			"count": map[string]interface{}{"$sum": float64(1)},
+		}},
+		{"$sort": map[string]interface{}{"total": float64(-1)}},
+		{"$limit": float64(10)},
+		{"$skip": float64(5)},
+	}
+
+	results, err := DocAggregate(db, "orders", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT data->>'category' AS _id")
+	assertContains(t, last.query, "COUNT(*) AS count")
+	assertContains(t, last.query, "SUM((data->>'price')::numeric) AS total")
+	assertContains(t, last.query, "FROM orders")
+	assertContains(t, last.query, "WHERE data @> $1::jsonb")
+	assertContains(t, last.query, "GROUP BY data->>'category'")
+	assertContains(t, last.query, "ORDER BY total DESC")
+	assertContains(t, last.query, "LIMIT $2")
+	assertContains(t, last.query, "OFFSET $3")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0]["_id"] != "electronics" {
+		t.Fatalf("expected _id=electronics, got %v", results[0]["_id"])
+	}
+}
+
+func TestDocAggregate_Accumulators(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "avg_price", "max_price", "min_price", "num"},
+		[][]driver.Value{
+			{"books", int64(25), int64(50), int64(10), int64(5)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":       "$category",
+			"avg_price": map[string]interface{}{"$avg": "$price"},
+			"max_price": map[string]interface{}{"$max": "$price"},
+			"min_price": map[string]interface{}{"$min": "$price"},
+			"num":       map[string]interface{}{"$count": true},
+		}},
+	}
+
+	_, err := DocAggregate(db, "products", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "AVG((data->>'price')::numeric) AS avg_price")
+	assertContains(t, last.query, "MAX((data->>'price')::numeric) AS max_price")
+	assertContains(t, last.query, "MIN((data->>'price')::numeric) AS min_price")
+	assertContains(t, last.query, "COUNT(*) AS num")
+	assertContains(t, last.query, "GROUP BY data->>'category'")
+}
+
+func TestDocAggregate_NullID(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "total"},
+		[][]driver.Value{
+			{nil, int64(1000)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   nil,
+			"total": map[string]interface{}{"$sum": "$amount"},
+		}},
+	}
+
+	results, err := DocAggregate(db, "orders", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "NULL AS _id")
+	assertContains(t, last.query, "SUM((data->>'amount')::numeric) AS total")
+	assertNotContains(t, last.query, "GROUP BY")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestDocAggregate_MatchOnly(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{
+			{int64(1), `{"status":"active","name":"alice"}`, "2026-01-01T00:00:00Z"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$match": map[string]interface{}{"status": "active"}},
+	}
+
+	results, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT id AS _id, data, created_at FROM users")
+	assertContains(t, last.query, "WHERE data @> $1::jsonb")
+	assertNotContains(t, last.query, "GROUP BY")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0]["name"] != "alice" {
+		t.Fatalf("expected name=alice, got %v", results[0]["name"])
+	}
+}
+
+func TestDocAggregate_SortWithoutGroup(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	pipeline := []map[string]interface{}{
+		{"$sort": map[string]interface{}{"name": float64(1), "age": float64(-1)}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// Without $group, sort keys use data->>'key' expressions
+	assertContains(t, last.query, "data->>'age' DESC")
+	assertContains(t, last.query, "data->>'name' ASC")
+}
+
+func TestDocAggregate_SortWithGroup(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "total"},
+		nil)
+
+	pipeline := []map[string]interface{}{
+		{"$group": map[string]interface{}{
+			"_id":   "$category",
+			"total": map[string]interface{}{"$sum": "$price"},
+		}},
+		{"$sort": map[string]interface{}{"total": float64(-1)}},
+	}
+
+	_, err := DocAggregate(db, "products", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// With $group, sort keys are aliases
+	assertContains(t, last.query, "ORDER BY total DESC")
+	assertNotContains(t, last.query, "data->>'total'")
+}
+
+func TestDocAggregate_UnsupportedStage(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$lookup": map[string]interface{}{"from": "other"}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err == nil {
+		t.Fatal("expected error for unsupported pipeline stage")
+	}
+	assertContains(t, err.Error(), "unsupported pipeline stage")
+}
+
+func TestDocAggregate_EmptyPipeline(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	results, err := DocAggregate(db, "users", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results != nil {
+		t.Fatalf("expected nil for empty pipeline, got %v", results)
+	}
+}
+
+func TestDocAggregate_InvalidCollection(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	_, err := DocAggregate(db, "bad;name", []map[string]interface{}{
+		{"$match": map[string]interface{}{"a": "b"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid collection name")
+	}
+	assertContains(t, err.Error(), "invalid identifier")
+}
+
+func TestDocAggregate_MultipleKeysInStage(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$match": nil, "$sort": map[string]interface{}{"x": float64(1)}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err == nil {
+		t.Fatal("expected error for stage with multiple keys")
+	}
+	assertContains(t, err.Error(), "exactly one key")
 }
