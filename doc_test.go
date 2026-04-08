@@ -2,6 +2,8 @@ package goldlapel
 
 import (
 	"database/sql/driver"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -964,6 +966,136 @@ func TestBuildFilter_InvalidDotKey(t *testing.T) {
 		t.Fatal("expected error for invalid dot-notation key")
 	}
 	assertContains(t, err.Error(), "invalid filter key")
+}
+
+// --- expandDotKeys ---
+
+func TestExpandDotKeys_NoDots(t *testing.T) {
+	input := map[string]interface{}{"name": "alice", "age": float64(30)}
+	got := expandDotKeys(input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("expected %v, got %v", input, got)
+	}
+}
+
+func TestExpandDotKeys_SingleDot(t *testing.T) {
+	input := map[string]interface{}{"addr.city": "NY"}
+	want := map[string]interface{}{"addr": map[string]interface{}{"city": "NY"}}
+	got := expandDotKeys(input)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestExpandDotKeys_MultipleDots(t *testing.T) {
+	input := map[string]interface{}{"a.b.c": "deep"}
+	want := map[string]interface{}{"a": map[string]interface{}{"b": map[string]interface{}{"c": "deep"}}}
+	got := expandDotKeys(input)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestExpandDotKeys_SharedPrefix(t *testing.T) {
+	input := map[string]interface{}{"a.b": float64(1), "a.c": float64(2)}
+	got := expandDotKeys(input)
+	aMap, ok := got["a"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested map at 'a', got %T", got["a"])
+	}
+	if aMap["b"] != float64(1) || aMap["c"] != float64(2) {
+		t.Fatalf("expected {b:1, c:2}, got %v", aMap)
+	}
+}
+
+func TestExpandDotKeys_MixedPlainAndDotted(t *testing.T) {
+	input := map[string]interface{}{"role": "admin", "addr.city": "NY"}
+	got := expandDotKeys(input)
+	if got["role"] != "admin" {
+		t.Fatalf("expected role=admin, got %v", got["role"])
+	}
+	addrMap, ok := got["addr"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested map at 'addr', got %T", got["addr"])
+	}
+	if addrMap["city"] != "NY" {
+		t.Fatalf("expected city=NY, got %v", addrMap["city"])
+	}
+}
+
+func TestExpandDotKeys_EmptyMap(t *testing.T) {
+	input := map[string]interface{}{}
+	got := expandDotKeys(input)
+	if len(got) != 0 {
+		t.Fatalf("expected empty map, got %v", got)
+	}
+}
+
+func TestBuildFilter_DotNotationContainment(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"addr.city": "NY",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data @> $1::jsonb")
+	// The param should be the expanded nested JSON
+	paramStr, ok := last.args[0].(string)
+	if !ok {
+		t.Fatalf("expected string param, got %T", last.args[0])
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(paramStr), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	addrMap, ok := parsed["addr"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested addr map, got %T", parsed["addr"])
+	}
+	if addrMap["city"] != "NY" {
+		t.Fatalf("expected city=NY, got %v", addrMap["city"])
+	}
+}
+
+func TestBuildFilter_DotNotationContainmentDeep(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(db, "users", map[string]interface{}{
+		"addr.geo.lat": float64(40.7),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data @> $1::jsonb")
+	paramStr, ok := last.args[0].(string)
+	if !ok {
+		t.Fatalf("expected string param, got %T", last.args[0])
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(paramStr), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	addrMap, ok := parsed["addr"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested addr map, got %T", parsed["addr"])
+	}
+	geoMap, ok := addrMap["geo"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested geo map, got %T", addrMap["geo"])
+	}
+	if geoMap["lat"] != float64(40.7) {
+		t.Fatalf("expected lat=40.7, got %v", geoMap["lat"])
+	}
 }
 
 func TestBuildFilter_UnsupportedOperator(t *testing.T) {

@@ -1000,6 +1000,43 @@ var supportedFilterOps = map[string]bool{
 	"$exists": true, "$regex": true,
 }
 
+// expandDotKeys expands dot-notation keys in a flat map into nested maps.
+// For example, {"addr.city": "NY"} becomes {"addr": {"city": "NY"}}.
+// Non-dotted keys pass through unchanged. Multiple dotted keys sharing a
+// prefix are merged: {"a.b": 1, "a.c": 2} becomes {"a": {"b": 1, "c": 2}}.
+func expandDotKeys(m map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{}, len(m))
+	for key, value := range m {
+		parts := strings.Split(key, ".")
+		if len(parts) == 1 {
+			result[key] = value
+			continue
+		}
+		// Walk/create nested maps for all but the last segment
+		cur := result
+		for _, seg := range parts[:len(parts)-1] {
+			if existing, ok := cur[seg]; ok {
+				if nested, isMap := existing.(map[string]interface{}); isMap {
+					cur = nested
+				} else {
+					// Conflict: a scalar already sits at this path.
+					// Overwrite with a nested map (last write wins,
+					// same as MongoDB behaviour).
+					nested := make(map[string]interface{})
+					cur[seg] = nested
+					cur = nested
+				}
+			} else {
+				nested := make(map[string]interface{})
+				cur[seg] = nested
+				cur = nested
+			}
+		}
+		cur[parts[len(parts)-1]] = value
+	}
+	return result
+}
+
 // fieldPath converts a dot-notation key into a Postgres JSONB path expression.
 // "name" becomes "data->>'name'". "address.city" becomes "data->'address'->>'city'".
 // Each segment is validated against the identifier regex.
@@ -1092,6 +1129,7 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 	paramIdx := startParam
 
 	if len(containment) > 0 {
+		containment = expandDotKeys(containment)
 		cJSON, err := json.Marshal(containment)
 		if err != nil {
 			return "", nil, startParam, fmt.Errorf("marshal containment filter: %w", err)
