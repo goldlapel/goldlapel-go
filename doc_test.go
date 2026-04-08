@@ -711,7 +711,7 @@ func TestDocAggregate_UnsupportedStage(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
 	pipeline := []map[string]interface{}{
-		{"$lookup": map[string]interface{}{"from": "other"}},
+		{"$bucket": map[string]interface{}{"groupBy": "$price"}},
 	}
 
 	_, err := DocAggregate(db, "users", pipeline)
@@ -1246,4 +1246,308 @@ func TestDocAggregate_AddToSetInvalidField(t *testing.T) {
 		t.Fatal("expected error for invalid $addToSet field reference")
 	}
 	assertContains(t, err.Error(), "$addToSet")
+}
+
+// --- $project ---
+
+func TestDocAggregate_ProjectIncludeFields(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "name", "email"},
+		[][]driver.Value{
+			{int64(1), "alice", "alice@example.com"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$project": map[string]interface{}{
+			"name":  float64(1),
+			"email": float64(1),
+		}},
+	}
+
+	results, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "id AS _id")
+	assertContains(t, last.query, "data->>'email' AS email")
+	assertContains(t, last.query, "data->>'name' AS name")
+	assertContains(t, last.query, "FROM users")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestDocAggregate_ProjectExcludeID(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"name"},
+		[][]driver.Value{
+			{"alice"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$project": map[string]interface{}{
+			"_id":  float64(0),
+			"name": float64(1),
+		}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertNotContains(t, last.query, "id AS _id")
+	assertContains(t, last.query, "data->>'name' AS name")
+}
+
+func TestDocAggregate_ProjectRename(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "full_name"},
+		[][]driver.Value{
+			{int64(1), "alice"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$project": map[string]interface{}{
+			"full_name": "$name",
+		}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "data->>'name' AS full_name")
+	assertContains(t, last.query, "id AS _id")
+}
+
+func TestDocAggregate_ProjectWithMatch(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"name", "email"},
+		[][]driver.Value{
+			{"alice", "alice@example.com"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$match": map[string]interface{}{"status": "active"}},
+		{"$project": map[string]interface{}{
+			"_id":   float64(0),
+			"name":  float64(1),
+			"email": float64(1),
+		}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertNotContains(t, last.query, "id AS _id")
+	assertContains(t, last.query, "data->>'email' AS email")
+	assertContains(t, last.query, "data->>'name' AS name")
+	assertContains(t, last.query, "WHERE data @> $1::jsonb")
+}
+
+func TestDocAggregate_ProjectInvalidField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$project": map[string]interface{}{
+			"bad;field": float64(1),
+		}},
+	}
+
+	_, err := DocAggregate(db, "users", pipeline)
+	if err == nil {
+		t.Fatal("expected error for invalid $project field")
+	}
+	assertContains(t, err.Error(), "$project")
+}
+
+// --- $unwind ---
+
+func TestDocAggregate_UnwindString(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	pipeline := []map[string]interface{}{
+		{"$unwind": "$tags"},
+	}
+
+	_, err := DocAggregate(db, "items", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "CROSS JOIN jsonb_array_elements_text(data->'tags') AS tags")
+	assertContains(t, last.query, "FROM items")
+}
+
+func TestDocAggregate_UnwindMap(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	pipeline := []map[string]interface{}{
+		{"$unwind": map[string]interface{}{"path": "$colors"}},
+	}
+
+	_, err := DocAggregate(db, "products", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "CROSS JOIN jsonb_array_elements_text(data->'colors') AS colors")
+}
+
+func TestDocAggregate_UnwindThenGroup(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "count"},
+		[][]driver.Value{
+			{"fiction", int64(5)},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$unwind": "$tags"},
+		{"$group": map[string]interface{}{
+			"_id":   "$tags",
+			"count": map[string]interface{}{"$sum": float64(1)},
+		}},
+	}
+
+	results, err := DocAggregate(db, "books", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "CROSS JOIN jsonb_array_elements_text(data->'tags') AS tags")
+	// Group on the unwound alias, not data->>'tags'
+	assertContains(t, last.query, "tags AS _id")
+	assertContains(t, last.query, "GROUP BY tags")
+	assertContains(t, last.query, "COUNT(*) AS count")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0]["_id"] != "fiction" {
+		t.Fatalf("expected _id=fiction, got %v", results[0]["_id"])
+	}
+}
+
+func TestDocAggregate_UnwindInvalidField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$unwind": "$bad;field"},
+	}
+
+	_, err := DocAggregate(db, "items", pipeline)
+	if err == nil {
+		t.Fatal("expected error for invalid $unwind field")
+	}
+	assertContains(t, err.Error(), "$unwind")
+}
+
+func TestDocAggregate_UnwindInvalidFormat(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$unwind": "no_dollar_prefix"},
+	}
+
+	_, err := DocAggregate(db, "items", pipeline)
+	if err == nil {
+		t.Fatal("expected error for $unwind without $ prefix")
+	}
+	assertContains(t, err.Error(), "$unwind")
+}
+
+// --- $lookup ---
+
+func TestDocAggregate_Lookup(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"inventory_docs", "_id", "data", "created_at"},
+		[][]driver.Value{
+			{`[{"sku":"abc","qty":10}]`, int64(1), `{"item":"widget","sku":"abc"}`, "2026-01-01T00:00:00Z"},
+		})
+
+	pipeline := []map[string]interface{}{
+		{"$lookup": map[string]interface{}{
+			"from":         "inventory",
+			"localField":   "sku",
+			"foreignField": "sku",
+			"as":           "inventory_docs",
+		}},
+	}
+
+	results, err := DocAggregate(db, "orders", pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT (SELECT COALESCE(json_agg(inventory.data), '[]'::json) FROM inventory WHERE inventory.data->>'sku' = data->>'sku') AS inventory_docs")
+	assertContains(t, last.query, "id AS _id")
+	assertContains(t, last.query, "FROM orders")
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	// inventory_docs should be parsed as a JSON array
+	inv, ok := results[0]["inventory_docs"].([]interface{})
+	if !ok {
+		t.Fatalf("expected inventory_docs to be []interface{}, got %T: %v", results[0]["inventory_docs"], results[0]["inventory_docs"])
+	}
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory doc, got %d", len(inv))
+	}
+}
+
+func TestDocAggregate_LookupMissingRequiredField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$lookup": map[string]interface{}{
+			"from":       "inventory",
+			"localField": "sku",
+			// missing foreignField and as
+		}},
+	}
+
+	_, err := DocAggregate(db, "orders", pipeline)
+	if err == nil {
+		t.Fatal("expected error for missing $lookup field")
+	}
+	assertContains(t, err.Error(), "$lookup requires")
+}
+
+func TestDocAggregate_LookupInvalidFrom(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	pipeline := []map[string]interface{}{
+		{"$lookup": map[string]interface{}{
+			"from":         "bad;table",
+			"localField":   "sku",
+			"foreignField": "sku",
+			"as":           "docs",
+		}},
+	}
+
+	_, err := DocAggregate(db, "orders", pipeline)
+	if err == nil {
+		t.Fatal("expected error for invalid $lookup from collection")
+	}
+	assertContains(t, err.Error(), "$lookup")
+	assertContains(t, err.Error(), "invalid")
 }

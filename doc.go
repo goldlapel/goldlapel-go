@@ -445,8 +445,11 @@ func scanDocRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 }
 
 // DocAggregate runs a MongoDB-style aggregation pipeline against a collection.
-// Supported stages: $match, $group, $sort, $limit, $skip.
+// Supported stages: $match, $group, $sort, $limit, $skip, $project, $unwind, $lookup.
 // $group translates to SQL GROUP BY with accumulators ($sum, $avg, $min, $max, $count).
+// $project selects/renames fields (1=include, 0 on _id=exclude, "$field"=rename).
+// $unwind expands a JSONB array field via CROSS JOIN jsonb_array_elements_text.
+// $lookup performs a correlated subquery join against another collection.
 // Returns a slice of result maps.
 func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
@@ -457,14 +460,21 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 	}
 
 	var (
-		matchFilter interface{}
-		groupStage  map[string]interface{}
-		sortStage   map[string]interface{}
-		limitVal    int
-		skipVal     int
-		hasGroup    bool
-		hasLimit    bool
-		hasSkip     bool
+		matchFilter  interface{}
+		groupStage   map[string]interface{}
+		sortStage    map[string]interface{}
+		projectStage map[string]interface{}
+		unwindField  string                   // bare field name (no $)
+		unwindMap    map[string]interface{}    // passed to group builder when $unwind precedes $group
+		lookupStage  map[string]interface{}
+		limitVal     int
+		skipVal      int
+		hasGroup     bool
+		hasLimit     bool
+		hasSkip      bool
+		hasProject   bool
+		hasUnwind    bool
+		hasLookup    bool
 	)
 
 	for _, stage := range pipeline {
@@ -502,11 +512,57 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				}
 				skipVal = n
 				hasSkip = true
+			case "$project":
+				pm, ok := val.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("$project stage must be a map")
+				}
+				projectStage = pm
+				hasProject = true
+			case "$unwind":
+				switch v := val.(type) {
+				case string:
+					if len(v) == 0 || v[0] != '$' {
+						return nil, fmt.Errorf("$unwind string must start with $")
+					}
+					unwindField = v[1:]
+				case map[string]interface{}:
+					pathVal, ok := v["path"]
+					if !ok {
+						return nil, fmt.Errorf("$unwind map requires a 'path' key")
+					}
+					pathStr, ok := pathVal.(string)
+					if !ok || len(pathStr) == 0 || pathStr[0] != '$' {
+						return nil, fmt.Errorf("$unwind path must be a $field reference")
+					}
+					unwindField = pathStr[1:]
+					unwindMap = v
+				default:
+					return nil, fmt.Errorf("$unwind must be a string or map")
+				}
+				if err := validateIdentifier(unwindField); err != nil {
+					return nil, fmt.Errorf("$unwind: invalid field: %w", err)
+				}
+				hasUnwind = true
+			case "$lookup":
+				lm, ok := val.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("$lookup stage must be a map")
+				}
+				for _, reqKey := range []string{"from", "localField", "foreignField", "as"} {
+					if _, exists := lm[reqKey]; !exists {
+						return nil, fmt.Errorf("$lookup requires '%s' field", reqKey)
+					}
+				}
+				lookupStage = lm
+				hasLookup = true
 			default:
 				return nil, fmt.Errorf("unsupported pipeline stage: %s", key)
 			}
 		}
 	}
+
+	_ = unwindMap // reserved for future $unwind options (preserveNullAndEmptyArrays, etc.)
 
 	var args []interface{}
 	paramIdx := 1
@@ -515,7 +571,53 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 	var selectParts []string
 	var groupByParts []string
 
-	if hasGroup {
+	if hasProject {
+		// $project: build explicit select list
+		projKeys := make([]string, 0, len(projectStage))
+		for k := range projectStage {
+			projKeys = append(projKeys, k)
+		}
+		sort.Strings(projKeys)
+
+		excludeID := false
+		for _, key := range projKeys {
+			val := projectStage[key]
+			if key == "_id" {
+				if n, ok := val.(float64); ok && n == 0 {
+					excludeID = true
+					continue
+				}
+			}
+			if n, ok := val.(float64); ok && n == 1 {
+				// Include field: data->>'field' AS field
+				if err := validateIdentifier(key); err != nil {
+					return nil, fmt.Errorf("$project: invalid field %q: %w", key, err)
+				}
+				fp, err := fieldPath(key)
+				if err != nil {
+					return nil, fmt.Errorf("$project: %w", err)
+				}
+				selectParts = append(selectParts, fmt.Sprintf("%s AS %s", fp, key))
+			} else if s, ok := val.(string); ok && len(s) > 0 && s[0] == '$' {
+				// Rename: data->>'sourceField' AS alias
+				srcField := s[1:]
+				if err := validateIdentifier(key); err != nil {
+					return nil, fmt.Errorf("$project: invalid alias %q: %w", key, err)
+				}
+				fp, err := fieldPath(srcField)
+				if err != nil {
+					return nil, fmt.Errorf("$project: %w", err)
+				}
+				selectParts = append(selectParts, fmt.Sprintf("%s AS %s", fp, key))
+			} else {
+				return nil, fmt.Errorf("$project: unsupported value for key %q: %v", key, val)
+			}
+		}
+		if !excludeID {
+			// Include _id by default (prepend)
+			selectParts = append([]string{"id AS _id"}, selectParts...)
+		}
+	} else if hasGroup {
 		// _id field determines grouping
 		idVal, hasID := groupStage["_id"]
 		if !hasID {
@@ -530,8 +632,14 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 			if err := validateIdentifier(field); err != nil {
 				return nil, fmt.Errorf("invalid $group _id field: %w", err)
 			}
-			selectParts = append(selectParts, fmt.Sprintf("data->>'%s' AS _id", field))
-			groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", field))
+			// When $unwind precedes $group on the same field, use the unwound alias
+			if hasUnwind && field == unwindField {
+				selectParts = append(selectParts, fmt.Sprintf("%s AS _id", unwindField))
+				groupByParts = append(groupByParts, unwindField)
+			} else {
+				selectParts = append(selectParts, fmt.Sprintf("data->>'%s' AS _id", field))
+				groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", field))
+			}
 		} else if idMap, ok := idVal.(map[string]interface{}); ok {
 			// Composite _id: {alias: "$field", ...} → json_build_object + multi GROUP BY
 			if len(idMap) == 0 {
@@ -590,6 +698,11 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 
 	q := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
 
+	// CROSS JOIN for $unwind
+	if hasUnwind {
+		q += fmt.Sprintf(" CROSS JOIN jsonb_array_elements_text(data->'%s') AS %s", unwindField, unwindField)
+	}
+
 	// WHERE from $match
 	if matchFilter != nil {
 		whereClause, filterParams, nextP, err := buildFilter(matchFilter, paramIdx)
@@ -606,6 +719,39 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 	// GROUP BY
 	if len(groupByParts) > 0 {
 		q += " GROUP BY " + strings.Join(groupByParts, ", ")
+	}
+
+	// $lookup: correlated subquery appended as additional select column via wrapping
+	if hasLookup {
+		fromColl, _ := lookupStage["from"].(string)
+		localField, _ := lookupStage["localField"].(string)
+		foreignField, _ := lookupStage["foreignField"].(string)
+		asField, _ := lookupStage["as"].(string)
+
+		if err := validateIdentifier(fromColl); err != nil {
+			return nil, fmt.Errorf("$lookup: invalid 'from' collection: %w", err)
+		}
+		if err := validateIdentifier(asField); err != nil {
+			return nil, fmt.Errorf("$lookup: invalid 'as' field: %w", err)
+		}
+
+		localExpr, err := fieldPath(localField)
+		if err != nil {
+			return nil, fmt.Errorf("$lookup: invalid localField: %w", err)
+		}
+		foreignExpr, err := fieldPath(foreignField)
+		if err != nil {
+			return nil, fmt.Errorf("$lookup: invalid foreignField: %w", err)
+		}
+		// Qualify foreignExpr to reference the lookup table
+		foreignExpr = strings.Replace(foreignExpr, "data", fromColl+".data", 1)
+
+		subquery := fmt.Sprintf(
+			"(SELECT COALESCE(json_agg(%s.data), '[]'::json) FROM %s WHERE %s = %s) AS %s",
+			fromColl, fromColl, foreignExpr, localExpr, asField)
+
+		// Inject the subquery into the SELECT by rebuilding
+		q = strings.Replace(q, "SELECT ", "SELECT "+subquery+", ", 1)
 	}
 
 	// ORDER BY
@@ -658,7 +804,7 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 	}
 	defer rows.Close()
 
-	if hasGroup {
+	if hasGroup || hasProject || hasLookup {
 		return scanAggregateRows(rows)
 	}
 	return scanDocRows(rows)
@@ -775,6 +921,14 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 			}
 			s, isStr := val.(string)
 			if isStr {
+				// Try to parse JSON arrays (from json_agg in $lookup)
+				if len(s) > 0 && s[0] == '[' {
+					var arr []interface{}
+					if err := json.Unmarshal([]byte(s), &arr); err == nil {
+						row[col] = arr
+						continue
+					}
+				}
 				// Try to parse JSON objects (from json_build_object) and arrays
 				if len(s) > 0 && s[0] == '{' && col == "_id" {
 					var m map[string]interface{}
