@@ -288,10 +288,8 @@ func TestSearchFuzzy_SQLGeneration(t *testing.T) {
 	}
 
 	caps := drv.allCaptures()
-	// First capture: CREATE EXTENSION IF NOT EXISTS pg_trgm
-	assertContains(t, caps[0].query, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
-	// Second capture: the actual query
+	// The query (no extension creation — proxy handles pg_trgm)
 	last := caps[len(caps)-1]
 	assertContains(t, last.query, "similarity(name, $1)")
 	assertContains(t, last.query, "FROM users")
@@ -356,10 +354,8 @@ func TestSearchPhonetic_SQLGeneration(t *testing.T) {
 	}
 
 	caps := drv.allCaptures()
-	// First two captures: CREATE EXTENSION for fuzzystrmatch and pg_trgm
-	assertContains(t, caps[0].query, "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-	assertContains(t, caps[1].query, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
+	// The query (no extension creation — proxy handles fuzzystrmatch and pg_trgm)
 	last := caps[len(caps)-1]
 	assertContains(t, last.query, "soundex(name) = soundex($1)")
 	assertContains(t, last.query, "similarity(name, $1)")
@@ -412,9 +408,8 @@ func TestSimilar_SQLGeneration(t *testing.T) {
 	}
 
 	caps := drv.allCaptures()
-	// First: CREATE EXTENSION IF NOT EXISTS vector
-	assertContains(t, caps[0].query, "CREATE EXTENSION IF NOT EXISTS vector")
 
+	// The query (no extension creation — proxy handles vector)
 	last := caps[len(caps)-1]
 	assertContains(t, last.query, "embedding <=> $1::vector")
 	assertContains(t, last.query, "FROM documents")
@@ -475,9 +470,8 @@ func TestSuggest_SQLGeneration(t *testing.T) {
 	}
 
 	caps := drv.allCaptures()
-	// First: CREATE EXTENSION pg_trgm
-	assertContains(t, caps[0].query, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
+	// The query (no extension creation — proxy handles pg_trgm)
 	last := caps[len(caps)-1]
 	assertContains(t, last.query, "similarity(name, $1)")
 	assertContains(t, last.query, "name ILIKE $2")
