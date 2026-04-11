@@ -365,12 +365,7 @@ func Hdel(db *sql.DB, table, key, field string) (bool, error) {
 // Creates the table with PostGIS geometry column if it doesn't exist.
 // Requires PostGIS extension.
 func Geoadd(db *sql.DB, table, nameColumn, geomColumn, name string, lon, lat float64) error {
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS postgis")
-	if err != nil {
-		return fmt.Errorf("create postgis extension: %w", err)
-	}
-
-	_, err = db.Exec(
+	_, err := db.Exec(
 		"CREATE TABLE IF NOT EXISTS " + table + " (" +
 			"id BIGSERIAL PRIMARY KEY, " +
 			nameColumn + " TEXT NOT NULL, " +
@@ -614,11 +609,6 @@ func StreamClaim(db *sql.DB, stream, group, consumer string, minIdleMs int64) ([
 // provided arguments, and returns the text result. Returns nil if the
 // function returns NULL. Requires the pllua extension.
 func Script(db *sql.DB, luaCode string, args ...string) (*string, error) {
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pllua")
-	if err != nil {
-		return nil, err
-	}
-
 	funcName := fmt.Sprintf("_gl_lua_%016x", rand.Int63())[:24]
 
 	var params []string
@@ -627,7 +617,7 @@ func Script(db *sql.DB, luaCode string, args ...string) (*string, error) {
 	}
 	paramStr := strings.Join(params, ", ")
 
-	_, err = db.Exec(fmt.Sprintf(
+	_, err := db.Exec(fmt.Sprintf(
 		`CREATE OR REPLACE FUNCTION pg_temp.%s(%s) RETURNS text LANGUAGE pllua AS $pllua$ %s $pllua$`,
 		funcName, paramStr, luaCode))
 	if err != nil {

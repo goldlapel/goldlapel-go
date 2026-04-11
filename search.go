@@ -190,11 +190,6 @@ func SearchFuzzy(db *sql.DB, table, column, query string, opts ...SearchOption) 
 		return nil, err
 	}
 
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-	if err != nil {
-		return nil, fmt.Errorf("create pg_trgm extension: %w", err)
-	}
-
 	q := fmt.Sprintf(
 		"SELECT *, similarity(%s, $1) AS _score FROM %s WHERE similarity(%s, $1) > $2 ORDER BY _score DESC LIMIT $3",
 		column, table, column)
@@ -225,15 +220,6 @@ func SearchPhonetic(db *sql.DB, table, column, query string, opts ...SearchOptio
 		return nil, err
 	}
 
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-	if err != nil {
-		return nil, fmt.Errorf("create fuzzystrmatch extension: %w", err)
-	}
-	_, err = db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-	if err != nil {
-		return nil, fmt.Errorf("create pg_trgm extension: %w", err)
-	}
-
 	q := fmt.Sprintf(
 		"SELECT *, similarity(%s, $1) AS _score FROM %s WHERE soundex(%s) = soundex($1) ORDER BY _score DESC, %s LIMIT $2",
 		column, table, column, column)
@@ -261,11 +247,6 @@ func Similar(db *sql.DB, table, column string, vector []float64, opts ...SearchO
 	}
 	if err := validateIdentifier(column); err != nil {
 		return nil, err
-	}
-
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector")
-	if err != nil {
-		return nil, fmt.Errorf("create vector extension: %w", err)
 	}
 
 	parts := make([]string, len(vector))
@@ -301,11 +282,6 @@ func Suggest(db *sql.DB, table, column, prefix string, opts ...SearchOption) ([]
 	}
 	if err := validateIdentifier(column); err != nil {
 		return nil, err
-	}
-
-	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-	if err != nil {
-		return nil, fmt.Errorf("create pg_trgm extension: %w", err)
 	}
 
 	q := fmt.Sprintf(
