@@ -821,7 +821,7 @@ func TestPercolateAdd_SQLGeneration(t *testing.T) {
 	assertContains(t, caps[0].query, "tsquery TSQUERY")
 
 	assertContains(t, caps[1].query, "CREATE INDEX IF NOT EXISTS my_percolator_tsq_idx")
-	assertContains(t, caps[1].query, "USING GIN (tsquery)")
+	assertContains(t, caps[1].query, "USING GIST (tsquery)")
 
 	upsert := caps[2]
 	assertContains(t, upsert.query, "INSERT INTO my_percolator")

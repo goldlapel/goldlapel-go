@@ -32,8 +32,8 @@ func PercolateAdd(db *sql.DB, name, queryID, query string, opts ...SearchOption)
 		return fmt.Errorf("create percolator table: %w", err)
 	}
 
-	// Auto-create GIN index on tsquery column
-	createIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_tsq_idx ON %s USING GIN (tsquery)", name, name)
+	// Auto-create GIST index on tsquery column
+	createIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_tsq_idx ON %s USING GIST (tsquery)", name, name)
 	if _, err := db.Exec(createIndex); err != nil {
 		return fmt.Errorf("create percolator index: %w", err)
 	}
