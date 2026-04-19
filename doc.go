@@ -9,9 +9,6 @@ import (
 	"strings"
 )
 
-// DocFindOption configures a DocFind call.
-type DocFindOption func(*docFindOptions)
-
 type docFindOptions struct {
 	sort  map[string]int // key -> 1 (ASC) or -1 (DESC)
 	limit int
@@ -20,19 +17,19 @@ type docFindOptions struct {
 
 // DocSort sets the sort order for DocFind. Keys are JSONB field names,
 // values are 1 for ascending or -1 for descending. Like MongoDB's sort.
-func DocSort(fields map[string]int) DocFindOption {
-	return func(o *docFindOptions) { o.sort = fields }
+func DocSort(fields map[string]int) Option {
+	return docOnly(func(o *docFindOptions) { o.sort = fields })
 }
 
 // DocLimit sets the maximum number of documents to return. Like MongoDB's limit.
-func DocLimit(n int) DocFindOption {
-	return func(o *docFindOptions) { o.limit = n }
+func DocLimit(n int) Option {
+	return docOnly(func(o *docFindOptions) { o.limit = n })
 }
 
 // DocSkip sets the number of documents to skip before returning results.
 // Like MongoDB's skip.
-func DocSkip(n int) DocFindOption {
-	return func(o *docFindOptions) { o.skip = n }
+func DocSkip(n int) Option {
+	return docOnly(func(o *docFindOptions) { o.skip = n })
 }
 
 // ensureCollection creates the document store table if it doesn't exist.
@@ -135,14 +132,14 @@ func DocInsertMany(ctx context.Context, q execQuerier, collection string, docume
 }
 
 // DocFind queries documents from a collection. Like MongoDB's find().
-func DocFind(ctx context.Context, q execQuerier, collection string, filter interface{}, opts ...DocFindOption) ([]map[string]interface{}, error) {
+func DocFind(ctx context.Context, q execQuerier, collection string, filter interface{}, opts ...Option) ([]map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
 
 	o := &docFindOptions{limit: 100}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applyDoc(o)
 	}
 
 	query := "SELECT id, data, created_at FROM " + collection
@@ -366,7 +363,9 @@ func DocCount(ctx context.Context, q execQuerier, collection string, filter inte
 }
 
 // DocCreateIndex creates a GIN index on one or more JSONB keys in a collection.
-func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys ...string) error {
+// Pass keys as a slice so that functional options (e.g. WithTx) remain
+// available as trailing variadic parameters.
+func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys []string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}

@@ -396,7 +396,7 @@ func TestDocCount_InvalidCollection(t *testing.T) {
 func TestDocCreateIndex_FullIndex(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(ctx, db, "users")
+	err := DocCreateIndex(ctx, db, "users", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestDocCreateIndex_FullIndex(t *testing.T) {
 func TestDocCreateIndex_SingleKey(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(ctx, db, "users", "email")
+	err := DocCreateIndex(ctx, db, "users", []string{"email"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestDocCreateIndex_SingleKey(t *testing.T) {
 func TestDocCreateIndex_MultipleKeys(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(ctx, db, "users", "first_name", "last_name")
+	err := DocCreateIndex(ctx, db, "users", []string{"first_name", "last_name"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestDocCreateIndex_MultipleKeys(t *testing.T) {
 func TestDocCreateIndex_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(ctx, db, "bad;name")
+	err := DocCreateIndex(ctx, db, "bad;name", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -446,7 +446,7 @@ func TestDocCreateIndex_InvalidCollection(t *testing.T) {
 func TestDocCreateIndex_InvalidKey(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(ctx, db, "users", "bad;key")
+	err := DocCreateIndex(ctx, db, "users", []string{"bad;key"})
 	if err == nil {
 		t.Fatal("expected error for invalid key name")
 	}
@@ -471,7 +471,7 @@ func TestDoc_AllFunctions_RejectSQLInjection(t *testing.T) {
 		{"DocDelete", func() error { _, err := DocDelete(ctx, db, badName, nil); return err }},
 		{"DocDeleteOne", func() error { _, err := DocDeleteOne(ctx, db, badName, nil); return err }},
 		{"DocCount", func() error { _, err := DocCount(ctx, db, badName, nil); return err }},
-		{"DocCreateIndex", func() error { return DocCreateIndex(ctx, db, badName) }},
+		{"DocCreateIndex", func() error { return DocCreateIndex(ctx, db, badName, nil) }},
 		{"DocAggregate", func() error {
 			_, err := DocAggregate(ctx, db, badName, []map[string]interface{}{{"$match": nil}})
 			return err

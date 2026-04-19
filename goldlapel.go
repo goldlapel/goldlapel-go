@@ -105,23 +105,62 @@ var (
 
 // Option is the unified functional-options type accepted by Start and by
 // every receiver method. Implementations typically set construction
-// parameters (e.g. WithPort) or per-call overrides (e.g. WithTx).
+// parameters (e.g. WithPort) or per-call overrides (e.g. WithTx). A single
+// Option may participate in any combination of the four facets:
+//
+//	applyStart  — set fields on *GoldLapel before spawn (WithPort, WithConfig)
+//	applyCall   — override per-call state such as the tx target (WithTx)
+//	applySearch — populate search-specific options (WithLimit, WithLang, ...)
+//	applyDoc    — populate DocFind-specific options (DocSort, DocLimit, ...)
+//
+// Implementations no-op the facets they do not care about. This keeps a
+// single pipe of options flowing through every method in the API.
 type Option interface {
 	applyStart(*GoldLapel)
 	applyCall(*callOptions)
+	applySearch(*searchOptions)
+	applyDoc(*docFindOptions)
 }
+
+// SearchOption is retained as an alias for Option so existing callers that
+// named the type (e.g. when holding options in a variable) keep compiling.
+// Every SearchOption is an Option and vice-versa.
+type SearchOption = Option
+
+// DocFindOption is retained as an alias for Option for the same reason.
+type DocFindOption = Option
 
 // startOnly is an Option that only affects construction.
 type startOnly func(*GoldLapel)
 
-func (f startOnly) applyStart(gl *GoldLapel) { f(gl) }
-func (f startOnly) applyCall(*callOptions)   {}
+func (f startOnly) applyStart(gl *GoldLapel)  { f(gl) }
+func (f startOnly) applyCall(*callOptions)    {}
+func (f startOnly) applySearch(*searchOptions) {}
+func (f startOnly) applyDoc(*docFindOptions)   {}
 
 // callOnly is an Option that only affects a single method call.
 type callOnly func(*callOptions)
 
-func (f callOnly) applyStart(*GoldLapel)   {}
-func (f callOnly) applyCall(o *callOptions) { f(o) }
+func (f callOnly) applyStart(*GoldLapel)       {}
+func (f callOnly) applyCall(o *callOptions)    { f(o) }
+func (f callOnly) applySearch(*searchOptions)  {}
+func (f callOnly) applyDoc(*docFindOptions)    {}
+
+// searchOnly is an Option that only affects search-specific options.
+type searchOnly func(*searchOptions)
+
+func (f searchOnly) applyStart(*GoldLapel)       {}
+func (f searchOnly) applyCall(*callOptions)      {}
+func (f searchOnly) applySearch(o *searchOptions) { f(o) }
+func (f searchOnly) applyDoc(*docFindOptions)    {}
+
+// docOnly is an Option that only affects DocFind-specific options.
+type docOnly func(*docFindOptions)
+
+func (f docOnly) applyStart(*GoldLapel)       {}
+func (f docOnly) applyCall(*callOptions)      {}
+func (f docOnly) applySearch(*searchOptions)  {}
+func (f docOnly) applyDoc(o *docFindOptions)  { f(o) }
 
 // callOptions collects per-call overrides. Currently only a transaction
 // target, but this is the hook for future per-call options.
@@ -406,11 +445,22 @@ func openDB(url string) (*sql.DB, error) {
 // Stop terminates the proxy process and closes the database pool.
 // Safe to call multiple times. The context is honoured during the graceful
 // shutdown wait — if ctx is cancelled the process is killed immediately.
+//
+// Scoped instances (the *GoldLapel returned by InTx) share the parent's
+// process and pool but must not tear them down if a caller mistakenly
+// calls Stop on them. Stop is a no-op on a scoped instance — the caller
+// should Stop the parent.
 func (gl *GoldLapel) Stop(ctx context.Context) error {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 
-	// Scoped instances (returned by InTx) do not own a process.
+	// Scoped instance (bound to an *sql.Tx from InTx): never tear down
+	// the shared proxy process or pool. The parent owns those.
+	if gl.tx != nil {
+		return nil
+	}
+
+	// Unstarted / already-stopped instance.
 	if gl.cmd == nil && gl.done == nil {
 		return nil
 	}
@@ -459,6 +509,7 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 
 // Close implements io.Closer. It calls Stop with context.Background().
 // Prefer Stop(ctx) in application code so the shutdown deadline is explicit.
+// Like Stop, Close is a no-op on scoped instances returned by InTx.
 func (gl *GoldLapel) Close() error {
 	return gl.Stop(context.Background())
 }

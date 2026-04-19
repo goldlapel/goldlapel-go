@@ -8,10 +8,10 @@ import (
 // PercolateAdd registers a named query for reverse matching.
 // Like Elasticsearch percolator. Auto-creates the percolator table and GIN
 // index if they don't exist, then upserts the query.
-func PercolateAdd(ctx context.Context, q execQuerier, name, queryID, query string, opts ...SearchOption) error {
+func PercolateAdd(ctx context.Context, q execQuerier, name, queryID, query string, opts ...Option) error {
 	o := &searchOptions{lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(name); err != nil {
@@ -52,10 +52,10 @@ func PercolateAdd(ctx context.Context, q execQuerier, name, queryID, query strin
 }
 
 // Percolate matches a document against stored queries.
-func Percolate(ctx context.Context, q execQuerier, name, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Percolate(ctx context.Context, q execQuerier, name, text string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(name); err != nil {

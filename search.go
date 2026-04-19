@@ -32,47 +32,44 @@ type searchOptions struct {
 	metadata    string
 }
 
-// SearchOption configures a search call.
-type SearchOption func(*searchOptions)
-
 // WithLimit sets the maximum number of results.
-func WithLimit(n int) SearchOption {
-	return func(o *searchOptions) { o.limit = n }
+func WithLimit(n int) Option {
+	return searchOnly(func(o *searchOptions) { o.limit = n })
 }
 
 // WithLang sets the language for full-text search (default "english").
-func WithLang(lang string) SearchOption {
-	return func(o *searchOptions) { o.lang = lang }
+func WithLang(lang string) Option {
+	return searchOnly(func(o *searchOptions) { o.lang = lang })
 }
 
 // WithThreshold sets the similarity threshold for fuzzy search (default 0.3).
-func WithThreshold(t float64) SearchOption {
-	return func(o *searchOptions) { o.threshold = t }
+func WithThreshold(t float64) Option {
+	return searchOnly(func(o *searchOptions) { o.threshold = t })
 }
 
 // WithHighlight enables ts_headline highlighting for full-text search.
-func WithHighlight(on bool) SearchOption {
-	return func(o *searchOptions) { o.highlight = on }
+func WithHighlight(on bool) Option {
+	return searchOnly(func(o *searchOptions) { o.highlight = on })
 }
 
 // WithQuery sets the full-text search query string for filtering.
-func WithQuery(q string) SearchOption {
-	return func(o *searchOptions) { o.query = q }
+func WithQuery(q string) Option {
+	return searchOnly(func(o *searchOptions) { o.query = q })
 }
 
 // WithQueryColumn sets the column(s) to search against. Accepts string or []string.
-func WithQueryColumn(col interface{}) SearchOption {
-	return func(o *searchOptions) { o.queryColumn = col }
+func WithQueryColumn(col interface{}) Option {
+	return searchOnly(func(o *searchOptions) { o.queryColumn = col })
 }
 
 // WithGroupBy sets the GROUP BY column for aggregate queries.
-func WithGroupBy(col string) SearchOption {
-	return func(o *searchOptions) { o.groupBy = col }
+func WithGroupBy(col string) Option {
+	return searchOnly(func(o *searchOptions) { o.groupBy = col })
 }
 
 // WithMetadata sets JSON metadata for percolator queries.
-func WithMetadata(meta string) SearchOption {
-	return func(o *searchOptions) { o.metadata = meta }
+func WithMetadata(meta string) Option {
+	return searchOnly(func(o *searchOptions) { o.metadata = meta })
 }
 
 // scanRows reads all rows from a *sql.Rows using dynamic column scanning.
@@ -107,10 +104,10 @@ func scanRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 }
 
 // Search performs full-text search using tsvector/tsquery.
-func Search(ctx context.Context, q execQuerier, table string, columns interface{}, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Search(ctx context.Context, q execQuerier, table string, columns interface{}, query string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -167,10 +164,10 @@ func Search(ctx context.Context, q execQuerier, table string, columns interface{
 }
 
 // SearchFuzzy performs trigram-based fuzzy search.
-func SearchFuzzy(ctx context.Context, q execQuerier, table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func SearchFuzzy(ctx context.Context, q execQuerier, table, column, query string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, threshold: 0.3}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -194,10 +191,10 @@ func SearchFuzzy(ctx context.Context, q execQuerier, table, column, query string
 }
 
 // SearchPhonetic performs phonetic (sounds-like) search.
-func SearchPhonetic(ctx context.Context, q execQuerier, table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func SearchPhonetic(ctx context.Context, q execQuerier, table, column, query string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -221,10 +218,10 @@ func SearchPhonetic(ctx context.Context, q execQuerier, table, column, query str
 }
 
 // Similar performs vector similarity search using pgvector.
-func Similar(ctx context.Context, q execQuerier, table, column string, vector []float64, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Similar(ctx context.Context, q execQuerier, table, column string, vector []float64, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 10}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -254,10 +251,10 @@ func Similar(ctx context.Context, q execQuerier, table, column string, vector []
 }
 
 // Suggest performs prefix-based autocomplete search.
-func Suggest(ctx context.Context, q execQuerier, table, column, prefix string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Suggest(ctx context.Context, q execQuerier, table, column, prefix string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 10}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -281,10 +278,10 @@ func Suggest(ctx context.Context, q execQuerier, table, column, prefix string, o
 }
 
 // Facets performs a terms aggregation on a column.
-func Facets(ctx context.Context, q execQuerier, table, column string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Facets(ctx context.Context, q execQuerier, table, column string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -349,10 +346,10 @@ var validAggregateFuncs = map[string]bool{
 }
 
 // Aggregate performs an aggregate function on a column.
-func Aggregate(ctx context.Context, q execQuerier, table, column, funcName string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Aggregate(ctx context.Context, q execQuerier, table, column, funcName string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {
@@ -400,10 +397,10 @@ func Aggregate(ctx context.Context, q execQuerier, table, column, funcName strin
 }
 
 // Analyze shows how PostgreSQL breaks text into searchable tokens.
-func Analyze(ctx context.Context, q execQuerier, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Analyze(ctx context.Context, q execQuerier, text string, opts ...Option) ([]map[string]interface{}, error) {
 	o := &searchOptions{lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	rows, err := q.QueryContext(ctx,
@@ -418,10 +415,10 @@ func Analyze(ctx context.Context, q execQuerier, text string, opts ...SearchOpti
 }
 
 // ExplainScore shows why a specific row scores the way it does for a query.
-func ExplainScore(ctx context.Context, q execQuerier, table, column, query, idColumn string, idValue interface{}, opts ...SearchOption) (map[string]interface{}, error) {
+func ExplainScore(ctx context.Context, q execQuerier, table, column, query, idColumn string, idValue interface{}, opts ...Option) (map[string]interface{}, error) {
 	o := &searchOptions{lang: "english"}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applySearch(o)
 	}
 
 	if err := validateIdentifier(table); err != nil {

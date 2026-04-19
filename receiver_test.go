@@ -78,7 +78,7 @@ func TestReceiverMethods_ErrNotConnected(t *testing.T) {
 		t.Fatalf("DocCount: expected ErrNotConnected, got %v", err)
 	}
 
-	err = gl.DocCreateIndex(ctx, "test", "a")
+	err = gl.DocCreateIndex(ctx, "test", []string{"a"})
 	if err != ErrNotConnected {
 		t.Fatalf("DocCreateIndex: expected ErrNotConnected, got %v", err)
 	}
@@ -476,4 +476,215 @@ func openTxDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, _ := newTestDB(t, nil, nil)
 	return db
+}
+
+// --- v0.2 WithTx regression on specialised option methods ---
+
+// TestWithTxOnSearch proves that WithTx is accepted — and honoured — by the
+// search-family methods that used to take `...SearchOption` only. Before the
+// unification these methods had no way to route at a specific transaction.
+func TestWithTxOnSearch(t *testing.T) {
+	db, drv := newTestDB(t, []string{"id", "title", "_score"}, nil)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	ctx := context.Background()
+
+	// Search with both a search option AND WithTx — both must be accepted
+	// and both must take effect.
+	_, err = gl.Search(ctx, "articles", "title", "postgres", WithLimit(7), WithTx(tx))
+	if err != nil {
+		t.Fatalf("Search with WithTx: %v", err)
+	}
+
+	captures := drv.allCaptures()
+	if len(captures) == 0 {
+		t.Fatal("expected a captured query")
+	}
+	last := captures[len(captures)-1]
+	// WithLimit(7) must have been applied as the trailing LIMIT parameter.
+	if last.args[len(last.args)-1] != int64(7) {
+		t.Fatalf("expected limit=7 as last param, got %v", last.args[len(last.args)-1])
+	}
+}
+
+// TestWithTxOnDocFind proves that WithTx is accepted alongside DocSort/
+// DocLimit/DocSkip on DocFind, which used to take `...DocFindOption` only.
+func TestWithTxOnDocFind(t *testing.T) {
+	db, _ := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		nil)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	ctx := context.Background()
+
+	// DocFind used to reject WithTx at compile time. Mixing doc options and
+	// WithTx in one call must now be accepted.
+	_, err = gl.DocFind(ctx, "users", nil,
+		DocSort(map[string]int{"name": 1}),
+		DocLimit(5),
+		WithTx(tx))
+	if err != nil {
+		t.Fatalf("DocFind with WithTx: %v", err)
+	}
+}
+
+// TestWithTxOnDocCreateIndex confirms DocCreateIndex (which previously took
+// `keys ...string`) now accepts WithTx as a trailing functional option.
+func TestWithTxOnDocCreateIndex(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	ctx := context.Background()
+	if err := gl.DocCreateIndex(ctx, "users", []string{"email"}, WithTx(tx)); err != nil {
+		t.Fatalf("DocCreateIndex with WithTx: %v", err)
+	}
+
+	// Sanity: the statement actually ran.
+	if len(drv.allCaptures()) == 0 {
+		t.Fatal("expected a captured CREATE INDEX query")
+	}
+}
+
+// TestResolveExec_WithTxOnSearchOptions verifies that at the resolveExec
+// level, passing WithTx together with a search-only option picks up the
+// transaction. This catches any regression where search-only options would
+// shadow the WithTx apply-path.
+func TestResolveExec_WithTxAndSearchOption(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	got, err := gl.resolveExec([]Option{WithLimit(10), WithTx(tx), WithLang("french")})
+	if err != nil {
+		t.Fatalf("resolveExec: %v", err)
+	}
+	if got != tx {
+		t.Fatalf("expected tx, got %T", got)
+	}
+}
+
+// --- Scoped Stop/Close no-op regression ---
+
+// TestScopedStopIsNoop guards against the footgun where a caller accidentally
+// calls Stop on the scoped *GoldLapel passed into an InTx closure. Before the
+// fix, that would SIGTERM the parent proxy process and close the shared pool,
+// nuking the parent instance. Now it must be a no-op: the parent's done
+// channel stays open and its db pool stays usable.
+func TestScopedStopIsNoop(t *testing.T) {
+	db := openTxDB(t)
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	// Simulate a running parent: give it a non-nil done channel so we can
+	// detect whether scoped.Stop would have closed it.
+	gl.done = make(chan struct{})
+	defer close(gl.done) // cleanup after the test
+
+	ctx := context.Background()
+	err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
+		// The scoped instance must carry the tx and share the parent's pool.
+		if scoped.tx == nil {
+			t.Fatal("scoped gl missing tx")
+		}
+		if scoped.db != db {
+			t.Fatal("scoped gl should share the parent's db")
+		}
+
+		// Calling Stop on the scoped instance must NOT kill the parent.
+		if err := scoped.Stop(ctx); err != nil {
+			t.Fatalf("scoped.Stop: %v", err)
+		}
+		// Calling Close on the scoped instance must also be a no-op.
+		if err := scoped.Close(); err != nil {
+			t.Fatalf("scoped.Close: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+
+	// Parent's done channel must still be open — scoped.Stop must not
+	// have touched it.
+	select {
+	case <-gl.done:
+		t.Fatal("parent done was closed by scoped Stop — parent got torn down")
+	default:
+	}
+
+	// Parent's db pool must still be usable.
+	if gl.db == nil {
+		t.Fatal("parent db was nilled by scoped Stop")
+	}
+	if err := gl.db.PingContext(ctx); err != nil {
+		t.Fatalf("parent db pool unusable after scoped Stop: %v", err)
+	}
+}
+
+// TestScopedStop_AfterInTxCommit ensures a scoped instance retained past the
+// InTx callback (e.g. captured into a variable) still cannot affect the
+// parent if Stop is called on it.
+func TestScopedStop_RetainedInstanceIsNoop(t *testing.T) {
+	db := openTxDB(t)
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+	gl.done = make(chan struct{})
+	defer close(gl.done)
+
+	var captured *GoldLapel
+	ctx := context.Background()
+	if err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
+		captured = scoped
+		return nil
+	}); err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+
+	if captured == nil || captured.tx == nil {
+		t.Fatal("expected captured scoped instance with tx set")
+	}
+
+	if err := captured.Stop(ctx); err != nil {
+		t.Fatalf("captured.Stop: %v", err)
+	}
+
+	// Parent still alive.
+	select {
+	case <-gl.done:
+		t.Fatal("parent done closed by retained scoped Stop")
+	default:
+	}
+	if gl.db == nil {
+		t.Fatal("parent db nilled by retained scoped Stop")
+	}
 }
