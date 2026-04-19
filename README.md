@@ -172,9 +172,13 @@ Every helper is available both as a package-level function (taking `ctx`, `execQ
 ## How it works
 
 1. `Start` locates the bundled Rust binary (honouring `GOLDLAPEL_BINARY`), spawns it as a subprocess, and waits for its port to accept TCP connections.
-2. It then eagerly opens a `database/sql` pool against the proxy — trying `pgx` first, then `postgres` (lib/pq) — and pings once to fail fast on auth/SSL issues.
+2. It then eagerly opens a `database/sql` pool against the proxy — trying `pgx` first, then `postgres` (lib/pq) — and pings once. If the ping fails the pool is closed and `gl.DB()` returns `nil`; the proxy itself still runs, and callers can open their own pool via `gl.URL()`.
 3. Wrapper methods run through `gl.DB()` by default. `InTx` begins a transaction and hands a scoped `*GoldLapel` to a closure; `WithTx(tx)` overrides the target for a single call.
 4. `Stop(ctx)` sends `SIGTERM`, waits for the child to exit, and closes the pool.
+
+## Testing
+
+Run your test suite with the race detector enabled: `go test -race ./...`. The wrapper spawns a subprocess and holds shared state (the last-started instance used by `Wrap` auto-detection), and `-race` catches concurrency issues that silent PASSes would otherwise hide.
 
 ## Upgrading from v0.1
 
