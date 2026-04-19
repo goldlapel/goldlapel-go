@@ -15,6 +15,13 @@ import (
 type capturedQuery struct {
 	query string
 	args  []driver.Value
+	// inTx is true when the statement executed inside an open transaction
+	// on the conn (i.e. after driver.Conn.Begin and before tx.Commit /
+	// tx.Rollback). Set from the conn's active-tx flag at the moment
+	// Exec/Query fires. This lets tests assert whether a call was routed
+	// at the pool (inTx=false) or at a transaction (inTx=true) — the
+	// original mock couldn't distinguish.
+	inTx bool
 }
 
 type mockDriver struct {
@@ -23,6 +30,10 @@ type mockDriver struct {
 	// columns/rows returned by mock queries
 	columns []string
 	rows    [][]driver.Value
+	// Lifecycle counters populated by mockTx.Commit / mockTx.Rollback so
+	// tests can assert happy-path commit semantics.
+	commits   int
+	rollbacks int
 }
 
 func (d *mockDriver) Open(name string) (driver.Conn, error) {
@@ -50,41 +61,78 @@ func (d *mockDriver) reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.captures = nil
+	d.commits = 0
+	d.rollbacks = 0
 }
 
 type mockConn struct {
 	drv *mockDriver
+	// inTx is true between Begin() and the subsequent tx.Commit/Rollback.
+	// Statements prepared+executed during that window are tagged inTx=true
+	// on their capturedQuery. Accessed under drv.mu (there's only one
+	// mockConn per test and database/sql serialises driver.Conn calls, but
+	// the tag is read from the stmt goroutine which in practice is the
+	// same goroutine — using the driver mutex keeps things honest under
+	// -race).
+	inTx bool
 }
 
 func (c *mockConn) Prepare(query string) (driver.Stmt, error) {
 	return &mockStmt{conn: c, query: query}, nil
 }
-func (c *mockConn) Close() error               { return nil }
-func (c *mockConn) Begin() (driver.Tx, error)   { return &mockTx{}, nil }
+func (c *mockConn) Close() error { return nil }
+func (c *mockConn) Begin() (driver.Tx, error) {
+	c.drv.mu.Lock()
+	c.inTx = true
+	c.drv.mu.Unlock()
+	return &mockTx{conn: c}, nil
+}
 
-type mockTx struct{}
+type mockTx struct {
+	conn *mockConn
+}
 
-func (t *mockTx) Commit() error   { return nil }
-func (t *mockTx) Rollback() error { return nil }
+func (t *mockTx) Commit() error {
+	t.conn.drv.mu.Lock()
+	t.conn.drv.commits++
+	t.conn.inTx = false
+	t.conn.drv.mu.Unlock()
+	return nil
+}
+func (t *mockTx) Rollback() error {
+	t.conn.drv.mu.Lock()
+	t.conn.drv.rollbacks++
+	t.conn.inTx = false
+	t.conn.drv.mu.Unlock()
+	return nil
+}
 
 type mockStmt struct {
 	conn  *mockConn
 	query string
 }
 
-func (s *mockStmt) Close() error { return nil }
+func (s *mockStmt) Close() error  { return nil }
 func (s *mockStmt) NumInput() int { return -1 } // accept any number of args
 
 func (s *mockStmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.conn.drv.mu.Lock()
-	s.conn.drv.captures = append(s.conn.drv.captures, capturedQuery{query: s.query, args: args})
+	s.conn.drv.captures = append(s.conn.drv.captures, capturedQuery{
+		query: s.query,
+		args:  args,
+		inTx:  s.conn.inTx,
+	})
 	s.conn.drv.mu.Unlock()
 	return mockResult{}, nil
 }
 
 func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.conn.drv.mu.Lock()
-	s.conn.drv.captures = append(s.conn.drv.captures, capturedQuery{query: s.query, args: args})
+	s.conn.drv.captures = append(s.conn.drv.captures, capturedQuery{
+		query: s.query,
+		args:  args,
+		inTx:  s.conn.inTx,
+	})
 	cols := s.conn.drv.columns
 	rows := s.conn.drv.rows
 	s.conn.drv.mu.Unlock()

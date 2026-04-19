@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -342,6 +343,9 @@ func TestErrNotConnected_ErrorMessage(t *testing.T) {
 func TestWithTx_OverridesPool(t *testing.T) {
 	// Build a *sql.DB + *sql.Tx backed by the mock driver so we can
 	// prove WithTx(tx) routes a call at the transaction instead of the pool.
+	// The enhanced mock tags every capture with inTx=true iff the statement
+	// fired while a transaction was open on its conn — so we can assert
+	// the happy-path routing, not just "a query happened".
 	db, drv := newTestDB(t,
 		[]string{"id", "data", "created_at"},
 		[][]driver.Value{{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
@@ -361,13 +365,46 @@ func TestWithTx_OverridesPool(t *testing.T) {
 		t.Fatalf("DocInsert: %v", err)
 	}
 
-	// Sanity check: at least one capture ran against the mock driver. The
-	// mock shares a single statement recorder across the pool + tx, so we
-	// only need to prove the call completed; tx routing is exercised by
-	// resolveExec itself via the unit test on callOptions below.
+	// The DocInsert above should have fired through the transaction. Find
+	// the INSERT among the captures (earlier captures include any schema
+	// DDL DocInsert emits; we only assert the user-visible INSERT tag).
 	captures := drv.allCaptures()
 	if len(captures) == 0 {
 		t.Fatal("expected at least one captured query")
+	}
+	foundInsertInTx := false
+	for _, c := range captures {
+		if strings.Contains(strings.ToUpper(c.query), "INSERT INTO") && c.inTx {
+			foundInsertInTx = true
+			break
+		}
+	}
+	if !foundInsertInTx {
+		t.Fatalf("expected INSERT INTO to execute inside tx, but all captures were on the pool:\n%+v", captures)
+	}
+}
+
+// TestWithTx_NoOverrideRoutesThroughPool is the negative of
+// TestWithTx_OverridesPool — without WithTx, the DocInsert must hit the
+// pool, not any transaction. Guards against a regression where resolveExec
+// leaks tx state across calls.
+func TestWithTx_NoOverrideRoutesThroughPool(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{{int64(1), `{"name":"bob"}`, "2026-01-01T00:00:00Z"}})
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	ctx := context.Background()
+	if _, err := gl.DocInsert(ctx, "users", map[string]interface{}{"name": "bob"}); err != nil {
+		t.Fatalf("DocInsert: %v", err)
+	}
+
+	for _, c := range drv.allCaptures() {
+		if c.inTx {
+			t.Fatalf("expected all captures on the pool (inTx=false), got inTx=true for: %q", c.query)
+		}
 	}
 }
 
@@ -430,6 +467,103 @@ func TestInTx_CommitsOnSuccess(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected callback to run")
+	}
+}
+
+// TestWithTx_HappyPathCommit is the end-to-end happy-path test the v0.2
+// review flagged as missing. Previous coverage only had the mock-level
+// 'a query ran' smoke test (TestWithTx_OverridesPool) and the integration
+// suite — neither verified the full lifecycle inside InTx. With the
+// enhanced mock driver (captures tagged inTx, commit/rollback counters
+// on the driver), we can now assert:
+//
+//  1. InTx calls Begin on the conn (inTx flips to true).
+//  2. Every gl.* call inside the closure routes through the tx — every
+//     capture carries inTx=true.
+//  3. On successful return, Commit fires exactly once; Rollback never
+//     fires.
+func TestWithTx_HappyPathCommit(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{{int64(1), `{"x":1}`, "2026-01-01T00:00:00Z"}})
+
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	ctx := context.Background()
+
+	// Reset driver captures between the initial schema dance (if any)
+	// and the measurement we care about. DocInsert/DocUpdate emit a few
+	// CREATE TABLE IF NOT EXISTS statements the first time they touch a
+	// collection — we don't want those muddying the assertions.
+	drv.reset()
+
+	err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
+		if _, err := scoped.DocInsert(ctx, "users", map[string]interface{}{"name": "alice"}); err != nil {
+			return err
+		}
+		if _, err := scoped.DocUpdate(ctx, "users",
+			map[string]interface{}{"name": "alice"},
+			map[string]interface{}{"name": "alice2"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("InTx returned error: %v", err)
+	}
+
+	captures := drv.allCaptures()
+	if len(captures) == 0 {
+		t.Fatal("expected queries to have fired inside InTx")
+	}
+
+	// Every captured statement must be inside the tx.
+	for _, c := range captures {
+		if !c.inTx {
+			t.Errorf("expected inTx=true for all statements, got inTx=false for: %q", c.query)
+		}
+	}
+
+	// Commit fired exactly once; Rollback never fired.
+	drv.mu.Lock()
+	commits := drv.commits
+	rollbacks := drv.rollbacks
+	drv.mu.Unlock()
+	if commits != 1 {
+		t.Fatalf("expected 1 commit, got %d", commits)
+	}
+	if rollbacks != 0 {
+		t.Fatalf("expected 0 rollbacks, got %d", rollbacks)
+	}
+}
+
+// TestWithTx_RollbackOnError is the symmetric negative: on error, Commit
+// must NOT fire; Rollback must fire exactly once. Complements
+// TestInTx_RollsBackOnError (which only checks the error value, not the
+// driver-level lifecycle).
+func TestWithTx_RollbackOnError(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	gl.db = db
+
+	sentinel := errors.New("boom")
+	err := gl.InTx(context.Background(), db, func(scoped *GoldLapel) error {
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel, got %v", err)
+	}
+
+	drv.mu.Lock()
+	commits := drv.commits
+	rollbacks := drv.rollbacks
+	drv.mu.Unlock()
+	if commits != 0 {
+		t.Fatalf("expected 0 commits on error path, got %d", commits)
+	}
+	if rollbacks != 1 {
+		t.Fatalf("expected 1 rollback on error path, got %d", rollbacks)
 	}
 }
 
