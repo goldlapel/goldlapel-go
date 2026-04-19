@@ -196,6 +196,16 @@ func WithExtraArgs(args ...string) Option {
 	})
 }
 
+// WithSilent suppresses the one-line startup banner that Start would
+// otherwise print to stderr. Use it in library code, CLI tools, or test
+// harnesses that don't want the wrapper chattering on their streams.
+// Construction-time only.
+func WithSilent() Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.silent = true
+	})
+}
+
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
 // Construction-time only.
@@ -351,6 +361,7 @@ type GoldLapel struct {
 	done          chan struct{} // closed when process exits
 	db            *sql.DB
 	tx            *sql.Tx // non-nil only for GoldLapel instances returned by InTx
+	silent        bool    // when true, printBanner is a no-op
 	mu            sync.Mutex
 }
 
@@ -468,13 +479,25 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	}
 	gl.db = db
 
-	if gl.dashboardPort > 0 {
-		fmt.Printf("goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
-	} else {
-		fmt.Printf("goldlapel → :%d (proxy)\n", gl.port)
-	}
+	gl.printBanner(os.Stderr)
 
 	return nil
+}
+
+// printBanner writes the one-line startup banner to w. Library code should
+// never write to stdout, so Start calls this with os.Stderr. WithSilent()
+// makes it a no-op. Exposed as a method (rather than inlined in spawn) so
+// tests can exercise both the routing and the silent-suppression paths
+// without spawning the real binary.
+func (gl *GoldLapel) printBanner(w io.Writer) {
+	if gl.silent {
+		return
+	}
+	if gl.dashboardPort > 0 {
+		fmt.Fprintf(w, "goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
+	} else {
+		fmt.Fprintf(w, "goldlapel → :%d (proxy)\n", gl.port)
+	}
 }
 
 // openDB tries common registered Postgres drivers in a stable order.

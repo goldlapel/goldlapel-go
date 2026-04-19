@@ -2,6 +2,7 @@ package goldlapel
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -781,5 +782,114 @@ func TestWithConfig_Integration(t *testing.T) {
 	}
 	if gl.config["pool_size"] != 20 {
 		t.Fatalf("expected pool_size=20, got %v", gl.config["pool_size"])
+	}
+}
+
+// --- Banner routing tests ---
+//
+// The startup banner must never go to stdout (library code that pollutes
+// stdout breaks callers who capture it — CI tools, test runners, CLIs
+// piping the wrapper's own output). WithSilent() must suppress it on both
+// streams. These tests swap os.Stdout/os.Stderr for pipes, invoke the
+// banner helper the same way Start does, and inspect what landed where —
+// all without spawning the real binary.
+
+// captureStdStreams redirects os.Stdout and os.Stderr to pipes, runs fn,
+// restores the originals, and returns whatever fn wrote to each. Any I/O
+// error (pipe creation, restore) fails the test — the banner contract
+// isn't worth asserting against a leaky harness.
+func captureStdStreams(t *testing.T, fn func()) (stdout, stderr string) {
+	t.Helper()
+
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stdout: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		t.Fatalf("os.Pipe stderr: %v", err)
+	}
+
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	// Drain concurrently — a full pipe buffer would deadlock fn.
+	stdoutCh := make(chan string, 1)
+	stderrCh := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(stdoutR)
+		stdoutCh <- string(b)
+	}()
+	go func() {
+		b, _ := io.ReadAll(stderrR)
+		stderrCh <- string(b)
+	}()
+
+	defer func() {
+		os.Stdout = origStdout
+		os.Stderr = origStderr
+	}()
+
+	fn()
+
+	// Close the writer ends so the readers see EOF.
+	stdoutW.Close()
+	stderrW.Close()
+
+	return <-stdoutCh, <-stderrCh
+}
+
+func TestBannerWritesToStderrNotStdout(t *testing.T) {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+
+	stdout, stderr := captureStdStreams(t, func() {
+		// Mirror what spawn does at the print site.
+		gl.printBanner(os.Stderr)
+	})
+
+	if !strings.Contains(stderr, "goldlapel →") {
+		t.Fatalf("expected banner on stderr, got stderr=%q", stderr)
+	}
+	if strings.Contains(stdout, "goldlapel") {
+		t.Fatalf("banner leaked to stdout: %q", stdout)
+	}
+	// Confirm the full shape so a future formatting change trips the test.
+	if !strings.Contains(stderr, ":7932 (proxy)") || !strings.Contains(stderr, "127.0.0.1:7933 (dashboard)") {
+		t.Fatalf("banner shape changed: %q", stderr)
+	}
+}
+
+func TestWithSilentSuppressesBanner(t *testing.T) {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent())
+
+	stdout, stderr := captureStdStreams(t, func() {
+		gl.printBanner(os.Stderr)
+	})
+
+	if strings.Contains(stdout, "goldlapel") {
+		t.Fatalf("WithSilent should have suppressed stdout banner, got %q", stdout)
+	}
+	if strings.Contains(stderr, "goldlapel") {
+		t.Fatalf("WithSilent should have suppressed stderr banner, got %q", stderr)
+	}
+}
+
+func TestWithSilentDefaultsFalse(t *testing.T) {
+	// No WithSilent → silent field defaults to false → banner prints.
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	if gl.silent {
+		t.Fatal("expected silent to default to false")
+	}
+}
+
+func TestWithSilentSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent())
+	if !gl.silent {
+		t.Fatal("expected WithSilent() to set silent=true")
 	}
 }
