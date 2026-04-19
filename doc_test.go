@@ -1937,3 +1937,250 @@ func TestDocRemoveCap_DropsDDL(t *testing.T) {
 	assertContains(t, captures[0].query, "DROP TRIGGER IF EXISTS logs_cap_trigger ON logs")
 	assertContains(t, captures[1].query, "DROP FUNCTION IF EXISTS logs_cap_enforce()")
 }
+
+// --- DocCreateCollection ---
+
+func TestDocCreateCollection_Logged(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	if err := DocCreateCollection(ctx, db, "users", false); err != nil {
+		t.Fatal(err)
+	}
+	last := drv.lastCapture()
+	assertContains(t, last.query, "CREATE TABLE IF NOT EXISTS users")
+	assertNotContains(t, last.query, "UNLOGGED")
+	assertContains(t, last.query, "BIGSERIAL PRIMARY KEY")
+	assertContains(t, last.query, "data JSONB NOT NULL")
+	assertContains(t, last.query, "created_at TIMESTAMPTZ")
+}
+
+func TestDocCreateCollection_Unlogged(t *testing.T) {
+	db, drv := newTestDB(t, nil, nil)
+
+	if err := DocCreateCollection(ctx, db, "events", true); err != nil {
+		t.Fatal(err)
+	}
+	last := drv.lastCapture()
+	assertContains(t, last.query, "CREATE UNLOGGED TABLE IF NOT EXISTS events")
+}
+
+func TestDocCreateCollection_InvalidIdentifier(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+
+	if err := DocCreateCollection(ctx, db, "bad name!", false); err == nil {
+		t.Fatal("expected error for invalid identifier")
+	}
+}
+
+// --- DocFindOneAndUpdate ---
+
+func TestDocFindOneAndUpdate_SQLAndReturn(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{
+			{int64(7), `{"name":"alice","role":"admin"}`, "2026-01-01T00:00:00Z"},
+		})
+
+	result, err := DocFindOneAndUpdate(ctx, db, "users",
+		map[string]string{"name": "alice"},
+		map[string]string{"role": "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "WITH target AS")
+	assertContains(t, last.query, "SELECT id FROM users")
+	assertContains(t, last.query, "LIMIT 1")
+	assertContains(t, last.query, "UPDATE users SET data = data ||")
+	assertContains(t, last.query, "RETURNING users.id, users.data, users.created_at")
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result["_id"] != int64(7) {
+		t.Fatalf("expected _id=7, got %v", result["_id"])
+	}
+	if result["role"] != "admin" {
+		t.Fatalf("expected role=admin, got %v", result["role"])
+	}
+}
+
+func TestDocFindOneAndUpdate_NotFound(t *testing.T) {
+	db, _ := newTestDB(t,
+		[]string{"id", "data", "created_at"}, nil)
+
+	result, err := DocFindOneAndUpdate(ctx, db, "users",
+		map[string]string{"name": "nobody"},
+		map[string]string{"x": "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil for no match, got %v", result)
+	}
+}
+
+func TestDocFindOneAndUpdate_InvalidCollection(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+	_, err := DocFindOneAndUpdate(ctx, db, "bad!!", nil, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid collection")
+	}
+}
+
+// --- DocFindOneAndDelete ---
+
+func TestDocFindOneAndDelete_SQLAndReturn(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{
+			{int64(3), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
+		})
+
+	result, err := DocFindOneAndDelete(ctx, db, "users",
+		map[string]string{"name": "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "WITH target AS")
+	assertContains(t, last.query, "DELETE FROM users USING target")
+	assertContains(t, last.query, "RETURNING users.id, users.data, users.created_at")
+
+	if result == nil || result["name"] != "alice" {
+		t.Fatalf("expected alice, got %v", result)
+	}
+}
+
+func TestDocFindOneAndDelete_NotFound(t *testing.T) {
+	db, _ := newTestDB(t, []string{"id", "data", "created_at"}, nil)
+
+	result, err := DocFindOneAndDelete(ctx, db, "users",
+		map[string]string{"name": "nobody"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil, got %v", result)
+	}
+}
+
+// --- DocDistinct ---
+
+func TestDocDistinct_NoFilter(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"role"},
+		[][]driver.Value{
+			{"admin"}, {"user"}, {"guest"},
+		})
+
+	results, err := DocDistinct(ctx, db, "users", "role", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT DISTINCT data->>'role' FROM users")
+	assertContains(t, last.query, "WHERE data->>'role' IS NOT NULL")
+
+	if len(results) != 3 {
+		t.Fatalf("expected 3 values, got %d: %v", len(results), results)
+	}
+}
+
+func TestDocDistinct_WithFilter(t *testing.T) {
+	db, drv := newTestDB(t, []string{"role"}, nil)
+
+	_, err := DocDistinct(ctx, db, "users", "role",
+		map[string]string{"active": "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "IS NOT NULL AND data @> $1::jsonb")
+}
+
+func TestDocDistinct_InvalidField(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+	_, err := DocDistinct(ctx, db, "users", "bad name!", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid field")
+	}
+}
+
+// --- DocFindCursor ---
+
+func TestDocFindCursor_YieldsAll(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{
+			{int64(1), `{"n":1}`, "2026-01-01T00:00:00Z"},
+			{int64(2), `{"n":2}`, "2026-01-01T00:00:00Z"},
+			{int64(3), `{"n":3}`, "2026-01-01T00:00:00Z"},
+		})
+
+	var collected []map[string]interface{}
+	err := DocFindCursor(ctx, db, "items", nil,
+		func(doc map[string]interface{}) (bool, error) {
+			collected = append(collected, doc)
+			return true, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "SELECT id, data, created_at FROM items")
+	assertContains(t, last.query, "ORDER BY id")
+	assertNotContains(t, last.query, "LIMIT")
+
+	if len(collected) != 3 {
+		t.Fatalf("expected 3 docs, got %d", len(collected))
+	}
+	if collected[0]["_id"] != int64(1) {
+		t.Fatalf("expected first _id=1, got %v", collected[0]["_id"])
+	}
+}
+
+func TestDocFindCursor_EarlyStop(t *testing.T) {
+	db, _ := newTestDB(t,
+		[]string{"id", "data", "created_at"},
+		[][]driver.Value{
+			{int64(1), `{}`, "2026-01-01T00:00:00Z"},
+			{int64(2), `{}`, "2026-01-01T00:00:00Z"},
+			{int64(3), `{}`, "2026-01-01T00:00:00Z"},
+		})
+
+	count := 0
+	err := DocFindCursor(ctx, db, "items", nil,
+		func(doc map[string]interface{}) (bool, error) {
+			count++
+			return count < 2, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected callback to stop after 2 calls, got %d", count)
+	}
+}
+
+func TestDocFindCursor_NilCallback(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+	err := DocFindCursor(ctx, db, "items", nil, nil)
+	if err == nil {
+		t.Fatal("expected error for nil callback")
+	}
+}
+
+func TestDocFindCursor_InvalidCollection(t *testing.T) {
+	db, _ := newTestDB(t, nil, nil)
+	err := DocFindCursor(ctx, db, "1bad", nil,
+		func(doc map[string]interface{}) (bool, error) { return true, nil })
+	if err == nil {
+		t.Fatal("expected error for invalid collection")
+	}
+}

@@ -12,6 +12,18 @@ import (
 
 // --- Document store ---
 
+// DocCreateCollection explicitly creates a collection table. Pass unlogged=true
+// for an UNLOGGED table (higher throughput, not crash-safe). Collections are
+// auto-created on first insert, so this is only needed to preset unlogged or
+// to materialize the table without inserting.
+func (gl *GoldLapel) DocCreateCollection(ctx context.Context, collection string, unlogged bool, opts ...Option) error {
+	q, err := gl.resolveExec(opts)
+	if err != nil {
+		return err
+	}
+	return DocCreateCollection(ctx, q, collection, unlogged)
+}
+
 func (gl *GoldLapel) DocInsert(ctx context.Context, collection string, document interface{}, opts ...Option) (map[string]interface{}, error) {
 	q, err := gl.resolveExec(opts)
 	if err != nil {
@@ -84,6 +96,47 @@ func (gl *GoldLapel) DocCount(ctx context.Context, collection string, filter int
 		return 0, err
 	}
 	return DocCount(ctx, q, collection, filter)
+}
+
+// DocFindOneAndUpdate atomically finds a single document matching filter,
+// merges update into data, and returns the updated document (nil if no match).
+func (gl *GoldLapel) DocFindOneAndUpdate(ctx context.Context, collection string, filter, update interface{}, opts ...Option) (map[string]interface{}, error) {
+	q, err := gl.resolveExec(opts)
+	if err != nil {
+		return nil, err
+	}
+	return DocFindOneAndUpdate(ctx, q, collection, filter, update)
+}
+
+// DocFindOneAndDelete atomically finds a single document matching filter,
+// deletes it, and returns the deleted document (nil if no match).
+func (gl *GoldLapel) DocFindOneAndDelete(ctx context.Context, collection string, filter interface{}, opts ...Option) (map[string]interface{}, error) {
+	q, err := gl.resolveExec(opts)
+	if err != nil {
+		return nil, err
+	}
+	return DocFindOneAndDelete(ctx, q, collection, filter)
+}
+
+// DocDistinct returns the distinct values of the given JSONB field across
+// documents matching filter.
+func (gl *GoldLapel) DocDistinct(ctx context.Context, collection, field string, filter interface{}, opts ...Option) ([]interface{}, error) {
+	q, err := gl.resolveExec(opts)
+	if err != nil {
+		return nil, err
+	}
+	return DocDistinct(ctx, q, collection, field, filter)
+}
+
+// DocFindCursor streams documents through a callback, fetching in batches.
+// Useful for large result sets. Callback returns (continue, error); returning
+// false halts cleanly.
+func (gl *GoldLapel) DocFindCursor(ctx context.Context, collection string, filter interface{}, callback func(doc map[string]interface{}) (bool, error), opts ...Option) error {
+	q, err := gl.resolveExec(opts)
+	if err != nil {
+		return err
+	}
+	return DocFindCursor(ctx, q, collection, filter, callback, opts...)
 }
 
 func (gl *GoldLapel) DocCreateIndex(ctx context.Context, collection string, keys []string, opts ...Option) error {
