@@ -412,10 +412,15 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 
 // spawn boots the underlying binary and opens the database pool. Called
 // exclusively from Start.
+//
+// No gl.mu lock is held across spawn: the *GoldLapel being constructed is
+// not yet visible to any other goroutine (Start hasn't returned, so no
+// public method has a receiver yet, and registerStartedInstance runs only
+// after spawn returns). Holding the mutex across the 10s port poll + 5s
+// ping would serialise any concurrent accessor for the entire startup
+// window once gl became visible — it was guarding against nothing and
+// penalising every path that sees the instance after Start returns.
 func (gl *GoldLapel) spawn(ctx context.Context) error {
-	gl.mu.Lock()
-	defer gl.mu.Unlock()
-
 	bin, err := FindBinary()
 	if err != nil {
 		return err
