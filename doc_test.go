@@ -16,8 +16,8 @@ var ctx = context.Background()
 
 func TestDocInsert_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
-		[][]driver.Value{{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
+		[]string{"_id", "data", "created_at"},
+		[][]driver.Value{{"11111111-1111-1111-1111-111111111111", `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
 
 	result, err := DocInsert(ctx, db, "users", map[string]interface{}{"name": "alice"})
 	if err != nil {
@@ -28,21 +28,25 @@ func TestDocInsert_SQLGeneration(t *testing.T) {
 	// First capture: CREATE TABLE IF NOT EXISTS
 	assertContains(t, captures[0].query, "CREATE TABLE IF NOT EXISTS users")
 	assertContains(t, captures[0].query, "data JSONB NOT NULL")
-	assertContains(t, captures[0].query, "BIGSERIAL PRIMARY KEY")
+	assertContains(t, captures[0].query, "_id UUID PRIMARY KEY DEFAULT gen_random_uuid()")
 
 	// Second capture: INSERT RETURNING
 	assertContains(t, captures[1].query, "INSERT INTO users")
 	assertContains(t, captures[1].query, "$1::jsonb")
-	assertContains(t, captures[1].query, "RETURNING id, data, created_at")
+	assertContains(t, captures[1].query, "RETURNING _id, data, created_at")
 
-	if result["name"] != "alice" {
-		t.Fatalf("expected name=alice, got %v", result["name"])
+	data, ok := result["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data to be a map, got %T: %v", result["data"], result["data"])
 	}
-	if result["_id"] != int64(1) {
-		t.Fatalf("expected _id=1, got %v", result["_id"])
+	if data["name"] != "alice" {
+		t.Fatalf("expected data.name=alice, got %v", data["name"])
 	}
-	if result["_created_at"] != "2026-01-01T00:00:00Z" {
-		t.Fatalf("expected _created_at, got %v", result["_created_at"])
+	if result["_id"] != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("expected _id=UUID string, got %v", result["_id"])
+	}
+	if result["created_at"] != "2026-01-01T00:00:00Z" {
+		t.Fatalf("expected created_at, got %v", result["created_at"])
 	}
 }
 
@@ -60,10 +64,10 @@ func TestDocInsert_InvalidCollection(t *testing.T) {
 
 func TestDocInsertMany_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
-			{int64(2), `{"name":"bob"}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
+			{"22222222-2222-2222-2222-222222222222", `{"name":"bob"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	docs := []interface{}{
@@ -81,16 +85,16 @@ func TestDocInsertMany_SQLGeneration(t *testing.T) {
 	assertContains(t, insertQ, "INSERT INTO users (data) VALUES")
 	assertContains(t, insertQ, "$1::jsonb")
 	assertContains(t, insertQ, "$2::jsonb")
-	assertContains(t, insertQ, "RETURNING id, data, created_at")
+	assertContains(t, insertQ, "RETURNING _id, data, created_at")
 
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	if results[0]["name"] != "alice" {
-		t.Fatalf("expected name=alice, got %v", results[0]["name"])
+	if results[0]["data"].(map[string]interface{})["name"] != "alice" {
+		t.Fatalf("expected data.name=alice, got %v", results[0]["data"])
 	}
-	if results[1]["name"] != "bob" {
-		t.Fatalf("expected name=bob, got %v", results[1]["name"])
+	if results[1]["data"].(map[string]interface{})["name"] != "bob" {
+		t.Fatalf("expected data.name=bob, got %v", results[1]["data"])
 	}
 }
 
@@ -110,9 +114,9 @@ func TestDocInsertMany_Empty(t *testing.T) {
 
 func TestDocFind_NoFilter(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	results, err := DocFind(ctx, db, "users", nil)
@@ -121,9 +125,11 @@ func TestDocFind_NoFilter(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
-	assertContains(t, last.query, "SELECT id, data, created_at FROM users")
+	assertContains(t, last.query, "SELECT _id, data, created_at FROM users")
 	assertNotContains(t, last.query, "WHERE")
-	assertContains(t, last.query, "ORDER BY id")
+	// No default ORDER BY — matches the 6-wrapper consensus (Python, JS, Ruby,
+	// Java, PHP, .NET). UUIDs don't sort by insert order, so we don't fake one.
+	assertNotContains(t, last.query, "ORDER BY")
 	assertContains(t, last.query, "LIMIT $1")
 
 	if len(results) != 1 {
@@ -133,9 +139,9 @@ func TestDocFind_NoFilter(t *testing.T) {
 
 func TestDocFind_WithFilter(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"role":"admin"}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"role":"admin"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	_, err := DocFind(ctx, db, "users", map[string]string{"role": "admin"})
@@ -150,7 +156,7 @@ func TestDocFind_WithFilter(t *testing.T) {
 
 func TestDocFind_EmptyFilter(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]string{})
@@ -165,7 +171,7 @@ func TestDocFind_EmptyFilter(t *testing.T) {
 
 func TestDocFind_WithSort(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", nil, DocSort(map[string]int{"name": 1, "age": -1}))
@@ -180,7 +186,7 @@ func TestDocFind_WithSort(t *testing.T) {
 
 func TestDocFind_WithLimitAndSkip(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", nil, DocLimit(10), DocSkip(20))
@@ -213,9 +219,9 @@ func TestDocFind_InvalidCollection(t *testing.T) {
 
 func TestDocFindOne_WithFilter(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	result, err := DocFindOne(ctx, db, "users", map[string]string{"name": "alice"})
@@ -226,15 +232,16 @@ func TestDocFindOne_WithFilter(t *testing.T) {
 	last := drv.lastCapture()
 	assertContains(t, last.query, "WHERE data @> $1::jsonb")
 	assertContains(t, last.query, "LIMIT 1")
+	assertNotContains(t, last.query, "ORDER BY")
 
-	if result["name"] != "alice" {
-		t.Fatalf("expected name=alice, got %v", result["name"])
+	if result["data"].(map[string]interface{})["name"] != "alice" {
+		t.Fatalf("expected data.name=alice, got %v", result["data"])
 	}
 }
 
 func TestDocFindOne_NotFound(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	result, err := DocFindOne(ctx, db, "users", map[string]string{"name": "nobody"})
@@ -526,7 +533,7 @@ func TestBuildSortClause_InvalidKey(t *testing.T) {
 
 func TestDocFind_InvalidSortKey(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", nil, DocSort(map[string]int{"bad;key": 1}))
@@ -642,9 +649,9 @@ func TestDocAggregate_NullID(t *testing.T) {
 
 func TestDocAggregate_MatchOnly(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"status":"active","name":"alice"}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"status":"active","name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	pipeline := []map[string]interface{}{
@@ -657,21 +664,25 @@ func TestDocAggregate_MatchOnly(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
-	assertContains(t, last.query, "SELECT id AS _id, data, created_at FROM users")
+	assertContains(t, last.query, "SELECT _id, data, created_at FROM users")
 	assertContains(t, last.query, "WHERE data @> $1::jsonb")
 	assertNotContains(t, last.query, "GROUP BY")
 
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
-	if results[0]["name"] != "alice" {
-		t.Fatalf("expected name=alice, got %v", results[0]["name"])
+	data, ok := results[0]["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data to be a map, got %T: %v", results[0]["data"], results[0]["data"])
+	}
+	if data["name"] != "alice" {
+		t.Fatalf("expected data.name=alice, got %v", data["name"])
 	}
 }
 
 func TestDocAggregate_SortWithoutGroup(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	pipeline := []map[string]interface{}{
@@ -769,7 +780,7 @@ func TestDocAggregate_MultipleKeysInStage(t *testing.T) {
 
 func TestBuildFilter_GtNumeric(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -786,7 +797,7 @@ func TestBuildFilter_GtNumeric(t *testing.T) {
 
 func TestBuildFilter_GteLteRange(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -806,7 +817,7 @@ func TestBuildFilter_GteLteRange(t *testing.T) {
 
 func TestBuildFilter_LtString(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -823,7 +834,7 @@ func TestBuildFilter_LtString(t *testing.T) {
 
 func TestBuildFilter_EqAndNe(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -841,7 +852,7 @@ func TestBuildFilter_EqAndNe(t *testing.T) {
 
 func TestBuildFilter_In(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -859,7 +870,7 @@ func TestBuildFilter_In(t *testing.T) {
 
 func TestBuildFilter_Nin(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -877,7 +888,7 @@ func TestBuildFilter_Nin(t *testing.T) {
 
 func TestBuildFilter_Exists(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -893,7 +904,7 @@ func TestBuildFilter_Exists(t *testing.T) {
 
 func TestBuildFilter_NotExists(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -909,7 +920,7 @@ func TestBuildFilter_NotExists(t *testing.T) {
 
 func TestBuildFilter_Regex(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -925,7 +936,7 @@ func TestBuildFilter_Regex(t *testing.T) {
 
 func TestBuildFilter_DotNotation(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -941,7 +952,7 @@ func TestBuildFilter_DotNotation(t *testing.T) {
 
 func TestBuildFilter_MixedContainmentAndOperators(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -960,7 +971,7 @@ func TestBuildFilter_MixedContainmentAndOperators(t *testing.T) {
 
 func TestBuildFilter_InvalidDotKey(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -1037,7 +1048,7 @@ func TestExpandDotKeys_EmptyMap(t *testing.T) {
 
 func TestBuildFilter_DotNotationContainment(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -1069,7 +1080,7 @@ func TestBuildFilter_DotNotationContainment(t *testing.T) {
 
 func TestBuildFilter_DotNotationContainmentDeep(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -1104,7 +1115,7 @@ func TestBuildFilter_DotNotationContainmentDeep(t *testing.T) {
 
 func TestBuildFilter_UnsupportedOperator(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	_, err := DocFind(ctx, db, "users", map[string]interface{}{
@@ -1390,7 +1401,7 @@ func TestDocAggregate_ProjectIncludeFields(t *testing.T) {
 	db, drv := newTestDB(t,
 		[]string{"_id", "name", "email"},
 		[][]driver.Value{
-			{int64(1), "alice", "alice@example.com"},
+			{"11111111-1111-1111-1111-111111111111", "alice", "alice@example.com"},
 		})
 
 	pipeline := []map[string]interface{}{
@@ -1406,9 +1417,9 @@ func TestDocAggregate_ProjectIncludeFields(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
-	assertContains(t, last.query, "id AS _id")
-	assertContains(t, last.query, "data->>'email' AS email")
-	assertContains(t, last.query, "data->>'name' AS name")
+	// _id is projected by its own name (not aliased from `id`) since the
+	// schema column IS _id.
+	assertContains(t, last.query, "SELECT _id, data->>'email' AS email, data->>'name' AS name")
 	assertContains(t, last.query, "FROM users")
 
 	if len(results) != 1 {
@@ -1436,7 +1447,10 @@ func TestDocAggregate_ProjectExcludeID(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
+	// _id excluded via $project: {_id: 0} — neither `id AS _id` nor a bare `_id`
+	// selector should appear.
 	assertNotContains(t, last.query, "id AS _id")
+	assertNotContains(t, last.query, "SELECT _id,")
 	assertContains(t, last.query, "data->>'name' AS name")
 }
 
@@ -1444,7 +1458,7 @@ func TestDocAggregate_ProjectRename(t *testing.T) {
 	db, drv := newTestDB(t,
 		[]string{"_id", "full_name"},
 		[][]driver.Value{
-			{int64(1), "alice"},
+			{"11111111-1111-1111-1111-111111111111", "alice"},
 		})
 
 	pipeline := []map[string]interface{}{
@@ -1460,7 +1474,8 @@ func TestDocAggregate_ProjectRename(t *testing.T) {
 
 	last := drv.lastCapture()
 	assertContains(t, last.query, "data->>'name' AS full_name")
-	assertContains(t, last.query, "id AS _id")
+	// _id is selected by its schema column name (no alias needed).
+	assertContains(t, last.query, "SELECT _id, data->>'name' AS full_name")
 }
 
 func TestDocAggregate_ProjectWithMatch(t *testing.T) {
@@ -1485,7 +1500,10 @@ func TestDocAggregate_ProjectWithMatch(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
+	// _id excluded — neither the legacy `id AS _id` alias nor a bare `_id`
+	// selector should appear in the SELECT list.
 	assertNotContains(t, last.query, "id AS _id")
+	assertNotContains(t, last.query, "SELECT _id,")
 	assertContains(t, last.query, "data->>'email' AS email")
 	assertContains(t, last.query, "data->>'name' AS name")
 	assertContains(t, last.query, "WHERE data @> $1::jsonb")
@@ -1511,7 +1529,7 @@ func TestDocAggregate_ProjectInvalidField(t *testing.T) {
 
 func TestDocAggregate_UnwindString(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	pipeline := []map[string]interface{}{
@@ -1530,7 +1548,7 @@ func TestDocAggregate_UnwindString(t *testing.T) {
 
 func TestDocAggregate_UnwindMap(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	pipeline := []map[string]interface{}{
@@ -1615,7 +1633,7 @@ func TestDocAggregate_Lookup(t *testing.T) {
 	db, drv := newTestDB(t,
 		[]string{"inventory_docs", "_id", "data", "created_at"},
 		[][]driver.Value{
-			{`[{"sku":"abc","qty":10}]`, int64(1), `{"item":"widget","sku":"abc"}`, "2026-01-01T00:00:00Z"},
+			{`[{"sku":"abc","qty":10}]`, "11111111-1111-1111-1111-111111111111", `{"item":"widget","sku":"abc"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	pipeline := []map[string]interface{}{
@@ -1634,7 +1652,8 @@ func TestDocAggregate_Lookup(t *testing.T) {
 
 	last := drv.lastCapture()
 	assertContains(t, last.query, "SELECT (SELECT COALESCE(json_agg(inventory.data), '[]'::json) FROM inventory WHERE inventory.data->>'sku' = data->>'sku') AS inventory_docs")
-	assertContains(t, last.query, "id AS _id")
+	// _id now a direct column reference, not aliased from a legacy `id` column.
+	assertContains(t, last.query, "_id, data, created_at")
 	assertContains(t, last.query, "FROM orders")
 
 	if len(results) != 1 {
@@ -1875,7 +1894,10 @@ func TestDocCreateCapped_TriggerDDL(t *testing.T) {
 		if strings.Contains(c.query, "CREATE OR REPLACE FUNCTION logs_cap_enforce") {
 			funcFound = true
 			assertContains(t, c.query, "DELETE FROM logs")
-			assertContains(t, c.query, "ORDER BY id DESC LIMIT 1000")
+			// UUIDs don't sort by insert order, so we keep the N most recent
+			// rows by created_at (tie-broken on _id for determinism).
+			assertContains(t, c.query, "ORDER BY created_at DESC, _id DESC LIMIT 1000")
+			assertNotContains(t, c.query, "ORDER BY id ")
 		}
 	}
 	if !funcFound {
@@ -1949,9 +1971,12 @@ func TestDocCreateCollection_Logged(t *testing.T) {
 	last := drv.lastCapture()
 	assertContains(t, last.query, "CREATE TABLE IF NOT EXISTS users")
 	assertNotContains(t, last.query, "UNLOGGED")
-	assertContains(t, last.query, "BIGSERIAL PRIMARY KEY")
+	// v0.2 schema matches the 6-wrapper consensus (Python, JS, Ruby, Java,
+	// PHP, .NET): _id UUID primary key, data JSONB, created_at TIMESTAMPTZ.
+	assertContains(t, last.query, "_id UUID PRIMARY KEY DEFAULT gen_random_uuid()")
 	assertContains(t, last.query, "data JSONB NOT NULL")
 	assertContains(t, last.query, "created_at TIMESTAMPTZ")
+	assertNotContains(t, last.query, "BIGSERIAL")
 }
 
 func TestDocCreateCollection_Unlogged(t *testing.T) {
@@ -1976,9 +2001,9 @@ func TestDocCreateCollection_InvalidIdentifier(t *testing.T) {
 
 func TestDocFindOneAndUpdate_SQLAndReturn(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(7), `{"name":"alice","role":"admin"}`, "2026-01-01T00:00:00Z"},
+			{"77777777-7777-7777-7777-777777777777", `{"name":"alice","role":"admin"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	result, err := DocFindOneAndUpdate(ctx, db, "users",
@@ -1990,25 +2015,30 @@ func TestDocFindOneAndUpdate_SQLAndReturn(t *testing.T) {
 
 	last := drv.lastCapture()
 	assertContains(t, last.query, "WITH target AS")
-	assertContains(t, last.query, "SELECT id FROM users")
+	assertContains(t, last.query, "SELECT _id FROM users")
 	assertContains(t, last.query, "LIMIT 1")
+	assertNotContains(t, last.query, "ORDER BY")
 	assertContains(t, last.query, "UPDATE users SET data = data ||")
-	assertContains(t, last.query, "RETURNING users.id, users.data, users.created_at")
+	assertContains(t, last.query, "RETURNING users._id, users.data, users.created_at")
 
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
-	if result["_id"] != int64(7) {
-		t.Fatalf("expected _id=7, got %v", result["_id"])
+	if result["_id"] != "77777777-7777-7777-7777-777777777777" {
+		t.Fatalf("expected _id UUID string, got %v", result["_id"])
 	}
-	if result["role"] != "admin" {
-		t.Fatalf("expected role=admin, got %v", result["role"])
+	data, ok := result["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data to be a map, got %T: %v", result["data"], result["data"])
+	}
+	if data["role"] != "admin" {
+		t.Fatalf("expected data.role=admin, got %v", data["role"])
 	}
 }
 
 func TestDocFindOneAndUpdate_NotFound(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"}, nil)
+		[]string{"_id", "data", "created_at"}, nil)
 
 	result, err := DocFindOneAndUpdate(ctx, db, "users",
 		map[string]string{"name": "nobody"},
@@ -2033,9 +2063,9 @@ func TestDocFindOneAndUpdate_InvalidCollection(t *testing.T) {
 
 func TestDocFindOneAndDelete_SQLAndReturn(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(3), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
+			{"33333333-3333-3333-3333-333333333333", `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
 	result, err := DocFindOneAndDelete(ctx, db, "users",
@@ -2046,16 +2076,24 @@ func TestDocFindOneAndDelete_SQLAndReturn(t *testing.T) {
 
 	last := drv.lastCapture()
 	assertContains(t, last.query, "WITH target AS")
+	assertContains(t, last.query, "SELECT _id FROM users")
 	assertContains(t, last.query, "DELETE FROM users USING target")
-	assertContains(t, last.query, "RETURNING users.id, users.data, users.created_at")
+	assertContains(t, last.query, "RETURNING users._id, users.data, users.created_at")
 
-	if result == nil || result["name"] != "alice" {
-		t.Fatalf("expected alice, got %v", result)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	data, ok := result["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data map, got %T: %v", result["data"], result["data"])
+	}
+	if data["name"] != "alice" {
+		t.Fatalf("expected data.name=alice, got %v", data["name"])
 	}
 }
 
 func TestDocFindOneAndDelete_NotFound(t *testing.T) {
-	db, _ := newTestDB(t, []string{"id", "data", "created_at"}, nil)
+	db, _ := newTestDB(t, []string{"_id", "data", "created_at"}, nil)
 
 	result, err := DocFindOneAndDelete(ctx, db, "users",
 		map[string]string{"name": "nobody"})
@@ -2115,11 +2153,11 @@ func TestDocDistinct_InvalidField(t *testing.T) {
 
 func TestDocFindCursor_YieldsAll(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{"n":1}`, "2026-01-01T00:00:00Z"},
-			{int64(2), `{"n":2}`, "2026-01-01T00:00:00Z"},
-			{int64(3), `{"n":3}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{"n":1}`, "2026-01-01T00:00:00Z"},
+			{"22222222-2222-2222-2222-222222222222", `{"n":2}`, "2026-01-01T00:00:00Z"},
+			{"33333333-3333-3333-3333-333333333333", `{"n":3}`, "2026-01-01T00:00:00Z"},
 		})
 
 	var collected []map[string]interface{}
@@ -2133,25 +2171,27 @@ func TestDocFindCursor_YieldsAll(t *testing.T) {
 	}
 
 	last := drv.lastCapture()
-	assertContains(t, last.query, "SELECT id, data, created_at FROM items")
-	assertContains(t, last.query, "ORDER BY id")
+	assertContains(t, last.query, "SELECT _id, data, created_at FROM items")
+	// No default ORDER BY — UUIDs don't sort meaningfully, and matching the
+	// 6-wrapper consensus. Callers wanting order pass DocSort.
+	assertNotContains(t, last.query, "ORDER BY")
 	assertNotContains(t, last.query, "LIMIT")
 
 	if len(collected) != 3 {
 		t.Fatalf("expected 3 docs, got %d", len(collected))
 	}
-	if collected[0]["_id"] != int64(1) {
-		t.Fatalf("expected first _id=1, got %v", collected[0]["_id"])
+	if collected[0]["_id"] != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("expected first _id UUID, got %v", collected[0]["_id"])
 	}
 }
 
 func TestDocFindCursor_EarlyStop(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		[][]driver.Value{
-			{int64(1), `{}`, "2026-01-01T00:00:00Z"},
-			{int64(2), `{}`, "2026-01-01T00:00:00Z"},
-			{int64(3), `{}`, "2026-01-01T00:00:00Z"},
+			{"11111111-1111-1111-1111-111111111111", `{}`, "2026-01-01T00:00:00Z"},
+			{"22222222-2222-2222-2222-222222222222", `{}`, "2026-01-01T00:00:00Z"},
+			{"33333333-3333-3333-3333-333333333333", `{}`, "2026-01-01T00:00:00Z"},
 		})
 
 	count := 0

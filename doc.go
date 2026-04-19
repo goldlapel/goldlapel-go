@@ -33,7 +33,9 @@ func DocSkip(n int) Option {
 }
 
 // ensureCollection creates the document store table if it doesn't exist.
-// Schema: id BIGSERIAL PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ.
+// Schema matches the 6-wrapper consensus (Python, JS, Ruby, Java, PHP, .NET):
+// _id UUID PRIMARY KEY DEFAULT gen_random_uuid(), data JSONB NOT NULL,
+// created_at TIMESTAMPTZ DEFAULT NOW().
 func ensureCollection(ctx context.Context, q execQuerier, collection string) error {
 	return ensureCollectionOpts(ctx, q, collection, false)
 }
@@ -48,9 +50,9 @@ func ensureCollectionOpts(ctx context.Context, q execQuerier, collection string,
 	}
 	_, err := q.ExecContext(ctx,
 		prefix+" IF NOT EXISTS "+collection+" ("+
-			"id BIGSERIAL PRIMARY KEY, "+
+			"_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "+
 			"data JSONB NOT NULL, "+
-			"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+			"created_at TIMESTAMPTZ DEFAULT NOW())")
 	if err != nil {
 		return fmt.Errorf("create collection %s: %w", collection, err)
 	}
@@ -69,8 +71,10 @@ func DocCreateCollection(ctx context.Context, q execQuerier, collection string, 
 }
 
 // DocInsert inserts a single document into a collection. Like MongoDB's insertOne().
-// Creates the collection table if it doesn't exist. Returns the inserted document
-// with _id and _created_at fields added.
+// Creates the collection table if it doesn't exist. Returns a map with three
+// keys — "_id" (UUID string), "data" (the document), and "created_at"
+// (RFC 3339 string) — matching the cross-wrapper shape so a collection written
+// by any wrapper round-trips through any other.
 func DocInsert(ctx context.Context, q execQuerier, collection string, document interface{}) (map[string]interface{}, error) {
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
@@ -81,23 +85,25 @@ func DocInsert(ctx context.Context, q execQuerier, collection string, document i
 		return nil, fmt.Errorf("marshal document: %w", err)
 	}
 
-	var id int64
+	var id string
 	var createdAt string
 	var rawData string
 	err = q.QueryRowContext(ctx,
-		"INSERT INTO "+collection+" (data) VALUES ($1::jsonb) RETURNING id, data, created_at",
+		"INSERT INTO "+collection+" (data) VALUES ($1::jsonb) RETURNING _id, data, created_at",
 		string(data)).Scan(&id, &rawData, &createdAt)
 	if err != nil {
 		return nil, err
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(rawData), &result); err != nil {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(rawData), &parsed); err != nil {
 		return nil, fmt.Errorf("unmarshal result: %w", err)
 	}
-	result["_id"] = id
-	result["_created_at"] = createdAt
-	return result, nil
+	return map[string]interface{}{
+		"_id":        id,
+		"data":       parsed,
+		"created_at": createdAt,
+	}, nil
 }
 
 // DocInsertMany inserts multiple documents into a collection. Like MongoDB's insertMany().
@@ -123,7 +129,7 @@ func DocInsertMany(ctx context.Context, q execQuerier, collection string, docume
 
 	query := "INSERT INTO " + collection + " (data) VALUES " +
 		strings.Join(placeholders, ", ") +
-		" RETURNING id, data, created_at"
+		" RETURNING _id, data, created_at"
 
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -131,23 +137,7 @@ func DocInsertMany(ctx context.Context, q execQuerier, collection string, docume
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
-	for rows.Next() {
-		var id int64
-		var rawData string
-		var createdAt string
-		if err := rows.Scan(&id, &rawData, &createdAt); err != nil {
-			return nil, err
-		}
-		var doc map[string]interface{}
-		if err := json.Unmarshal([]byte(rawData), &doc); err != nil {
-			return nil, fmt.Errorf("unmarshal result: %w", err)
-		}
-		doc["_id"] = id
-		doc["_created_at"] = createdAt
-		results = append(results, doc)
-	}
-	return results, rows.Err()
+	return scanDocRows(rows)
 }
 
 // DocFind queries documents from a collection. Like MongoDB's find().
@@ -161,7 +151,7 @@ func DocFind(ctx context.Context, q execQuerier, collection string, filter inter
 		opt.applyDoc(o)
 	}
 
-	query := "SELECT id, data, created_at FROM " + collection
+	query := "SELECT _id, data, created_at FROM " + collection
 	paramIdx := 1
 	var args []interface{}
 
@@ -181,8 +171,6 @@ func DocFind(ctx context.Context, q execQuerier, collection string, filter inter
 			return nil, err
 		}
 		query += " ORDER BY " + strings.Join(orderParts, ", ")
-	} else {
-		query += " ORDER BY id"
 	}
 
 	query += fmt.Sprintf(" LIMIT $%d", paramIdx)
@@ -209,7 +197,7 @@ func DocFindOne(ctx context.Context, q execQuerier, collection string, filter in
 		return nil, err
 	}
 
-	query := "SELECT id, data, created_at FROM " + collection
+	query := "SELECT _id, data, created_at FROM " + collection
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -221,7 +209,7 @@ func DocFindOne(ctx context.Context, q execQuerier, collection string, filter in
 		args = append(args, filterParams...)
 	}
 
-	query += " ORDER BY id LIMIT 1"
+	query += " LIMIT 1"
 
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -292,9 +280,9 @@ func DocUpdateOne(ctx context.Context, q execQuerier, collection string, filter,
 	}
 
 	query := "WITH target AS (" +
-		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
+		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
 		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
-		"FROM target WHERE " + collection + ".id = target.id"
+		"FROM target WHERE " + collection + "._id = target._id"
 
 	args := append(filterParams, string(updateJSON))
 	result, err := q.ExecContext(ctx, query, args...)
@@ -346,8 +334,8 @@ func DocDeleteOne(ctx context.Context, q execQuerier, collection string, filter 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
-		") DELETE FROM " + collection + " USING target WHERE " + collection + ".id = target.id"
+		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
+		") DELETE FROM " + collection + " USING target WHERE " + collection + "._id = target._id"
 	result, err := q.ExecContext(ctx, query, filterParams...)
 	if err != nil {
 		return 0, err
@@ -380,10 +368,10 @@ func DocFindOneAndUpdate(ctx context.Context, q execQuerier, collection string, 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
+		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
 		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
-		"FROM target WHERE " + collection + ".id = target.id " +
-		"RETURNING " + collection + ".id, " + collection + ".data, " + collection + ".created_at"
+		"FROM target WHERE " + collection + "._id = target._id " +
+		"RETURNING " + collection + "._id, " + collection + ".data, " + collection + ".created_at"
 
 	args := append(append([]interface{}{}, filterParams...), string(updateJSON))
 	rows, err := q.QueryContext(ctx, query, args...)
@@ -421,9 +409,9 @@ func DocFindOneAndDelete(ctx context.Context, q execQuerier, collection string, 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
-		") DELETE FROM " + collection + " USING target WHERE " + collection + ".id = target.id " +
-		"RETURNING " + collection + ".id, " + collection + ".data, " + collection + ".created_at"
+		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
+		") DELETE FROM " + collection + " USING target WHERE " + collection + "._id = target._id " +
+		"RETURNING " + collection + "._id, " + collection + ".data, " + collection + ".created_at"
 
 	rows, err := q.QueryContext(ctx, query, filterParams...)
 	if err != nil {
@@ -508,7 +496,7 @@ func DocFindCursor(ctx context.Context, q execQuerier, collection string, filter
 		opt.applyDoc(o)
 	}
 
-	query := "SELECT id, data, created_at FROM " + collection
+	query := "SELECT _id, data, created_at FROM " + collection
 	paramIdx := 1
 	var args []interface{}
 
@@ -528,8 +516,6 @@ func DocFindCursor(ctx context.Context, q execQuerier, collection string, filter
 			return err
 		}
 		query += " ORDER BY " + strings.Join(orderParts, ", ")
-	} else {
-		query += " ORDER BY id"
 	}
 
 	if o.limit > 0 {
@@ -550,18 +536,10 @@ func DocFindCursor(ctx context.Context, q execQuerier, collection string, filter
 	defer rows.Close()
 
 	for rows.Next() {
-		var id int64
-		var rawData string
-		var createdAt string
-		if err := rows.Scan(&id, &rawData, &createdAt); err != nil {
+		doc, err := scanDocRow(rows)
+		if err != nil {
 			return err
 		}
-		var doc map[string]interface{}
-		if err := json.Unmarshal([]byte(rawData), &doc); err != nil {
-			return fmt.Errorf("unmarshal document: %w", err)
-		}
-		doc["_id"] = id
-		doc["_created_at"] = createdAt
 		cont, cbErr := callback(doc)
 		if cbErr != nil {
 			return cbErr
@@ -634,23 +612,38 @@ func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys 
 	return err
 }
 
-// scanDocRows reads document rows (id, data, created_at) and returns them
-// as maps with _id and _created_at merged into the JSONB data.
+// scanDocRow reads a single (_id, data, created_at) row into the cross-wrapper
+// document shape: {"_id": uuid-string, "data": parsed-json, "created_at": ts}.
+// Assumes rows.Next() has already been called.
+func scanDocRow(rows *sql.Rows) (map[string]interface{}, error) {
+	var id string
+	var rawData string
+	var createdAt string
+	if err := rows.Scan(&id, &rawData, &createdAt); err != nil {
+		return nil, err
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(rawData), &parsed); err != nil {
+		return nil, fmt.Errorf("unmarshal document: %w", err)
+	}
+	return map[string]interface{}{
+		"_id":        id,
+		"data":       parsed,
+		"created_at": createdAt,
+	}, nil
+}
+
+// scanDocRows reads document rows (_id, data, created_at) and returns them
+// as maps with the three top-level keys _id, data, created_at — matching the
+// Python/JS/Ruby/Java/PHP/.NET wrapper return shape so a collection written
+// by any wrapper round-trips through any other.
 func scanDocRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 	var results []map[string]interface{}
 	for rows.Next() {
-		var id int64
-		var rawData string
-		var createdAt string
-		if err := rows.Scan(&id, &rawData, &createdAt); err != nil {
+		doc, err := scanDocRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		var doc map[string]interface{}
-		if err := json.Unmarshal([]byte(rawData), &doc); err != nil {
-			return nil, fmt.Errorf("unmarshal document: %w", err)
-		}
-		doc["_id"] = id
-		doc["_created_at"] = createdAt
 		results = append(results, doc)
 	}
 	return results, rows.Err()
@@ -812,7 +805,7 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 			}
 		}
 		if !excludeID {
-			selectParts = append([]string{"id AS _id"}, selectParts...)
+			selectParts = append([]string{"_id"}, selectParts...)
 		}
 	} else if hasGroup {
 		idVal, hasID := groupStage["_id"]
@@ -885,7 +878,7 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 			selectParts = append(selectParts, fmt.Sprintf("%s AS %s", expr, accName))
 		}
 	} else {
-		selectParts = append(selectParts, "id AS _id", "data", "created_at")
+		selectParts = append(selectParts, "_id", "data", "created_at")
 	}
 
 	query := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
@@ -1460,10 +1453,12 @@ func DocCreateCapped(ctx context.Context, q execQuerier, collection string, maxD
 	funcName := collection + "_cap_enforce"
 	triggerName := collection + "_cap_trigger"
 
+	// UUIDs don't sort by insert order, so keep the N most recent rows using
+	// created_at. Ties on created_at fall back to _id for determinism.
 	createFunc := fmt.Sprintf(
 		"CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $$ "+
 			"BEGIN "+
-			"DELETE FROM %s WHERE id NOT IN (SELECT id FROM %s ORDER BY id DESC LIMIT %d); "+
+			"DELETE FROM %s WHERE _id NOT IN (SELECT _id FROM %s ORDER BY created_at DESC, _id DESC LIMIT %d); "+
 			"RETURN NULL; "+
 			"END; "+
 			"$$ LANGUAGE plpgsql",

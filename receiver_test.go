@@ -347,8 +347,8 @@ func TestWithTx_OverridesPool(t *testing.T) {
 	// fired while a transaction was open on its conn — so we can assert
 	// the happy-path routing, not just "a query happened".
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
-		[][]driver.Value{{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
+		[]string{"_id", "data", "created_at"},
+		[][]driver.Value{{"11111111-1111-1111-1111-111111111111", `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -390,8 +390,8 @@ func TestWithTx_OverridesPool(t *testing.T) {
 // leaks tx state across calls.
 func TestWithTx_NoOverrideRoutesThroughPool(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
-		[][]driver.Value{{int64(1), `{"name":"bob"}`, "2026-01-01T00:00:00Z"}})
+		[]string{"_id", "data", "created_at"},
+		[][]driver.Value{{"11111111-1111-1111-1111-111111111111", `{"name":"bob"}`, "2026-01-01T00:00:00Z"}})
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
@@ -484,8 +484,8 @@ func TestInTx_CommitsOnSuccess(t *testing.T) {
 //     fires.
 func TestWithTx_HappyPathCommit(t *testing.T) {
 	db, drv := newTestDB(t,
-		[]string{"id", "data", "created_at"},
-		[][]driver.Value{{int64(1), `{"x":1}`, "2026-01-01T00:00:00Z"}})
+		[]string{"_id", "data", "created_at"},
+		[][]driver.Value{{"11111111-1111-1111-1111-111111111111", `{"x":1}`, "2026-01-01T00:00:00Z"}})
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
@@ -653,7 +653,7 @@ func TestWithTxOnSearch(t *testing.T) {
 // DocLimit/DocSkip on DocFind, which used to take `...DocFindOption` only.
 func TestWithTxOnDocFind(t *testing.T) {
 	db, _ := newTestDB(t,
-		[]string{"id", "data", "created_at"},
+		[]string{"_id", "data", "created_at"},
 		nil)
 
 	tx, err := db.Begin()

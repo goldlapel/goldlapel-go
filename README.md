@@ -155,6 +155,51 @@ gl, _ := goldlapel.Start(ctx, upstream,
 )
 ```
 
+## Document store
+
+Gold Lapel ships a MongoDB-ish document store layered on Postgres JSONB. Every collection is a table with the schema
+
+```sql
+CREATE TABLE IF NOT EXISTS <collection> (
+    _id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    data JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+)
+```
+
+Operations return `map[string]interface{}` with three top-level keys:
+
+- `_id` — UUID string
+- `data` — the document body as `map[string]interface{}`
+- `created_at` — RFC 3339 timestamp string
+
+```go
+doc, _ := gl.DocInsert(ctx, "users", map[string]interface{}{"name": "alice"})
+// doc == map[string]interface{}{
+//     "_id": "7b2e...-uuid",
+//     "data": map[string]interface{}{"name": "alice"},
+//     "created_at": "2026-04-19T12:34:56.789012+00:00",
+// }
+```
+
+The schema matches the other Gold Lapel wrappers (Python, JavaScript, Ruby, Java, PHP, .NET), so a collection created by one wrapper is readable and writable by any other against the same Postgres.
+
+### Migration from v0.1
+
+v0.1 tables used `id BIGSERIAL` primary keys. v0.2 switched to UUIDs for cross-wrapper interop. One-shot migration per existing doc table:
+
+```sql
+-- Migrate a goldlapel-go v0.1 doc table to the v0.2 schema.
+-- `gen_random_uuid()` is in contrib; ensure `pgcrypto` is installed first:
+--     CREATE EXTENSION IF NOT EXISTS pgcrypto;
+ALTER TABLE <table> ADD COLUMN _id UUID DEFAULT gen_random_uuid();
+UPDATE <table> SET _id = gen_random_uuid() WHERE _id IS NULL;
+ALTER TABLE <table> ALTER COLUMN _id SET NOT NULL;
+ALTER TABLE <table> DROP CONSTRAINT <table>_pkey;
+ALTER TABLE <table> ADD PRIMARY KEY (_id);
+ALTER TABLE <table> DROP COLUMN id;
+```
+
 ## Wrapper methods
 
 Every helper is available both as a package-level function (taking `ctx`, `execQuerier`, and any args) and as a receiver method on `*GoldLapel` (which resolves the target automatically based on `InTx` / `WithTx`):
