@@ -2,10 +2,11 @@ package goldlapel
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -585,7 +586,14 @@ func Script(ctx context.Context, q execQuerier, luaCode string, args ...string) 
 		return nil, err
 	}
 
-	funcName := fmt.Sprintf("_gl_lua_%016x", rand.Int63())[:24]
+	// crypto/rand for SQL identifier collision resistance: 8 bytes hex = 16
+	// chars of entropy, well above the birthday bound for concurrent Script
+	// calls. math/rand would share an unseeded PRNG across goroutines.
+	var nameBytes [8]byte
+	if _, err := rand.Read(nameBytes[:]); err != nil {
+		return nil, fmt.Errorf("generate function name: %w", err)
+	}
+	funcName := "_gl_lua_" + hex.EncodeToString(nameBytes[:])
 
 	var params []string
 	for i := range args {
