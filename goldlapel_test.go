@@ -373,7 +373,13 @@ func buildForTest(upstream string, opts ...Option) *GoldLapel {
 	gl.dashboardPort = gl.port + 1
 	if gl.config != nil {
 		if dp, ok := gl.config["dashboard_port"]; ok {
-			gl.dashboardPort = toInt(dp)
+			// Test helper: panic on malformed config — callers pass valid
+			// values. Real Start() returns an error instead.
+			n, err := toInt(dp)
+			if err != nil {
+				panic(err)
+			}
+			gl.dashboardPort = n
 		}
 	}
 	return gl
@@ -782,6 +788,66 @@ func TestWithConfig_Integration(t *testing.T) {
 	}
 	if gl.config["pool_size"] != 20 {
 		t.Fatalf("expected pool_size=20, got %v", gl.config["pool_size"])
+	}
+}
+
+// --- toInt ---
+
+func TestToInt_ParsesTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want int
+	}{
+		{"int", 42, 42},
+		{"int64", int64(99), 99},
+		{"float64", 3.0, 3},
+		{"string", "123", 123},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := toInt(tc.in)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("toInt(%v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestToInt_ErrorOnUnparseableString(t *testing.T) {
+	if _, err := toInt("abc"); err == nil {
+		t.Fatal("expected error for unparseable string, got nil")
+	}
+}
+
+func TestToInt_ErrorOnUnknownType(t *testing.T) {
+	if _, err := toInt([]int{1, 2, 3}); err == nil {
+		t.Fatal("expected error for unknown type, got nil")
+	}
+}
+
+func TestStart_ErrorsOnBadDashboardPort(t *testing.T) {
+	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
+		WithConfig(map[string]interface{}{"dashboard_port": "abc"}))
+	if err == nil {
+		t.Fatal("expected Start to error on unparseable dashboard_port")
+	}
+	if !strings.Contains(err.Error(), "dashboard_port") {
+		t.Fatalf("expected error to mention dashboard_port, got %q", err.Error())
+	}
+}
+
+func TestStart_ErrorsOnBadInvalidationPort(t *testing.T) {
+	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
+		WithConfig(map[string]interface{}{"invalidation_port": "xyz"}))
+	if err == nil {
+		t.Fatal("expected Start to error on unparseable invalidation_port")
+	}
+	if !strings.Contains(err.Error(), "invalidation_port") {
+		t.Fatalf("expected error to mention invalidation_port, got %q", err.Error())
 	}
 }
 

@@ -388,7 +388,18 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 	gl.dashboardPort = gl.port + 1
 	if gl.config != nil {
 		if dp, ok := gl.config["dashboard_port"]; ok {
-			gl.dashboardPort = toInt(dp)
+			n, err := toInt(dp)
+			if err != nil {
+				return nil, fmt.Errorf("invalid dashboard_port: %w", err)
+			}
+			gl.dashboardPort = n
+		}
+		// Validate invalidation_port up front so Wrap()'s later lookup via
+		// detectInvalidationPort() is guaranteed to succeed.
+		if ip, ok := gl.config["invalidation_port"]; ok {
+			if _, err := toInt(ip); err != nil {
+				return nil, fmt.Errorf("invalid invalidation_port: %w", err)
+			}
 		}
 	}
 
@@ -833,18 +844,25 @@ func cleanOldTempBinaries(dir, namePrefix, keep string) {
 	}
 }
 
-func toInt(v interface{}) int {
+// toInt coerces a config value to an int. Returns an error if the value is a
+// string that cannot be parsed or a type we don't understand — this prevents
+// silent conversion of e.g. "abc" into 0, which would quietly disable ports.
+func toInt(v interface{}) (int, error) {
 	switch n := v.(type) {
 	case int:
-		return n
+		return n, nil
+	case int64:
+		return int(n), nil
 	case float64:
-		return int(n)
+		return int(n), nil
 	case string:
 		var i int
-		fmt.Sscanf(n, "%d", &i)
-		return i
+		if _, err := fmt.Sscanf(n, "%d", &i); err != nil {
+			return 0, fmt.Errorf("cannot parse %q as int: %w", n, err)
+		}
+		return i, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("cannot convert %T to int", v)
 	}
 }
 
