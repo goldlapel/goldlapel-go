@@ -363,13 +363,18 @@ type GoldLapel struct {
 // WithConfig, WithExtraArgs).
 func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, error) {
 	gl := &GoldLapel{
-		upstream:      upstream,
-		port:          DefaultPort,
-		dashboardPort: DefaultDashboardPort,
+		upstream: upstream,
+		port:     DefaultPort,
 	}
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
+	// Dashboard defaults to proxy port + 1 (matches what the Rust binary
+	// binds when no --dashboard-port is passed). Only when the user supplies
+	// an explicit dashboard_port via WithConfig does that value override the
+	// derivation. This means WithPort(17932) correctly reports the dashboard
+	// at :17933 rather than the hardcoded 7933.
+	gl.dashboardPort = gl.port + 1
 	if gl.config != nil {
 		if dp, ok := gl.config["dashboard_port"]; ok {
 			gl.dashboardPort = toInt(dp)

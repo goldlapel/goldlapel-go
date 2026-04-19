@@ -360,13 +360,16 @@ func TestWaitForPortClosedPort(t *testing.T) {
 // Stop idempotency on an unstarted instance, etc.).
 func buildForTest(upstream string, opts ...Option) *GoldLapel {
 	gl := &GoldLapel{
-		upstream:      upstream,
-		port:          DefaultPort,
-		dashboardPort: DefaultDashboardPort,
+		upstream: upstream,
+		port:     DefaultPort,
 	}
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
+	// Mirrors Start: default dashboard port to proxy port + 1 so custom
+	// WithPort values propagate to the dashboard. Explicit dashboard_port
+	// in config overrides.
+	gl.dashboardPort = gl.port + 1
 	if gl.config != nil {
 		if dp, ok := gl.config["dashboard_port"]; ok {
 			gl.dashboardPort = toInt(dp)
@@ -744,6 +747,23 @@ func TestDashboardPortFromConfigString(t *testing.T) {
 	}))
 	if gl.dashboardPort != 9090 {
 		t.Fatalf("expected dashboard port 9090, got %d", gl.dashboardPort)
+	}
+}
+
+func TestDashboardPortDerivesFromCustomProxyPort(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithPort(17932))
+	if gl.dashboardPort != 17933 {
+		t.Fatalf("expected dashboard port 17933 (proxy+1), got %d", gl.dashboardPort)
+	}
+}
+
+func TestExplicitDashboardPortOverridesDerivation(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb",
+		WithPort(17932),
+		WithConfig(map[string]interface{}{"dashboard_port": 9999}),
+	)
+	if gl.dashboardPort != 9999 {
+		t.Fatalf("expected explicit dashboard port 9999, got %d", gl.dashboardPort)
 	}
 }
 
