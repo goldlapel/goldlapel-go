@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 )
 
 // ErrNoRows is returned by Row.Scan when the query returns no rows.
@@ -65,13 +66,30 @@ func Wrap(conn Querier, invalidationPort int) *CachedConn {
 	}
 }
 
+// lastStartedInstance tracks the most recently Start()ed *GoldLapel so that
+// Wrap() can auto-detect the invalidation port without requiring the caller
+// to pass it explicitly. It is best-effort — if no instance has been started
+// (e.g. the user is running the proxy out-of-process) Wrap falls back to
+// DefaultPort+2.
+var (
+	lastStartedInstance   *GoldLapel
+	lastStartedInstanceMu sync.Mutex
+)
+
+func registerStartedInstance(gl *GoldLapel) {
+	lastStartedInstanceMu.Lock()
+	lastStartedInstance = gl
+	lastStartedInstanceMu.Unlock()
+}
+
 func detectInvalidationPort() int {
-	singletonMu.Lock()
-	defer singletonMu.Unlock()
-	if instance != nil {
-		port := instance.port
-		if instance.config != nil {
-			if ip, ok := instance.config["invalidation_port"]; ok {
+	lastStartedInstanceMu.Lock()
+	inst := lastStartedInstance
+	lastStartedInstanceMu.Unlock()
+	if inst != nil {
+		port := inst.port
+		if inst.config != nil {
+			if ip, ok := inst.config["invalidation_port"]; ok {
 				return toInt(ip)
 			}
 		}

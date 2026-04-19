@@ -1,15 +1,14 @@
 package goldlapel
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 )
 
 // PercolateAdd registers a named query for reverse matching.
 // Like Elasticsearch percolator. Auto-creates the percolator table and GIN
 // index if they don't exist, then upserts the query.
-// Options: WithLang (default "english"), WithMetadata (JSON string).
-func PercolateAdd(db *sql.DB, name, queryID, query string, opts ...SearchOption) error {
+func PercolateAdd(ctx context.Context, q execQuerier, name, queryID, query string, opts ...SearchOption) error {
 	o := &searchOptions{lang: "english"}
 	for _, fn := range opts {
 		fn(o)
@@ -19,7 +18,6 @@ func PercolateAdd(db *sql.DB, name, queryID, query string, opts ...SearchOption)
 		return err
 	}
 
-	// Auto-create percolator table
 	createTable := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		query_id TEXT PRIMARY KEY,
 		query_text TEXT NOT NULL,
@@ -28,17 +26,15 @@ func PercolateAdd(db *sql.DB, name, queryID, query string, opts ...SearchOption)
 		metadata JSONB,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`, name)
-	if _, err := db.Exec(createTable); err != nil {
+	if _, err := q.ExecContext(ctx, createTable); err != nil {
 		return fmt.Errorf("create percolator table: %w", err)
 	}
 
-	// Auto-create GIST index on tsquery column
 	createIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_tsq_idx ON %s USING GIST (tsquery)", name, name)
-	if _, err := db.Exec(createIndex); err != nil {
+	if _, err := q.ExecContext(ctx, createIndex); err != nil {
 		return fmt.Errorf("create percolator index: %w", err)
 	}
 
-	// Upsert the query
 	var metadataArg interface{}
 	if o.metadata != "" {
 		metadataArg = o.metadata
@@ -51,14 +47,12 @@ func PercolateAdd(db *sql.DB, name, queryID, query string, opts ...SearchOption)
 			tsquery = EXCLUDED.tsquery,
 			lang = EXCLUDED.lang,
 			metadata = EXCLUDED.metadata`, name)
-	_, err := db.Exec(upsert, queryID, query, o.lang, metadataArg)
+	_, err := q.ExecContext(ctx, upsert, queryID, query, o.lang, metadataArg)
 	return err
 }
 
 // Percolate matches a document against stored queries.
-// Like Elasticsearch percolate API. Returns matching queries ranked by
-// relevance score. Default limit=50, lang="english".
-func Percolate(db *sql.DB, name, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
+func Percolate(ctx context.Context, q execQuerier, name, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
 	o := &searchOptions{limit: 50, lang: "english"}
 	for _, fn := range opts {
 		fn(o)
@@ -68,13 +62,13 @@ func Percolate(db *sql.DB, name, text string, opts ...SearchOption) ([]map[strin
 		return nil, err
 	}
 
-	q := fmt.Sprintf(`SELECT query_id, query_text, metadata,
+	sqlQ := fmt.Sprintf(`SELECT query_id, query_text, metadata,
 		ts_rank(to_tsvector($1, $2), tsquery) AS _score
 		FROM %s
 		WHERE to_tsvector($1, $2) @@ tsquery
 		ORDER BY _score DESC LIMIT $3`, name)
 
-	rows, err := db.Query(q, o.lang, text, o.limit)
+	rows, err := q.QueryContext(ctx, sqlQ, o.lang, text, o.limit)
 	if err != nil {
 		return nil, err
 	}
@@ -84,14 +78,13 @@ func Percolate(db *sql.DB, name, text string, opts ...SearchOption) ([]map[strin
 }
 
 // PercolateDelete removes a stored query from a percolator index.
-// Returns true if a row was deleted, false if the query_id was not found.
-func PercolateDelete(db *sql.DB, name, queryID string) (bool, error) {
+func PercolateDelete(ctx context.Context, q execQuerier, name, queryID string) (bool, error) {
 	if err := validateIdentifier(name); err != nil {
 		return false, err
 	}
 
-	q := fmt.Sprintf("DELETE FROM %s WHERE query_id = $1", name)
-	result, err := db.Exec(q, queryID)
+	sqlQ := fmt.Sprintf("DELETE FROM %s WHERE query_id = $1", name)
+	result, err := q.ExecContext(ctx, sqlQ, queryID)
 	if err != nil {
 		return false, err
 	}
