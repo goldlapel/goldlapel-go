@@ -359,6 +359,8 @@ type GoldLapel struct {
 	proxyURL      string
 	stderr        string
 	done          chan struct{} // closed when process exits
+	waitErr       error         // set by spawn's reaper goroutine before closing done
+	weSignaled    bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
 	db            *sql.DB
 	tx            *sql.Tx // non-nil only for GoldLapel instances returned by InTx
 	silent        bool    // when true, printBanner is a no-op
@@ -472,7 +474,11 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	go func() {
 		<-stderrDone
 		gl.stderr = stderrBuf.String()
-		gl.cmd.Wait()
+		// Capture Wait()'s error so Stop can surface it (E2). Stop
+		// synchronises on <-gl.done, so the write here happens-before any
+		// read of gl.waitErr on the Stop side — no additional locking
+		// is needed for this field.
+		gl.waitErr = gl.cmd.Wait()
 		close(gl.done)
 	}()
 
@@ -537,6 +543,15 @@ func openDB(url string) (*sql.DB, error) {
 // Safe to call multiple times. The context is honoured during the graceful
 // shutdown wait — if ctx is cancelled the process is killed immediately.
 //
+// Return value contract:
+//   - nil when the proxy shut down as expected — including the normal case
+//     where Stop itself signalled SIGTERM/Kill (the resulting non-zero exit
+//     is expected, not an error).
+//   - non-nil when the subprocess exited on its own before Stop was called
+//     (e.g. crashed with a non-zero status, OOM-killed) — in that case the
+//     exit error from cmd.Wait() is surfaced so callers checking the return
+//     value see the failure.
+//
 // Scoped instances (the *GoldLapel returned by InTx) share the parent's
 // process and pool but must not tear them down if a caller mistakenly
 // calls Stop on them. Stop is a no-op on a scoped instance — the caller
@@ -560,6 +575,9 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		return nil
 	}
 
+	// Fast path: process exited on its own before Stop was called. This
+	// is NOT an our-signal shutdown — surface any Wait() error so callers
+	// see e.g. a non-zero crash exit.
 	select {
 	case <-gl.done:
 		if gl.db != nil {
@@ -568,7 +586,7 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		}
 		gl.done = nil
 		gl.proxyURL = ""
-		return nil
+		return filterStopExit(gl.waitErr, gl.weSignaled)
 	default:
 	}
 
@@ -576,6 +594,11 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		gl.db.Close()
 		gl.db = nil
 	}
+
+	// Mark that we're about to issue a signal so the resulting ExitError
+	// from cmd.Wait() can be filtered as expected-shutdown rather than
+	// surfaced to the caller.
+	gl.weSignaled = true
 
 	if runtime.GOOS == "windows" {
 		gl.cmd.Process.Kill()
@@ -595,7 +618,34 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 
 	gl.done = nil
 	gl.proxyURL = ""
-	return nil
+	return filterStopExit(gl.waitErr, gl.weSignaled)
+}
+
+// filterStopExit classifies cmd.Wait()'s error and decides whether to
+// surface it. When weSignaled is true, the subprocess was killed by us
+// (SIGTERM or Process.Kill) — *exec.ExitError in that case reflects the
+// expected shutdown path and is swallowed. Any other non-nil error
+// (subprocess-crashed, OOM, I/O errors inside Wait) is returned so the
+// caller of Stop sees the failure.
+//
+// This is platform-agnostic: on both POSIX and Windows, cmd.Wait() returns
+// an *exec.ExitError for any non-zero exit — including signal-induced
+// termination on POSIX and Kill-induced termination on Windows. Filtering
+// by "did we issue the kill?" rather than by platform-specific WaitStatus
+// bits keeps the logic simple and uniform across all four targets
+// (linux-x86_64, linux-aarch64, darwin-aarch64, windows-x86_64).
+func filterStopExit(err error, weSignaled bool) error {
+	if err == nil {
+		return nil
+	}
+	if !weSignaled {
+		return err
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return nil
+	}
+	return err
 }
 
 // Close implements io.Closer. It calls Stop with context.Background().

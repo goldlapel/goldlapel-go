@@ -2,11 +2,14 @@ package goldlapel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -957,5 +960,130 @@ func TestWithSilentSetsField(t *testing.T) {
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent())
 	if !gl.silent {
 		t.Fatal("expected WithSilent() to set silent=true")
+	}
+}
+
+// --- Stop() exit-error surfacing (E2) ---
+//
+// These tests install a real long/short-lived subprocess on the *GoldLapel
+// (mimicking what spawn would install after a successful boot) and drive
+// Stop through each of the three scenarios:
+//
+//   (a) normal shutdown — Stop issues SIGTERM/Kill; the resulting ExitError
+//       is the expected path and must be swallowed (Stop returns nil).
+//   (b) subprocess exited on its own with non-zero status before Stop was
+//       called — Stop must surface the Wait() error.
+//   (c) subprocess exited on its own cleanly (zero) before Stop was called
+//       — Stop returns nil.
+//
+// A fake binary is built from the host shell ("sh -c sleep 60" for the
+// long-lived case, "sh -c exit 7" for the crash case). No real goldlapel
+// binary is needed.
+
+// installFakeProcess sets up the subset of *GoldLapel state that Stop
+// expects: gl.cmd is a started process and gl.done is closed by a reaper
+// goroutine that captures Wait()'s error into gl.waitErr. Returns the
+// started *exec.Cmd so tests can inspect or manipulate it.
+func installFakeProcess(t *testing.T, gl *GoldLapel, cmd *exec.Cmd) *exec.Cmd {
+	t.Helper()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fake process: %v", err)
+	}
+	gl.cmd = cmd
+	gl.done = make(chan struct{})
+	go func() {
+		gl.waitErr = cmd.Wait()
+		close(gl.done)
+	}()
+	return cmd
+}
+
+func TestStop_NormalShutdownReturnsNil(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based fake binary is POSIX-only; real-binary integration covers Windows")
+	}
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	// Long-lived subprocess so Stop actually has to signal it.
+	installFakeProcess(t, gl, exec.Command("sh", "-c", "sleep 60"))
+
+	if err := gl.Stop(context.Background()); err != nil {
+		t.Fatalf("expected nil from normal Stop (our-signal shutdown), got %v", err)
+	}
+}
+
+func TestStop_SubprocessCrashedSurfacesError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based fake binary is POSIX-only; real-binary integration covers Windows")
+	}
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	// Short-lived subprocess that exits non-zero — mimics a crashed proxy.
+	installFakeProcess(t, gl, exec.Command("sh", "-c", "exit 7"))
+
+	// Wait for the reaper to capture the exit before calling Stop, so
+	// Stop takes the already-exited fast path and surfaces waitErr.
+	<-gl.done
+
+	// Re-arm gl.done so the non-nil check in Stop survives; the reaper
+	// already ran, so we just need a channel that's already closed.
+	// (installFakeProcess's close(gl.done) already did that — no action needed.)
+
+	err := gl.Stop(context.Background())
+	if err == nil {
+		t.Fatal("expected Stop to surface the non-zero exit error, got nil")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected *exec.ExitError, got %T: %v", err, err)
+	}
+	if exitErr.ExitCode() != 7 {
+		t.Fatalf("expected exit code 7, got %d", exitErr.ExitCode())
+	}
+}
+
+func TestStop_SubprocessExitedCleanlyReturnsNil(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based fake binary is POSIX-only; real-binary integration covers Windows")
+	}
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	// Short-lived subprocess that exits zero — graceful self-shutdown.
+	installFakeProcess(t, gl, exec.Command("sh", "-c", "true"))
+
+	<-gl.done
+
+	if err := gl.Stop(context.Background()); err != nil {
+		t.Fatalf("expected nil from Stop after clean self-exit, got %v", err)
+	}
+}
+
+// TestFilterStopExit_UnitCases covers the classifier directly for edge
+// cases that are awkward to reach through Stop (non-ExitError error types,
+// our-signal with nil Wait error, etc.).
+func TestFilterStopExit_UnitCases(t *testing.T) {
+	// nil wait → always nil regardless of signal flag.
+	if got := filterStopExit(nil, true); got != nil {
+		t.Fatalf("nil+signaled: expected nil, got %v", got)
+	}
+	if got := filterStopExit(nil, false); got != nil {
+		t.Fatalf("nil+unsignaled: expected nil, got %v", got)
+	}
+
+	// ExitError + we signalled → swallowed (our kill is expected).
+	fakeExit := &exec.ExitError{}
+	if got := filterStopExit(fakeExit, true); got != nil {
+		t.Fatalf("exit+signaled: expected nil, got %v", got)
+	}
+
+	// ExitError + we did NOT signal → surfaced (subprocess crashed).
+	if got := filterStopExit(fakeExit, false); got == nil {
+		t.Fatal("exit+unsignaled: expected error, got nil")
+	}
+
+	// Non-ExitError (e.g. wait I/O failure) → always surfaced.
+	sentinel := errors.New("wait broke")
+	if got := filterStopExit(sentinel, true); got == nil {
+		t.Fatal("non-exit+signaled: expected error to be surfaced, got nil")
+	}
+	if got := filterStopExit(sentinel, false); got == nil {
+		t.Fatal("non-exit+unsignaled: expected error to be surfaced, got nil")
 	}
 }
