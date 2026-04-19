@@ -1055,6 +1055,35 @@ func TestStop_SubprocessExitedCleanlyReturnsNil(t *testing.T) {
 	}
 }
 
+// --- Stop() guard chain (F) ---
+//
+// Simulates a mid-spawn failure where gl.cmd is set but gl.done never was
+// (reaper not yet installed — e.g. StderrPipe or cmd.Start returned an
+// error). Stop must clean up cmd and return nil, leaving the instance in
+// a valid "unstarted" state that subsequent Stops treat as a no-op.
+
+func TestStop_MidSpawnFailureClearsCmd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based fake binary is POSIX-only")
+	}
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+
+	// Mimic spawn's state immediately after exec.Command() but before
+	// the reaper goroutine was installed — cmd set, done still nil.
+	gl.cmd = exec.Command("sh", "-c", "true")
+
+	if err := gl.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop on mid-spawn-failed instance: expected nil, got %v", err)
+	}
+	if gl.cmd != nil {
+		t.Fatalf("expected gl.cmd cleared after Stop, still set to %v", gl.cmd)
+	}
+	// Second Stop must remain a clean no-op.
+	if err := gl.Stop(context.Background()); err != nil {
+		t.Fatalf("second Stop: expected nil, got %v", err)
+	}
+}
+
 // TestFilterStopExit_UnitCases covers the classifier directly for edge
 // cases that are awkward to reach through Stop (non-ExitError error types,
 // our-signal with nil Wait error, etc.).

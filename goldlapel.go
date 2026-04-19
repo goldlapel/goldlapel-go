@@ -566,12 +566,19 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	// Unstarted / already-stopped instance.
-	if gl.cmd == nil && gl.done == nil {
-		return nil
-	}
-
+	// Unstarted / already-stopped: nothing to do.
+	//
+	// F: the guard chain used to have a third path (cmd != nil && done == nil)
+	// that returned without nilling cmd — harmless in practice because
+	// spawn's port-poll timeout path already nils cmd, but fragile if a
+	// future spawn error path left cmd set without installing a reaper.
+	// The check below consolidates to a single exit: if there's no reaper
+	// channel to wait on, we clear any stale cmd defensively and return.
+	// Callers never see such an instance today (Start returns nil on
+	// failure), but this keeps Stop reliably idempotent under any
+	// construction path (including hand-rolled test harnesses).
 	if gl.done == nil {
+		gl.cmd = nil
 		return nil
 	}
 
@@ -580,12 +587,7 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 	// see e.g. a non-zero crash exit.
 	select {
 	case <-gl.done:
-		if gl.db != nil {
-			gl.db.Close()
-			gl.db = nil
-		}
-		gl.done = nil
-		gl.proxyURL = ""
+		gl.teardownLocked()
 		return filterStopExit(gl.waitErr, gl.weSignaled)
 	default:
 	}
@@ -616,9 +618,22 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		<-gl.done
 	}
 
-	gl.done = nil
-	gl.proxyURL = ""
+	gl.teardownLocked()
 	return filterStopExit(gl.waitErr, gl.weSignaled)
+}
+
+// teardownLocked nils out the process/pool state after the reaper has
+// completed. Caller must hold gl.mu. Centralising this in one helper
+// keeps Stop's two return paths (already-exited fast path, post-signal
+// path) in sync — previously they diverged on whether gl.cmd was cleared.
+func (gl *GoldLapel) teardownLocked() {
+	if gl.db != nil {
+		gl.db.Close()
+		gl.db = nil
+	}
+	gl.done = nil
+	gl.cmd = nil
+	gl.proxyURL = ""
 }
 
 // filterStopExit classifies cmd.Wait()'s error and decides whether to
