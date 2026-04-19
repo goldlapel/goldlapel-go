@@ -47,12 +47,11 @@ func DocWatch(ctx context.Context, q execQuerier, listenConn, collection string,
 		return nil, fmt.Errorf("create watch function: %w", err)
 	}
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
-		return nil, fmt.Errorf("drop existing watch trigger: %w", err)
-	}
-
-	createTrigger := "CREATE TRIGGER " + triggerName +
+	// CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — avoids the race
+	// where a DROP + CREATE pair could have two concurrent DocWatch calls
+	// replace each other's triggers mid-flight and end up with a partially
+	// dropped one. GL targets PG14+ across the product, so this is safe.
+	createTrigger := "CREATE OR REPLACE TRIGGER " + triggerName +
 		" AFTER INSERT OR UPDATE OR DELETE ON " + collection +
 		" FOR EACH ROW EXECUTE FUNCTION " + funcName + "()"
 	if _, err := q.ExecContext(ctx, createTrigger); err != nil {

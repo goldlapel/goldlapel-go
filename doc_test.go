@@ -1701,7 +1701,9 @@ func TestDocWatch_TriggerDDL(t *testing.T) {
 	}
 
 	captures := drv.allCaptures()
-	// Expect: CREATE TABLE, CREATE OR REPLACE FUNCTION, DROP TRIGGER, CREATE TRIGGER
+	// Expect: CREATE TABLE, CREATE OR REPLACE FUNCTION, CREATE OR REPLACE TRIGGER.
+	// CREATE OR REPLACE TRIGGER (PG14+) replaces the old DROP+CREATE pair
+	// to avoid a race between concurrent DocWatch calls.
 	found := false
 	for _, c := range captures {
 		if strings.Contains(c.query, "CREATE OR REPLACE FUNCTION events_notify_changes") {
@@ -1715,10 +1717,10 @@ func TestDocWatch_TriggerDDL(t *testing.T) {
 		t.Fatal("expected CREATE OR REPLACE FUNCTION for watch trigger")
 	}
 
-	// Verify trigger creation
+	// Verify trigger creation uses atomic CREATE OR REPLACE.
 	triggerFound := false
 	for _, c := range captures {
-		if strings.Contains(c.query, "CREATE TRIGGER events_watch_trigger") {
+		if strings.Contains(c.query, "CREATE OR REPLACE TRIGGER events_watch_trigger") {
 			triggerFound = true
 			assertContains(t, c.query, "AFTER INSERT OR UPDATE OR DELETE")
 			assertContains(t, c.query, "FOR EACH ROW")
@@ -1726,7 +1728,15 @@ func TestDocWatch_TriggerDDL(t *testing.T) {
 		}
 	}
 	if !triggerFound {
-		t.Fatal("expected CREATE TRIGGER for watch")
+		t.Fatal("expected CREATE OR REPLACE TRIGGER for watch")
+	}
+
+	// Ensure no racy DROP TRIGGER IF EXISTS + CREATE TRIGGER pair sneaks
+	// back in later.
+	for _, c := range captures {
+		if strings.Contains(c.query, "DROP TRIGGER IF EXISTS events_watch_trigger") {
+			t.Fatal("DocWatch should not emit DROP TRIGGER IF EXISTS (racy); use CREATE OR REPLACE TRIGGER")
+		}
 	}
 }
 
