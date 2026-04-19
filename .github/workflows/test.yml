@@ -34,14 +34,11 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Download latest goldlapel binary
+      - name: Set goldlapel binary path
+        # Binary is committed to bin/ in this repo for the Go module proxy.
         run: |
-          LATEST=$(gh release list --repo goldlapel/goldlapel --limit 1 --json tagName -q '.[0].tagName')
-          gh release download "$LATEST" --repo goldlapel/goldlapel --pattern "goldlapel-linux-x86_64" --dir /tmp
-          chmod +x /tmp/goldlapel-linux-x86_64
-          echo "GOLDLAPEL_BINARY=/tmp/goldlapel-linux-x86_64" >> $GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          chmod +x bin/goldlapel-linux-x86_64
+          echo "GOLDLAPEL_BINARY=$GITHUB_WORKSPACE/bin/goldlapel-linux-x86_64" >> $GITHUB_ENV
 
       - name: Run tests
         env:
