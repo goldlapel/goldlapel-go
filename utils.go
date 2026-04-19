@@ -21,6 +21,9 @@ type ZMember struct {
 
 // Publish sends a message to a channel. Like redis.publish().
 func Publish(ctx context.Context, q execQuerier, channel, message string) error {
+	if err := validateIdentifier(channel); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx, "SELECT pg_notify($1, $2)", channel, message)
 	return err
 }
@@ -30,6 +33,9 @@ func Publish(ctx context.Context, q execQuerier, channel, message string) error 
 // Pass a connection string (DSN), not a *sql.DB, because LISTEN requires
 // a dedicated connection. The context cancels the loop.
 func Subscribe(ctx context.Context, conn string, channel string, callback func(channel, payload string)) error {
+	if err := validateIdentifier(channel); err != nil {
+		return err
+	}
 	minReconn := 10 * time.Second
 	maxReconn := time.Minute
 	listener := pq.NewListener(conn, minReconn, maxReconn, nil)
@@ -67,6 +73,9 @@ func SubscribeAsync(ctx context.Context, conn string, channel string, callback f
 
 // Enqueue adds a job to a queue table. Like redis.lpush().
 func Enqueue(ctx context.Context, q execQuerier, queueTable string, payload interface{}) error {
+	if err := validateIdentifier(queueTable); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+queueTable+" ("+
 			"id BIGSERIAL PRIMARY KEY, "+
@@ -88,6 +97,9 @@ func Enqueue(ctx context.Context, q execQuerier, queueTable string, payload inte
 // Dequeue pops the next job from a queue table. Like redis.brpop() (non-blocking).
 // Returns the payload as raw JSON, or nil if the queue is empty.
 func Dequeue(ctx context.Context, q execQuerier, queueTable string) (json.RawMessage, error) {
+	if err := validateIdentifier(queueTable); err != nil {
+		return nil, err
+	}
 	var payload string
 	err := q.QueryRowContext(ctx,
 		"DELETE FROM "+queueTable+
@@ -107,6 +119,9 @@ func Dequeue(ctx context.Context, q execQuerier, queueTable string) (json.RawMes
 
 // Incr increments a counter. Like redis.incr().
 func Incr(ctx context.Context, q execQuerier, table, key string, amount int64) (int64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return 0, err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+table+" ("+
 			"key TEXT PRIMARY KEY, "+
@@ -129,6 +144,9 @@ func Incr(ctx context.Context, q execQuerier, table, key string, amount int64) (
 
 // GetCounter reads a counter value. Returns 0 if the key doesn't exist.
 func GetCounter(ctx context.Context, q execQuerier, table, key string) (int64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return 0, err
+	}
 	var value int64
 	err := q.QueryRowContext(ctx,
 		"SELECT value FROM "+table+" WHERE key = $1",
@@ -145,6 +163,9 @@ func GetCounter(ctx context.Context, q execQuerier, table, key string) (int64, e
 
 // Zadd adds a member with a score to a sorted set. Like redis.zadd().
 func Zadd(ctx context.Context, q execQuerier, table, member string, score float64) error {
+	if err := validateIdentifier(table); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+table+" ("+
 			"member TEXT PRIMARY KEY, "+
@@ -162,6 +183,9 @@ func Zadd(ctx context.Context, q execQuerier, table, member string, score float6
 
 // Zrange gets members by score rank. Like redis.zrange().
 func Zrange(ctx context.Context, q execQuerier, table string, start, stop int, desc bool) ([]ZMember, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
 	order := "ASC"
 	if desc {
 		order = "DESC"
@@ -191,6 +215,9 @@ func Zrange(ctx context.Context, q execQuerier, table string, start, stop int, d
 
 // Zincrby increments a member's score in a sorted set. Like redis.zincrby().
 func Zincrby(ctx context.Context, q execQuerier, table, member string, amount float64) (float64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return 0, err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+table+" ("+
 			"member TEXT PRIMARY KEY, "+
@@ -213,6 +240,9 @@ func Zincrby(ctx context.Context, q execQuerier, table, member string, amount fl
 
 // Zrank gets the rank of a member in a sorted set. Like redis.zrank().
 func Zrank(ctx context.Context, q execQuerier, table, member string, desc bool) (*int, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
 	order := "ASC"
 	if desc {
 		order = "DESC"
@@ -237,6 +267,9 @@ func Zrank(ctx context.Context, q execQuerier, table, member string, desc bool) 
 
 // Zscore gets the score of a member in a sorted set. Like redis.zscore().
 func Zscore(ctx context.Context, q execQuerier, table, member string) (*float64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
 	var score float64
 	err := q.QueryRowContext(ctx,
 		"SELECT score FROM "+table+" WHERE member = $1",
@@ -253,6 +286,9 @@ func Zscore(ctx context.Context, q execQuerier, table, member string) (*float64,
 
 // Zrem removes a member from a sorted set. Like redis.zrem().
 func Zrem(ctx context.Context, q execQuerier, table, member string) (bool, error) {
+	if err := validateIdentifier(table); err != nil {
+		return false, err
+	}
 	result, err := q.ExecContext(ctx,
 		"DELETE FROM "+table+" WHERE member = $1",
 		member)
@@ -269,6 +305,9 @@ func Zrem(ctx context.Context, q execQuerier, table, member string) (bool, error
 
 // Hset sets a field in a hash. Like redis.hset().
 func Hset(ctx context.Context, q execQuerier, table, key, field string, value interface{}) error {
+	if err := validateIdentifier(table); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+table+" ("+
 			"key TEXT PRIMARY KEY, "+
@@ -291,6 +330,9 @@ func Hset(ctx context.Context, q execQuerier, table, key, field string, value in
 
 // Hget gets a field from a hash. Like redis.hget().
 func Hget(ctx context.Context, q execQuerier, table, key, field string) (json.RawMessage, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
 	var val *string
 	err := q.QueryRowContext(ctx,
 		"SELECT data->>$1 FROM "+table+" WHERE key = $2",
@@ -307,6 +349,9 @@ func Hget(ctx context.Context, q execQuerier, table, key, field string) (json.Ra
 
 // Hgetall gets all fields from a hash. Like redis.hgetall().
 func Hgetall(ctx context.Context, q execQuerier, table, key string) (json.RawMessage, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
 	var data string
 	err := q.QueryRowContext(ctx,
 		"SELECT data FROM "+table+" WHERE key = $1",
@@ -323,6 +368,9 @@ func Hgetall(ctx context.Context, q execQuerier, table, key string) (json.RawMes
 
 // Hdel removes a field from a hash. Like redis.hdel().
 func Hdel(ctx context.Context, q execQuerier, table, key, field string) (bool, error) {
+	if err := validateIdentifier(table); err != nil {
+		return false, err
+	}
 	var existed bool
 	err := q.QueryRowContext(ctx,
 		"SELECT data ? $1 FROM "+table+" WHERE key = $2",
@@ -346,6 +394,15 @@ func Hdel(ctx context.Context, q execQuerier, table, key, field string) (bool, e
 
 // Geoadd adds a location to a geo table. Like redis.geoadd().
 func Geoadd(ctx context.Context, q execQuerier, table, nameColumn, geomColumn, name string, lon, lat float64) error {
+	if err := validateIdentifier(table); err != nil {
+		return err
+	}
+	if err := validateIdentifier(nameColumn); err != nil {
+		return err
+	}
+	if err := validateIdentifier(geomColumn); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS postgis")
 	if err != nil {
 		return fmt.Errorf("create postgis extension: %w", err)
@@ -369,6 +426,12 @@ func Geoadd(ctx context.Context, q execQuerier, table, nameColumn, geomColumn, n
 
 // Georadius finds rows within a radius of a point. Like redis.georadius().
 func Georadius(ctx context.Context, q execQuerier, table, geomColumn string, lon, lat, radiusMeters float64, limit int) ([]map[string]interface{}, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(geomColumn); err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx,
 		"SELECT *, ST_Distance("+
 			geomColumn+"::geography, "+
@@ -418,6 +481,12 @@ func Georadius(ctx context.Context, q execQuerier, table, geomColumn string, lon
 
 // CountDistinct counts the number of distinct values in a column.
 func CountDistinct(ctx context.Context, q execQuerier, table, column string) (int64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return 0, err
+	}
+	if err := validateIdentifier(column); err != nil {
+		return 0, err
+	}
 	var count int64
 	err := q.QueryRowContext(ctx, "SELECT COUNT(DISTINCT "+column+") FROM "+table).Scan(&count)
 	if err != nil {
@@ -428,6 +497,15 @@ func CountDistinct(ctx context.Context, q execQuerier, table, column string) (in
 
 // Geodist gets the distance between two members in meters. Like redis.geodist().
 func Geodist(ctx context.Context, q execQuerier, table, geomColumn, nameColumn, nameA, nameB string) (*float64, error) {
+	if err := validateIdentifier(table); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(geomColumn); err != nil {
+		return nil, err
+	}
+	if err := validateIdentifier(nameColumn); err != nil {
+		return nil, err
+	}
 	var dist float64
 	err := q.QueryRowContext(ctx,
 		"SELECT ST_Distance(a."+geomColumn+"::geography, b."+geomColumn+"::geography) "+
@@ -453,6 +531,9 @@ type StreamMessage struct {
 
 // StreamAdd adds a message to a stream. Like redis.xadd().
 func StreamAdd(ctx context.Context, q execQuerier, stream string, payload string) (int64, error) {
+	if err := validateIdentifier(stream); err != nil {
+		return 0, err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+stream+" ("+
 			"id BIGSERIAL PRIMARY KEY, "+
@@ -474,6 +555,9 @@ func StreamAdd(ctx context.Context, q execQuerier, stream string, payload string
 
 // StreamCreateGroup creates a consumer group for a stream. Like redis.xgroup_create().
 func StreamCreateGroup(ctx context.Context, q execQuerier, stream, group string) error {
+	if err := validateIdentifier(stream); err != nil {
+		return err
+	}
 	_, err := q.ExecContext(ctx,
 		"CREATE TABLE IF NOT EXISTS "+stream+"_groups ("+
 			"group_name TEXT NOT NULL, "+
@@ -503,6 +587,9 @@ func StreamCreateGroup(ctx context.Context, q execQuerier, stream, group string)
 
 // StreamRead reads messages from a stream for a consumer group. Like redis.xreadgroup().
 func StreamRead(ctx context.Context, q execQuerier, stream, group, consumer string, count int) ([]StreamMessage, error) {
+	if err := validateIdentifier(stream); err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx,
 		"WITH cursor AS ("+
 			"SELECT last_id FROM "+stream+"_cursors WHERE group_name = $1 FOR UPDATE"+
@@ -537,6 +624,9 @@ func StreamRead(ctx context.Context, q execQuerier, stream, group, consumer stri
 
 // StreamAck acknowledges a message in a consumer group. Like redis.xack().
 func StreamAck(ctx context.Context, q execQuerier, stream, group string, messageID int64) (bool, error) {
+	if err := validateIdentifier(stream); err != nil {
+		return false, err
+	}
 	result, err := q.ExecContext(ctx,
 		"UPDATE "+stream+"_groups SET acked = TRUE "+
 			"WHERE group_name = $1 AND message_id = $2 AND acked = FALSE",
@@ -554,6 +644,9 @@ func StreamAck(ctx context.Context, q execQuerier, stream, group string, message
 
 // StreamClaim claims idle messages from other consumers. Like redis.xclaim().
 func StreamClaim(ctx context.Context, q execQuerier, stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
+	if err := validateIdentifier(stream); err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx,
 		"WITH claimed AS ("+
 			"UPDATE "+stream+"_groups SET consumer = $1, claimed_at = NOW()"+
