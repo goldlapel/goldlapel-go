@@ -164,7 +164,7 @@ func assertNotContains(t *testing.T, haystack, needle string) {
 func TestSearch_SingleColumn_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "title", "_score"}, nil)
 
-	_, err := Search(db, "articles", "title", "hello world")
+	_, err := Search(ctx, db, "articles", "title", "hello world")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestSearch_SingleColumn_SQLGeneration(t *testing.T) {
 func TestSearch_MultiColumn_CoalesceWrapping(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := Search(db, "articles", []string{"title", "body"}, "test")
+	_, err := Search(ctx, db, "articles", []string{"title", "body"}, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestSearch_MultiColumn_CoalesceWrapping(t *testing.T) {
 func TestSearch_WithHighlight(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score", "_highlight"}, nil)
 
-	_, err := Search(db, "articles", "title", "hello", WithHighlight(true))
+	_, err := Search(ctx, db, "articles", "title", "hello", WithHighlight(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestSearch_WithHighlight(t *testing.T) {
 func TestSearch_WithLimit(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := Search(db, "articles", "title", "test", WithLimit(10))
+	_, err := Search(ctx, db, "articles", "title", "test", WithLimit(10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestSearch_WithLimit(t *testing.T) {
 func TestSearch_WithLang(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := Search(db, "articles", "title", "bonjour", WithLang("french"))
+	_, err := Search(ctx, db, "articles", "title", "bonjour", WithLang("french"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestSearch_WithLang(t *testing.T) {
 
 func TestSearch_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Search(db, "bad table!", "title", "test")
+	_, err := Search(ctx, db, "bad table!", "title", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -263,7 +263,7 @@ func TestSearch_InvalidTable(t *testing.T) {
 
 func TestSearch_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Search(db, "articles", "bad col!", "test")
+	_, err := Search(ctx, db, "articles", "bad col!", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -271,7 +271,7 @@ func TestSearch_InvalidColumn(t *testing.T) {
 
 func TestSearch_InvalidColumnType(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Search(db, "articles", 42, "test")
+	_, err := Search(ctx, db, "articles", 42, "test")
 	if err == nil {
 		t.Fatal("expected error for non-string column type")
 	}
@@ -282,7 +282,7 @@ func TestSearch_InvalidColumnType(t *testing.T) {
 func TestSearchFuzzy_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "name", "_score"}, nil)
 
-	_, err := SearchFuzzy(db, "users", "name", "jonh")
+	_, err := SearchFuzzy(ctx, db, "users", "name", "jonh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestSearchFuzzy_SQLGeneration(t *testing.T) {
 func TestSearchFuzzy_WithThreshold(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := SearchFuzzy(db, "users", "name", "test", WithThreshold(0.5))
+	_, err := SearchFuzzy(ctx, db, "users", "name", "test", WithThreshold(0.5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestSearchFuzzy_WithThreshold(t *testing.T) {
 
 func TestSearchFuzzy_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := SearchFuzzy(db, "bad table", "name", "test")
+	_, err := SearchFuzzy(ctx, db, "bad table", "name", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -337,7 +337,7 @@ func TestSearchFuzzy_InvalidTable(t *testing.T) {
 
 func TestSearchFuzzy_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := SearchFuzzy(db, "users", "bad col", "test")
+	_, err := SearchFuzzy(ctx, db, "users", "bad col", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -348,7 +348,7 @@ func TestSearchFuzzy_InvalidColumn(t *testing.T) {
 func TestSearchPhonetic_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "name", "_score"}, nil)
 
-	_, err := SearchPhonetic(db, "users", "name", "john")
+	_, err := SearchPhonetic(ctx, db, "users", "name", "john")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestSearchPhonetic_SQLGeneration(t *testing.T) {
 func TestSearchPhonetic_WithLimit(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := SearchPhonetic(db, "users", "name", "jon", WithLimit(5))
+	_, err := SearchPhonetic(ctx, db, "users", "name", "jon", WithLimit(5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestSearchPhonetic_WithLimit(t *testing.T) {
 
 func TestSearchPhonetic_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := SearchPhonetic(db, "bad!", "name", "test")
+	_, err := SearchPhonetic(ctx, db, "bad!", "name", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -402,7 +402,7 @@ func TestSearchPhonetic_InvalidTable(t *testing.T) {
 func TestSimilar_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "embedding", "_score"}, nil)
 
-	_, err := Similar(db, "documents", "embedding", []float64{0.1, 0.2, 0.3})
+	_, err := Similar(ctx, db, "documents", "embedding", []float64{0.1, 0.2, 0.3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestSimilar_SQLGeneration(t *testing.T) {
 func TestSimilar_WithLimit(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := Similar(db, "docs", "emb", []float64{1.0}, WithLimit(5))
+	_, err := Similar(ctx, db, "docs", "emb", []float64{1.0}, WithLimit(5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestSimilar_WithLimit(t *testing.T) {
 
 func TestSimilar_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Similar(db, "bad table", "emb", []float64{1.0})
+	_, err := Similar(ctx, db, "bad table", "emb", []float64{1.0})
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -453,7 +453,7 @@ func TestSimilar_InvalidTable(t *testing.T) {
 
 func TestSimilar_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Similar(db, "docs", "bad col", []float64{1.0})
+	_, err := Similar(ctx, db, "docs", "bad col", []float64{1.0})
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -464,7 +464,7 @@ func TestSimilar_InvalidColumn(t *testing.T) {
 func TestSuggest_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "name", "_score"}, nil)
 
-	_, err := Suggest(db, "products", "name", "lap")
+	_, err := Suggest(ctx, db, "products", "name", "lap")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +496,7 @@ func TestSuggest_SQLGeneration(t *testing.T) {
 func TestSuggest_WithLimit(t *testing.T) {
 	db, drv := newTestDB(t, []string{"id", "_score"}, nil)
 
-	_, err := Suggest(db, "products", "name", "la", WithLimit(3))
+	_, err := Suggest(ctx, db, "products", "name", "la", WithLimit(3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestSuggest_WithLimit(t *testing.T) {
 
 func TestSuggest_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Suggest(db, "bad!", "name", "test")
+	_, err := Suggest(ctx, db, "bad!", "name", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -521,7 +521,7 @@ func TestSuggest_InvalidTable(t *testing.T) {
 func TestFacets_BasicSQL(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value", "count"}, nil)
 
-	_, err := Facets(db, "products", "category")
+	_, err := Facets(ctx, db, "products", "category")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +545,7 @@ func TestFacets_BasicSQL(t *testing.T) {
 func TestFacets_WithQueryFilter(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value", "count"}, nil)
 
-	_, err := Facets(db, "products", "category",
+	_, err := Facets(ctx, db, "products", "category",
 		WithQuery("laptop"), WithQueryColumn("title"))
 	if err != nil {
 		t.Fatal(err)
@@ -572,7 +572,7 @@ func TestFacets_WithQueryFilter(t *testing.T) {
 func TestFacets_WithQueryFilterMultiColumn(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value", "count"}, nil)
 
-	_, err := Facets(db, "products", "category",
+	_, err := Facets(ctx, db, "products", "category",
 		WithQuery("laptop"), WithQueryColumn([]string{"title", "description"}))
 	if err != nil {
 		t.Fatal(err)
@@ -586,7 +586,7 @@ func TestFacets_WithQueryFilterMultiColumn(t *testing.T) {
 
 func TestFacets_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Facets(db, "bad!", "col")
+	_, err := Facets(ctx, db, "bad!", "col")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -594,7 +594,7 @@ func TestFacets_InvalidTable(t *testing.T) {
 
 func TestFacets_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Facets(db, "products", "bad col")
+	_, err := Facets(ctx, db, "products", "bad col")
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -602,7 +602,7 @@ func TestFacets_InvalidColumn(t *testing.T) {
 
 func TestFacets_InvalidQueryColumnType(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Facets(db, "products", "category",
+	_, err := Facets(ctx, db, "products", "category",
 		WithQuery("test"), WithQueryColumn(42))
 	if err == nil {
 		t.Fatal("expected error for invalid queryColumn type")
@@ -614,7 +614,7 @@ func TestFacets_InvalidQueryColumnType(t *testing.T) {
 func TestAggregate_Count(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "id", "count")
+	_, err := Aggregate(ctx, db, "orders", "id", "count")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,7 +631,7 @@ func TestAggregate_Count(t *testing.T) {
 func TestAggregate_Sum(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "total", "sum")
+	_, err := Aggregate(ctx, db, "orders", "total", "sum")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +644,7 @@ func TestAggregate_Sum(t *testing.T) {
 func TestAggregate_Avg(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "amount", "avg")
+	_, err := Aggregate(ctx, db, "orders", "amount", "avg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +656,7 @@ func TestAggregate_Avg(t *testing.T) {
 func TestAggregate_Min(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "price", "min")
+	_, err := Aggregate(ctx, db, "orders", "price", "min")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +668,7 @@ func TestAggregate_Min(t *testing.T) {
 func TestAggregate_Max(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "price", "max")
+	_, err := Aggregate(ctx, db, "orders", "price", "max")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestAggregate_Max(t *testing.T) {
 func TestAggregate_WithGroupBy(t *testing.T) {
 	db, drv := newTestDB(t, []string{"category", "value"}, nil)
 
-	_, err := Aggregate(db, "orders", "total", "sum", WithGroupBy("category"))
+	_, err := Aggregate(ctx, db, "orders", "total", "sum", WithGroupBy("category"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +702,7 @@ func TestAggregate_WithGroupBy(t *testing.T) {
 
 func TestAggregate_InvalidFunc(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Aggregate(db, "orders", "total", "median")
+	_, err := Aggregate(ctx, db, "orders", "total", "median")
 	if err == nil {
 		t.Fatal("expected error for invalid aggregate function")
 	}
@@ -711,7 +711,7 @@ func TestAggregate_InvalidFunc(t *testing.T) {
 
 func TestAggregate_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Aggregate(db, "bad!", "total", "sum")
+	_, err := Aggregate(ctx, db, "bad!", "total", "sum")
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -719,7 +719,7 @@ func TestAggregate_InvalidTable(t *testing.T) {
 
 func TestAggregate_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Aggregate(db, "orders", "bad col", "sum")
+	_, err := Aggregate(ctx, db, "orders", "bad col", "sum")
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -727,7 +727,7 @@ func TestAggregate_InvalidColumn(t *testing.T) {
 
 func TestAggregate_InvalidGroupBy(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Aggregate(db, "orders", "total", "sum", WithGroupBy("bad col"))
+	_, err := Aggregate(ctx, db, "orders", "total", "sum", WithGroupBy("bad col"))
 	if err == nil {
 		t.Fatal("expected error for invalid groupBy column")
 	}
@@ -736,7 +736,7 @@ func TestAggregate_InvalidGroupBy(t *testing.T) {
 func TestAggregate_CaseInsensitiveFunc(t *testing.T) {
 	db, drv := newTestDB(t, []string{"value"}, nil)
 
-	_, err := Aggregate(db, "orders", "total", "SUM")
+	_, err := Aggregate(ctx, db, "orders", "total", "SUM")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +752,7 @@ func TestCreateSearchConfig_SQLGeneration(t *testing.T) {
 
 	// The QueryRow for checking existence will return no rows (default mock behavior),
 	// triggering the CREATE statement
-	err := CreateSearchConfig(db, "my_config", "english")
+	err := CreateSearchConfig(ctx, db, "my_config", "english")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +773,7 @@ func TestCreateSearchConfig_SQLGeneration(t *testing.T) {
 func TestCreateSearchConfig_DefaultCopyFrom(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := CreateSearchConfig(db, "custom_cfg", "")
+	err := CreateSearchConfig(ctx, db, "custom_cfg", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -786,7 +786,7 @@ func TestCreateSearchConfig_DefaultCopyFrom(t *testing.T) {
 
 func TestCreateSearchConfig_InvalidName(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	err := CreateSearchConfig(db, "bad name!", "english")
+	err := CreateSearchConfig(ctx, db, "bad name!", "english")
 	if err == nil {
 		t.Fatal("expected error for invalid config name")
 	}
@@ -794,7 +794,7 @@ func TestCreateSearchConfig_InvalidName(t *testing.T) {
 
 func TestCreateSearchConfig_InvalidCopyFrom(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	err := CreateSearchConfig(db, "mycfg", "bad from!")
+	err := CreateSearchConfig(ctx, db, "mycfg", "bad from!")
 	if err == nil {
 		t.Fatal("expected error for invalid copyFrom name")
 	}
@@ -805,7 +805,7 @@ func TestCreateSearchConfig_InvalidCopyFrom(t *testing.T) {
 func TestPercolateAdd_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := PercolateAdd(db, "my_percolator", "q1", "breaking news")
+	err := PercolateAdd(ctx, db, "my_percolator", "q1", "breaking news")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -842,7 +842,7 @@ func TestPercolateAdd_SQLGeneration(t *testing.T) {
 func TestPercolateAdd_WithMetadata(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := PercolateAdd(db, "percolator", "q1", "test",
+	err := PercolateAdd(ctx, db, "percolator", "q1", "test",
 		WithMetadata(`{"priority":"high"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -858,7 +858,7 @@ func TestPercolateAdd_WithMetadata(t *testing.T) {
 func TestPercolateAdd_WithLang(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := PercolateAdd(db, "percolator", "q1", "bonjour", WithLang("french"))
+	err := PercolateAdd(ctx, db, "percolator", "q1", "bonjour", WithLang("french"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -872,7 +872,7 @@ func TestPercolateAdd_WithLang(t *testing.T) {
 
 func TestPercolateAdd_InvalidName(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	err := PercolateAdd(db, "bad name!", "q1", "test")
+	err := PercolateAdd(ctx, db, "bad name!", "q1", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid percolator name")
 	}
@@ -883,7 +883,7 @@ func TestPercolateAdd_InvalidName(t *testing.T) {
 func TestPercolate_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, []string{"query_id", "query_text", "metadata", "_score"}, nil)
 
-	_, err := Percolate(db, "my_percolator", "A breaking news story about technology")
+	_, err := Percolate(ctx, db, "my_percolator", "A breaking news story about technology")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +913,7 @@ func TestPercolate_SQLGeneration(t *testing.T) {
 func TestPercolate_WithLang(t *testing.T) {
 	db, drv := newTestDB(t, []string{"query_id", "query_text", "metadata", "_score"}, nil)
 
-	_, err := Percolate(db, "percolator", "bonjour le monde", WithLang("french"))
+	_, err := Percolate(ctx, db, "percolator", "bonjour le monde", WithLang("french"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,7 +927,7 @@ func TestPercolate_WithLang(t *testing.T) {
 func TestPercolate_WithLimit(t *testing.T) {
 	db, drv := newTestDB(t, []string{"query_id", "query_text", "metadata", "_score"}, nil)
 
-	_, err := Percolate(db, "percolator", "test", WithLimit(5))
+	_, err := Percolate(ctx, db, "percolator", "test", WithLimit(5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -940,7 +940,7 @@ func TestPercolate_WithLimit(t *testing.T) {
 
 func TestPercolate_InvalidName(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := Percolate(db, "bad name!", "test")
+	_, err := Percolate(ctx, db, "bad name!", "test")
 	if err == nil {
 		t.Fatal("expected error for invalid percolator name")
 	}
@@ -951,7 +951,7 @@ func TestPercolate_InvalidName(t *testing.T) {
 func TestPercolateDelete_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := PercolateDelete(db, "my_percolator", "q1")
+	_, err := PercolateDelete(ctx, db, "my_percolator", "q1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -969,7 +969,7 @@ func TestPercolateDelete_SQLGeneration(t *testing.T) {
 
 func TestPercolateDelete_InvalidName(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := PercolateDelete(db, "bad name!", "q1")
+	_, err := PercolateDelete(ctx, db, "bad name!", "q1")
 	if err == nil {
 		t.Fatal("expected error for invalid percolator name")
 	}
@@ -982,7 +982,7 @@ func TestAnalyze_SQLGeneration(t *testing.T) {
 		[]string{"alias", "description", "token", "dictionaries", "dictionary", "lexemes"},
 		nil)
 
-	_, err := Analyze(db, "The quick brown fox")
+	_, err := Analyze(ctx, db, "The quick brown fox")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,7 +1010,7 @@ func TestAnalyze_WithLang(t *testing.T) {
 		[]string{"alias", "description", "token", "dictionaries", "dictionary", "lexemes"},
 		nil)
 
-	_, err := Analyze(db, "Le renard brun rapide", WithLang("french"))
+	_, err := Analyze(ctx, db, "Le renard brun rapide", WithLang("french"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1028,7 +1028,7 @@ func TestExplainScore_SQLGeneration(t *testing.T) {
 		[]string{"document_text", "document_tokens", "query_tokens", "matches", "score", "headline"},
 		[][]driver.Value{{"hello world", "'hello':1 'world':2", "'hello'", true, 0.5, "**hello** world"}})
 
-	result, err := ExplainScore(db, "articles", "title", "hello", "id", 42)
+	result, err := ExplainScore(ctx, db, "articles", "title", "hello", "id", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1065,7 @@ func TestExplainScore_NotFound(t *testing.T) {
 		[]string{"document_text", "document_tokens", "query_tokens", "matches", "score", "headline"},
 		nil) // no rows
 
-	result, err := ExplainScore(db, "articles", "title", "hello", "id", 999)
+	result, err := ExplainScore(ctx, db, "articles", "title", "hello", "id", 999)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1080,7 +1080,7 @@ func TestExplainScore_WithLang(t *testing.T) {
 		[]string{"document_text", "document_tokens", "query_tokens", "matches", "score", "headline"},
 		[][]driver.Value{{"bonjour", "'bonjour':1", "'bonjour'", true, 0.5, "**bonjour**"}})
 
-	_, err := ExplainScore(db, "articles", "title", "bonjour", "id", 1, WithLang("french"))
+	_, err := ExplainScore(ctx, db, "articles", "title", "bonjour", "id", 1, WithLang("french"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1093,7 +1093,7 @@ func TestExplainScore_WithLang(t *testing.T) {
 
 func TestExplainScore_InvalidTable(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := ExplainScore(db, "bad!", "title", "test", "id", 1)
+	_, err := ExplainScore(ctx, db, "bad!", "title", "test", "id", 1)
 	if err == nil {
 		t.Fatal("expected error for invalid table name")
 	}
@@ -1101,7 +1101,7 @@ func TestExplainScore_InvalidTable(t *testing.T) {
 
 func TestExplainScore_InvalidColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := ExplainScore(db, "articles", "bad col", "test", "id", 1)
+	_, err := ExplainScore(ctx, db, "articles", "bad col", "test", "id", 1)
 	if err == nil {
 		t.Fatal("expected error for invalid column name")
 	}
@@ -1109,7 +1109,7 @@ func TestExplainScore_InvalidColumn(t *testing.T) {
 
 func TestExplainScore_InvalidIdColumn(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
-	_, err := ExplainScore(db, "articles", "title", "test", "bad!", 1)
+	_, err := ExplainScore(ctx, db, "articles", "title", "test", "bad!", 1)
 	if err == nil {
 		t.Fatal("expected error for invalid id column name")
 	}

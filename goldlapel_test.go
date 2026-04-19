@@ -1,6 +1,7 @@
 package goldlapel
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -354,49 +355,68 @@ func TestWaitForPortClosedPort(t *testing.T) {
 
 // --- GoldLapel struct tests ---
 
+// buildForTest constructs a *GoldLapel without spawning the binary. Used by
+// unit tests that exercise field-level behaviour (Port, DashboardURL parsing,
+// Stop idempotency on an unstarted instance, etc.).
+func buildForTest(upstream string, opts ...Option) *GoldLapel {
+	gl := &GoldLapel{
+		upstream:      upstream,
+		port:          DefaultPort,
+		dashboardPort: DefaultDashboardPort,
+	}
+	for _, opt := range opts {
+		opt.applyStart(gl)
+	}
+	if gl.config != nil {
+		if dp, ok := gl.config["dashboard_port"]; ok {
+			gl.dashboardPort = toInt(dp)
+		}
+	}
+	return gl
+}
+
 func TestDefaultPort(t *testing.T) {
-	gl := New("postgresql://user:pass@localhost:5432/mydb")
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	if gl.Port() != 7932 {
 		t.Fatalf("expected default port 7932, got %d", gl.Port())
 	}
 }
 
 func TestCustomPort(t *testing.T) {
-	gl := New("postgresql://user:pass@localhost:5432/mydb", WithPort(9000))
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithPort(9000))
 	if gl.Port() != 9000 {
 		t.Fatalf("expected port 9000, got %d", gl.Port())
 	}
 }
 
 func TestNotRunningBeforeStart(t *testing.T) {
-	gl := New("postgresql://user:pass@localhost:5432/mydb")
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	if gl.Running() {
 		t.Fatal("expected Running() to be false before Start()")
 	}
 }
 
 func TestStopNoOp(t *testing.T) {
-	gl := New("postgresql://user:pass@localhost:5432/mydb")
-	if err := gl.Stop(); err != nil {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	if err := gl.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() on unstarted instance should not error, got: %v", err)
 	}
 }
 
 func TestStopIdempotent(t *testing.T) {
-	gl := New("postgresql://user:pass@localhost:5432/mydb")
-	if err := gl.Stop(); err != nil {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	if err := gl.Stop(context.Background()); err != nil {
 		t.Fatalf("first Stop() failed: %v", err)
 	}
-	if err := gl.Stop(); err != nil {
+	if err := gl.Stop(context.Background()); err != nil {
 		t.Fatalf("second Stop() failed: %v", err)
 	}
 }
 
-// --- Singleton tests ---
-
-func TestProxyURLEmptyWhenNotStarted(t *testing.T) {
-	if url := ProxyURL(); url != "" {
-		t.Fatalf("expected empty ProxyURL(), got %q", url)
+func TestCloseMirrorsStop(t *testing.T) {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	if err := gl.Close(); err != nil {
+		t.Fatalf("Close() on unstarted instance should not error, got: %v", err)
 	}
 }
 
@@ -572,14 +592,14 @@ func TestConfigKeys_IsSorted(t *testing.T) {
 // --- DashboardURL tests ---
 
 func TestDashboardURLDefaultPort(t *testing.T) {
-	gl := New("postgresql://localhost:5432/mydb")
+	gl := buildForTest("postgresql://localhost:5432/mydb")
 	if gl.dashboardPort != 7933 {
 		t.Fatalf("expected default dashboard port 7933, got %d", gl.dashboardPort)
 	}
 }
 
 func TestDashboardURLCustomPort(t *testing.T) {
-	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
 		"dashboard_port": 8080,
 	}))
 	if gl.dashboardPort != 8080 {
@@ -588,7 +608,7 @@ func TestDashboardURLCustomPort(t *testing.T) {
 }
 
 func TestDashboardURLDisabled(t *testing.T) {
-	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
 		"dashboard_port": 0,
 	}))
 	if gl.dashboardPort != 0 {
@@ -600,24 +620,18 @@ func TestDashboardURLDisabled(t *testing.T) {
 }
 
 func TestDashboardURLNotRunning(t *testing.T) {
-	gl := New("postgresql://localhost:5432/mydb")
+	gl := buildForTest("postgresql://localhost:5432/mydb")
 	if url := gl.DashboardURL(); url != "" {
 		t.Fatalf("expected empty DashboardURL when not running, got %q", url)
 	}
 }
 
 func TestDashboardPortFromConfigString(t *testing.T) {
-	gl := New("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
 		"dashboard_port": "9090",
 	}))
 	if gl.dashboardPort != 9090 {
 		t.Fatalf("expected dashboard port 9090, got %d", gl.dashboardPort)
-	}
-}
-
-func TestDashboardURLSingletonEmptyWhenNotStarted(t *testing.T) {
-	if url := DashboardURL(); url != "" {
-		t.Fatalf("expected empty DashboardURL(), got %q", url)
 	}
 }
 
@@ -626,7 +640,7 @@ func TestWithConfig_Integration(t *testing.T) {
 		"mode":      "waiter",
 		"pool_size": 20,
 	}
-	gl := New("postgresql://user:pass@localhost:5432/mydb", WithConfig(config))
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithConfig(config))
 	if gl.config == nil {
 		t.Fatal("expected config to be set")
 	}

@@ -1,12 +1,16 @@
 package goldlapel
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+// ctx is the default context used by all package-level helper tests below.
+var ctx = context.Background()
 
 // --- DocInsert ---
 
@@ -15,7 +19,7 @@ func TestDocInsert_SQLGeneration(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		[][]driver.Value{{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"}})
 
-	result, err := DocInsert(db, "users", map[string]interface{}{"name": "alice"})
+	result, err := DocInsert(ctx, db, "users", map[string]interface{}{"name": "alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +49,7 @@ func TestDocInsert_SQLGeneration(t *testing.T) {
 func TestDocInsert_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocInsert(db, "drop table;--", map[string]interface{}{})
+	_, err := DocInsert(ctx, db, "drop table;--", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -66,7 +70,7 @@ func TestDocInsertMany_SQLGeneration(t *testing.T) {
 		map[string]interface{}{"name": "alice"},
 		map[string]interface{}{"name": "bob"},
 	}
-	results, err := DocInsertMany(db, "users", docs)
+	results, err := DocInsertMany(ctx, db, "users", docs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +97,7 @@ func TestDocInsertMany_SQLGeneration(t *testing.T) {
 func TestDocInsertMany_Empty(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	results, err := DocInsertMany(db, "users", nil)
+	results, err := DocInsertMany(ctx, db, "users", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +115,7 @@ func TestDocFind_NoFilter(t *testing.T) {
 			{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
-	results, err := DocFind(db, "users", nil)
+	results, err := DocFind(ctx, db, "users", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +138,7 @@ func TestDocFind_WithFilter(t *testing.T) {
 			{int64(1), `{"role":"admin"}`, "2026-01-01T00:00:00Z"},
 		})
 
-	_, err := DocFind(db, "users", map[string]string{"role": "admin"})
+	_, err := DocFind(ctx, db, "users", map[string]string{"role": "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +153,7 @@ func TestDocFind_EmptyFilter(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]string{})
+	_, err := DocFind(ctx, db, "users", map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +168,7 @@ func TestDocFind_WithSort(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", nil, DocSort(map[string]int{"name": 1, "age": -1}))
+	_, err := DocFind(ctx, db, "users", nil, DocSort(map[string]int{"name": 1, "age": -1}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +183,7 @@ func TestDocFind_WithLimitAndSkip(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", nil, DocLimit(10), DocSkip(20))
+	_, err := DocFind(ctx, db, "users", nil, DocLimit(10), DocSkip(20))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +203,7 @@ func TestDocFind_WithLimitAndSkip(t *testing.T) {
 func TestDocFind_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocFind(db, "123bad", nil)
+	_, err := DocFind(ctx, db, "123bad", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -214,7 +218,7 @@ func TestDocFindOne_WithFilter(t *testing.T) {
 			{int64(1), `{"name":"alice"}`, "2026-01-01T00:00:00Z"},
 		})
 
-	result, err := DocFindOne(db, "users", map[string]string{"name": "alice"})
+	result, err := DocFindOne(ctx, db, "users", map[string]string{"name": "alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +237,7 @@ func TestDocFindOne_NotFound(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	result, err := DocFindOne(db, "users", map[string]string{"name": "nobody"})
+	result, err := DocFindOne(ctx, db, "users", map[string]string{"name": "nobody"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +251,7 @@ func TestDocFindOne_NotFound(t *testing.T) {
 func TestDocUpdate_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := DocUpdate(db, "users",
+	_, err := DocUpdate(ctx, db, "users",
 		map[string]string{"role": "user"},
 		map[string]string{"role": "admin"})
 	if err != nil {
@@ -261,7 +265,7 @@ func TestDocUpdate_SQLGeneration(t *testing.T) {
 func TestDocUpdate_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocUpdate(db, "bad name!", nil, nil)
+	_, err := DocUpdate(ctx, db, "bad name!", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -272,7 +276,7 @@ func TestDocUpdate_InvalidCollection(t *testing.T) {
 func TestDocUpdateOne_CTEWithLimit1(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := DocUpdateOne(db, "users",
+	_, err := DocUpdateOne(ctx, db, "users",
 		map[string]string{"role": "user"},
 		map[string]string{"role": "admin"})
 	if err != nil {
@@ -291,7 +295,7 @@ func TestDocUpdateOne_CTEWithLimit1(t *testing.T) {
 func TestDocDelete_SQLGeneration(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := DocDelete(db, "users", map[string]string{"role": "banned"})
+	_, err := DocDelete(ctx, db, "users", map[string]string{"role": "banned"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +307,7 @@ func TestDocDelete_SQLGeneration(t *testing.T) {
 func TestDocDelete_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocDelete(db, "1invalid", nil)
+	_, err := DocDelete(ctx, db, "1invalid", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -314,7 +318,7 @@ func TestDocDelete_InvalidCollection(t *testing.T) {
 func TestDocDeleteOne_CTEWithLimit1(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := DocDeleteOne(db, "users", map[string]string{"name": "alice"})
+	_, err := DocDeleteOne(ctx, db, "users", map[string]string{"name": "alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +336,7 @@ func TestDocCount_NoFilter(t *testing.T) {
 		[]string{"count"},
 		[][]driver.Value{{int64(42)}})
 
-	count, err := DocCount(db, "users", nil)
+	count, err := DocCount(ctx, db, "users", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +355,7 @@ func TestDocCount_WithFilter(t *testing.T) {
 		[]string{"count"},
 		[][]driver.Value{{int64(5)}})
 
-	count, err := DocCount(db, "users", map[string]string{"role": "admin"})
+	count, err := DocCount(ctx, db, "users", map[string]string{"role": "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +373,7 @@ func TestDocCount_EmptyFilter(t *testing.T) {
 		[]string{"count"},
 		[][]driver.Value{{int64(10)}})
 
-	_, err := DocCount(db, "users", map[string]string{})
+	_, err := DocCount(ctx, db, "users", map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +385,7 @@ func TestDocCount_EmptyFilter(t *testing.T) {
 func TestDocCount_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocCount(db, "bad;name", nil)
+	_, err := DocCount(ctx, db, "bad;name", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -392,7 +396,7 @@ func TestDocCount_InvalidCollection(t *testing.T) {
 func TestDocCreateIndex_FullIndex(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(db, "users")
+	err := DocCreateIndex(ctx, db, "users")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +410,7 @@ func TestDocCreateIndex_FullIndex(t *testing.T) {
 func TestDocCreateIndex_SingleKey(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(db, "users", "email")
+	err := DocCreateIndex(ctx, db, "users", "email")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +423,7 @@ func TestDocCreateIndex_SingleKey(t *testing.T) {
 func TestDocCreateIndex_MultipleKeys(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(db, "users", "first_name", "last_name")
+	err := DocCreateIndex(ctx, db, "users", "first_name", "last_name")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +437,7 @@ func TestDocCreateIndex_MultipleKeys(t *testing.T) {
 func TestDocCreateIndex_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(db, "bad;name")
+	err := DocCreateIndex(ctx, db, "bad;name")
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -442,7 +446,7 @@ func TestDocCreateIndex_InvalidCollection(t *testing.T) {
 func TestDocCreateIndex_InvalidKey(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	err := DocCreateIndex(db, "users", "bad;key")
+	err := DocCreateIndex(ctx, db, "users", "bad;key")
 	if err == nil {
 		t.Fatal("expected error for invalid key name")
 	}
@@ -458,18 +462,18 @@ func TestDoc_AllFunctions_RejectSQLInjection(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"DocInsert", func() error { _, err := DocInsert(db, badName, map[string]string{}); return err }},
-		{"DocInsertMany", func() error { _, err := DocInsertMany(db, badName, []interface{}{map[string]string{"a": "b"}}); return err }},
-		{"DocFind", func() error { _, err := DocFind(db, badName, nil); return err }},
-		{"DocFindOne", func() error { _, err := DocFindOne(db, badName, nil); return err }},
-		{"DocUpdate", func() error { _, err := DocUpdate(db, badName, nil, nil); return err }},
-		{"DocUpdateOne", func() error { _, err := DocUpdateOne(db, badName, nil, nil); return err }},
-		{"DocDelete", func() error { _, err := DocDelete(db, badName, nil); return err }},
-		{"DocDeleteOne", func() error { _, err := DocDeleteOne(db, badName, nil); return err }},
-		{"DocCount", func() error { _, err := DocCount(db, badName, nil); return err }},
-		{"DocCreateIndex", func() error { return DocCreateIndex(db, badName) }},
+		{"DocInsert", func() error { _, err := DocInsert(ctx, db, badName, map[string]string{}); return err }},
+		{"DocInsertMany", func() error { _, err := DocInsertMany(ctx, db, badName, []interface{}{map[string]string{"a": "b"}}); return err }},
+		{"DocFind", func() error { _, err := DocFind(ctx, db, badName, nil); return err }},
+		{"DocFindOne", func() error { _, err := DocFindOne(ctx, db, badName, nil); return err }},
+		{"DocUpdate", func() error { _, err := DocUpdate(ctx, db, badName, nil, nil); return err }},
+		{"DocUpdateOne", func() error { _, err := DocUpdateOne(ctx, db, badName, nil, nil); return err }},
+		{"DocDelete", func() error { _, err := DocDelete(ctx, db, badName, nil); return err }},
+		{"DocDeleteOne", func() error { _, err := DocDeleteOne(ctx, db, badName, nil); return err }},
+		{"DocCount", func() error { _, err := DocCount(ctx, db, badName, nil); return err }},
+		{"DocCreateIndex", func() error { return DocCreateIndex(ctx, db, badName) }},
 		{"DocAggregate", func() error {
-			_, err := DocAggregate(db, badName, []map[string]interface{}{{"$match": nil}})
+			_, err := DocAggregate(ctx, db, badName, []map[string]interface{}{{"$match": nil}})
 			return err
 		}},
 	}
@@ -525,7 +529,7 @@ func TestDocFind_InvalidSortKey(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", nil, DocSort(map[string]int{"bad;key": 1}))
+	_, err := DocFind(ctx, db, "users", nil, DocSort(map[string]int{"bad;key": 1}))
 	if err == nil {
 		t.Fatal("expected error for invalid sort key")
 	}
@@ -553,7 +557,7 @@ func TestDocAggregate_FullPipeline(t *testing.T) {
 		{"$skip": float64(5)},
 	}
 
-	results, err := DocAggregate(db, "orders", pipeline)
+	results, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +598,7 @@ func TestDocAggregate_Accumulators(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "products", pipeline)
+	_, err := DocAggregate(ctx, db, "products", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +625,7 @@ func TestDocAggregate_NullID(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "orders", pipeline)
+	results, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +651,7 @@ func TestDocAggregate_MatchOnly(t *testing.T) {
 		{"$match": map[string]interface{}{"status": "active"}},
 	}
 
-	results, err := DocAggregate(db, "users", pipeline)
+	results, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +678,7 @@ func TestDocAggregate_SortWithoutGroup(t *testing.T) {
 		{"$sort": map[string]interface{}{"name": float64(1), "age": float64(-1)}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +702,7 @@ func TestDocAggregate_SortWithGroup(t *testing.T) {
 		{"$sort": map[string]interface{}{"total": float64(-1)}},
 	}
 
-	_, err := DocAggregate(db, "products", pipeline)
+	_, err := DocAggregate(ctx, db, "products", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +720,7 @@ func TestDocAggregate_UnsupportedStage(t *testing.T) {
 		{"$bucket": map[string]interface{}{"groupBy": "$price"}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err == nil {
 		t.Fatal("expected error for unsupported pipeline stage")
 	}
@@ -726,7 +730,7 @@ func TestDocAggregate_UnsupportedStage(t *testing.T) {
 func TestDocAggregate_EmptyPipeline(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	results, err := DocAggregate(db, "users", nil)
+	results, err := DocAggregate(ctx, db, "users", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +742,7 @@ func TestDocAggregate_EmptyPipeline(t *testing.T) {
 func TestDocAggregate_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocAggregate(db, "bad;name", []map[string]interface{}{
+	_, err := DocAggregate(ctx, db, "bad;name", []map[string]interface{}{
 		{"$match": map[string]interface{}{"a": "b"}},
 	})
 	if err == nil {
@@ -754,7 +758,7 @@ func TestDocAggregate_MultipleKeysInStage(t *testing.T) {
 		{"$match": nil, "$sort": map[string]interface{}{"x": float64(1)}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err == nil {
 		t.Fatal("expected error for stage with multiple keys")
 	}
@@ -768,7 +772,7 @@ func TestBuildFilter_GtNumeric(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"age": map[string]interface{}{"$gt": float64(21)},
 	})
 	if err != nil {
@@ -785,7 +789,7 @@ func TestBuildFilter_GteLteRange(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"score": map[string]interface{}{
 			"$gte": float64(50),
 			"$lte": float64(100),
@@ -805,7 +809,7 @@ func TestBuildFilter_LtString(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"name": map[string]interface{}{"$lt": "M"},
 	})
 	if err != nil {
@@ -822,7 +826,7 @@ func TestBuildFilter_EqAndNe(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"role":   map[string]interface{}{"$eq": "admin"},
 		"status": map[string]interface{}{"$ne": "banned"},
 	})
@@ -840,7 +844,7 @@ func TestBuildFilter_In(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"role": map[string]interface{}{
 			"$in": []interface{}{"admin", "editor"},
 		},
@@ -858,7 +862,7 @@ func TestBuildFilter_Nin(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"status": map[string]interface{}{
 			"$nin": []interface{}{"banned", "deleted"},
 		},
@@ -876,7 +880,7 @@ func TestBuildFilter_Exists(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"email": map[string]interface{}{"$exists": true},
 	})
 	if err != nil {
@@ -892,7 +896,7 @@ func TestBuildFilter_NotExists(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"phone": map[string]interface{}{"$exists": false},
 	})
 	if err != nil {
@@ -908,7 +912,7 @@ func TestBuildFilter_Regex(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"email": map[string]interface{}{"$regex": ".*@example\\.com$"},
 	})
 	if err != nil {
@@ -924,7 +928,7 @@ func TestBuildFilter_DotNotation(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"address.city": map[string]interface{}{"$eq": "Portland"},
 	})
 	if err != nil {
@@ -940,7 +944,7 @@ func TestBuildFilter_MixedContainmentAndOperators(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"role": "admin",
 		"age":  map[string]interface{}{"$gte": float64(18)},
 	})
@@ -959,7 +963,7 @@ func TestBuildFilter_InvalidDotKey(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"bad;key.field": map[string]interface{}{"$gt": float64(1)},
 	})
 	if err == nil {
@@ -1036,7 +1040,7 @@ func TestBuildFilter_DotNotationContainment(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"addr.city": "NY",
 	})
 	if err != nil {
@@ -1068,7 +1072,7 @@ func TestBuildFilter_DotNotationContainmentDeep(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"addr.geo.lat": float64(40.7),
 	})
 	if err != nil {
@@ -1103,7 +1107,7 @@ func TestBuildFilter_UnsupportedOperator(t *testing.T) {
 		[]string{"id", "data", "created_at"},
 		nil)
 
-	_, err := DocFind(db, "users", map[string]interface{}{
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
 		"age": map[string]interface{}{"$bogus": float64(1)},
 	})
 	if err == nil {
@@ -1115,7 +1119,7 @@ func TestBuildFilter_UnsupportedOperator(t *testing.T) {
 func TestBuildFilter_OperatorsInDocDelete(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	_, err := DocDelete(db, "users", map[string]interface{}{
+	_, err := DocDelete(ctx, db, "users", map[string]interface{}{
 		"age": map[string]interface{}{"$lt": float64(18)},
 	})
 	if err != nil {
@@ -1132,7 +1136,7 @@ func TestBuildFilter_OperatorsInDocCount(t *testing.T) {
 		[]string{"count"},
 		[][]driver.Value{{int64(3)}})
 
-	_, err := DocCount(db, "users", map[string]interface{}{
+	_, err := DocCount(ctx, db, "users", map[string]interface{}{
 		"score": map[string]interface{}{"$gte": float64(90)},
 	})
 	if err != nil {
@@ -1160,7 +1164,7 @@ func TestDocAggregate_CompositeID(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "sales", pipeline)
+	results, err := DocAggregate(ctx, db, "sales", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1204,7 +1208,7 @@ func TestDocAggregate_CompositeID_WithMatch(t *testing.T) {
 		{"$sort": map[string]interface{}{"count": float64(-1)}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1225,7 +1229,7 @@ func TestDocAggregate_CompositeID_EmptyMap(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "orders", pipeline)
+	_, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err == nil {
 		t.Fatal("expected error for empty composite _id map")
 	}
@@ -1241,7 +1245,7 @@ func TestDocAggregate_CompositeID_InvalidField(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "orders", pipeline)
+	_, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err == nil {
 		t.Fatal("expected error for invalid field in composite _id")
 	}
@@ -1264,7 +1268,7 @@ func TestDocAggregate_Push(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "employees", pipeline)
+	results, err := DocAggregate(ctx, db, "employees", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1299,7 +1303,7 @@ func TestDocAggregate_AddToSet(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "offices", pipeline)
+	results, err := DocAggregate(ctx, db, "offices", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1334,7 +1338,7 @@ func TestDocAggregate_PushWithCompositeID(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "products", pipeline)
+	results, err := DocAggregate(ctx, db, "products", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1373,7 +1377,7 @@ func TestDocAggregate_AddToSetInvalidField(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "employees", pipeline)
+	_, err := DocAggregate(ctx, db, "employees", pipeline)
 	if err == nil {
 		t.Fatal("expected error for invalid $addToSet field reference")
 	}
@@ -1396,7 +1400,7 @@ func TestDocAggregate_ProjectIncludeFields(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "users", pipeline)
+	results, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1426,7 +1430,7 @@ func TestDocAggregate_ProjectExcludeID(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1449,7 +1453,7 @@ func TestDocAggregate_ProjectRename(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1475,7 +1479,7 @@ func TestDocAggregate_ProjectWithMatch(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1496,7 +1500,7 @@ func TestDocAggregate_ProjectInvalidField(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "users", pipeline)
+	_, err := DocAggregate(ctx, db, "users", pipeline)
 	if err == nil {
 		t.Fatal("expected error for invalid $project field")
 	}
@@ -1514,7 +1518,7 @@ func TestDocAggregate_UnwindString(t *testing.T) {
 		{"$unwind": "$tags"},
 	}
 
-	_, err := DocAggregate(db, "items", pipeline)
+	_, err := DocAggregate(ctx, db, "items", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1533,7 +1537,7 @@ func TestDocAggregate_UnwindMap(t *testing.T) {
 		{"$unwind": map[string]interface{}{"path": "$colors"}},
 	}
 
-	_, err := DocAggregate(db, "products", pipeline)
+	_, err := DocAggregate(ctx, db, "products", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1557,7 +1561,7 @@ func TestDocAggregate_UnwindThenGroup(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "books", pipeline)
+	results, err := DocAggregate(ctx, db, "books", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1584,7 +1588,7 @@ func TestDocAggregate_UnwindInvalidField(t *testing.T) {
 		{"$unwind": "$bad;field"},
 	}
 
-	_, err := DocAggregate(db, "items", pipeline)
+	_, err := DocAggregate(ctx, db, "items", pipeline)
 	if err == nil {
 		t.Fatal("expected error for invalid $unwind field")
 	}
@@ -1598,7 +1602,7 @@ func TestDocAggregate_UnwindInvalidFormat(t *testing.T) {
 		{"$unwind": "no_dollar_prefix"},
 	}
 
-	_, err := DocAggregate(db, "items", pipeline)
+	_, err := DocAggregate(ctx, db, "items", pipeline)
 	if err == nil {
 		t.Fatal("expected error for $unwind without $ prefix")
 	}
@@ -1623,7 +1627,7 @@ func TestDocAggregate_Lookup(t *testing.T) {
 		}},
 	}
 
-	results, err := DocAggregate(db, "orders", pipeline)
+	results, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1657,7 +1661,7 @@ func TestDocAggregate_LookupMissingRequiredField(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "orders", pipeline)
+	_, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err == nil {
 		t.Fatal("expected error for missing $lookup field")
 	}
@@ -1676,7 +1680,7 @@ func TestDocAggregate_LookupInvalidFrom(t *testing.T) {
 		}},
 	}
 
-	_, err := DocAggregate(db, "orders", pipeline)
+	_, err := DocAggregate(ctx, db, "orders", pipeline)
 	if err == nil {
 		t.Fatal("expected error for invalid $lookup from collection")
 	}
@@ -1691,7 +1695,7 @@ func TestDocWatch_TriggerDDL(t *testing.T) {
 
 	// DocWatch executes DDL synchronously then starts a listener goroutine.
 	// The goroutine will hang on a fake conn, but we only need to verify DDL.
-	_, err := DocWatch(db, "postgresql://127.0.0.1:1/db", "events", func(op, data string) {})
+	_, err := DocWatch(ctx, db, "postgresql://127.0.0.1:1/db", "events", func(op, data string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1729,7 +1733,7 @@ func TestDocWatch_TriggerDDL(t *testing.T) {
 func TestDocWatch_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	_, err := DocWatch(db, "postgresql://fake/db", "bad;name", func(op, data string) {})
+	_, err := DocWatch(ctx, db, "postgresql://fake/db", "bad;name", func(op, data string) {})
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -1741,7 +1745,7 @@ func TestDocWatch_InvalidCollection(t *testing.T) {
 func TestDocUnwatch_DropsDDL(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocUnwatch(db, "events")
+	err := DocUnwatch(ctx, db, "events")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1757,7 +1761,7 @@ func TestDocUnwatch_DropsDDL(t *testing.T) {
 func TestDocUnwatch_InvalidCollection(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
-	err := DocUnwatch(db, "bad name!")
+	err := DocUnwatch(ctx, db, "bad name!")
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
@@ -1769,7 +1773,7 @@ func TestDocUnwatch_InvalidCollection(t *testing.T) {
 func TestDocCreateTtlIndex_TriggerDDL(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateTtlIndex(db, "sessions", 3600)
+	err := DocCreateTtlIndex(ctx, db, "sessions", 3600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1806,21 +1810,21 @@ func TestDocCreateTtlIndex_InvalidInputs(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
 	// Invalid collection
-	err := DocCreateTtlIndex(db, "bad;name", 3600)
+	err := DocCreateTtlIndex(ctx, db, "bad;name", 3600)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
 	assertContains(t, err.Error(), "invalid identifier")
 
 	// Zero TTL
-	err = DocCreateTtlIndex(db, "sessions", 0)
+	err = DocCreateTtlIndex(ctx, db, "sessions", 0)
 	if err == nil {
 		t.Fatal("expected error for zero TTL")
 	}
 	assertContains(t, err.Error(), "ttlSeconds must be positive")
 
 	// Negative TTL
-	err = DocCreateTtlIndex(db, "sessions", -10)
+	err = DocCreateTtlIndex(ctx, db, "sessions", -10)
 	if err == nil {
 		t.Fatal("expected error for negative TTL")
 	}
@@ -1832,7 +1836,7 @@ func TestDocCreateTtlIndex_InvalidInputs(t *testing.T) {
 func TestDocRemoveTtlIndex_DropsDDL(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocRemoveTtlIndex(db, "sessions")
+	err := DocRemoveTtlIndex(ctx, db, "sessions")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1850,7 +1854,7 @@ func TestDocRemoveTtlIndex_DropsDDL(t *testing.T) {
 func TestDocCreateCapped_TriggerDDL(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocCreateCapped(db, "logs", 1000)
+	err := DocCreateCapped(ctx, db, "logs", 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1885,21 +1889,21 @@ func TestDocCreateCapped_InvalidInputs(t *testing.T) {
 	db, _ := newTestDB(t, nil, nil)
 
 	// Invalid collection
-	err := DocCreateCapped(db, "bad;name", 100)
+	err := DocCreateCapped(ctx, db, "bad;name", 100)
 	if err == nil {
 		t.Fatal("expected error for invalid collection name")
 	}
 	assertContains(t, err.Error(), "invalid identifier")
 
 	// Zero maxDocs
-	err = DocCreateCapped(db, "logs", 0)
+	err = DocCreateCapped(ctx, db, "logs", 0)
 	if err == nil {
 		t.Fatal("expected error for zero maxDocs")
 	}
 	assertContains(t, err.Error(), "maxDocs must be positive")
 
 	// Negative maxDocs
-	err = DocCreateCapped(db, "logs", -5)
+	err = DocCreateCapped(ctx, db, "logs", -5)
 	if err == nil {
 		t.Fatal("expected error for negative maxDocs")
 	}
@@ -1911,7 +1915,7 @@ func TestDocCreateCapped_InvalidInputs(t *testing.T) {
 func TestDocRemoveCap_DropsDDL(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
-	err := DocRemoveCap(db, "logs")
+	err := DocRemoveCap(ctx, db, "logs")
 	if err != nil {
 		t.Fatal(err)
 	}
