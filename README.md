@@ -10,84 +10,128 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 go get github.com/goldlapel/goldlapel-go
 ```
 
+You also need a `database/sql` Postgres driver. `pgx` (via its stdlib adapter) is recommended; `lib/pq` also works.
+
+```bash
+go get github.com/jackc/pgx/v5
+```
+
 ## Quick Start
 
 ```go
 package main
 
 import (
-	"log"
+    "context"
+    "database/sql"
+    "log"
 
-	goldlapel "github.com/goldlapel/goldlapel-go"
+    _ "github.com/jackc/pgx/v5/stdlib" // register the "pgx" driver
+    "github.com/goldlapel/goldlapel-go"
 )
 
 func main() {
-	// Create and start the proxy — returns a database connection with L1 cache built in
-	gl := goldlapel.New("postgresql://user:pass@localhost:5432/mydb")
-	conn, err := gl.Start()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer gl.Stop()
+    ctx := context.Background()
 
-	// Use the connection directly — no driver setup needed
-	rows, err := conn.Query("SELECT * FROM users WHERE id = $1", 42)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
+    // Start the proxy. Returns a ready *GoldLapel.
+    gl, err := goldlapel.Start(ctx, "postgresql://user:pass@db/mydb",
+        goldlapel.WithPort(7932),
+        goldlapel.WithLogLevel("info"),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer gl.Stop(ctx)
+
+    // Open a pool against the proxy with any registered driver.
+    db, err := sql.Open("pgx", gl.URL())
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Normal SQL through the proxy — reads get the L1 cache automatically.
+    rows, err := db.QueryContext(ctx, "SELECT id, name FROM users LIMIT 10")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+
+    // Or use higher-level wrapper methods (document store, search, etc.).
+    hits, err := gl.Search(ctx, "articles", "body", "postgres tuning")
+    if err != nil {
+        log.Fatal(err)
+    }
+    _ = hits
 }
 ```
 
 ## API
 
-### `goldlapel.New(upstream, opts...) *GoldLapel`
+### `goldlapel.Start(ctx, upstream, opts...) (*GoldLapel, error)`
 
-Creates a new Gold Lapel proxy instance.
+Spawns the proxy binary, waits for it to accept connections, eagerly opens a `*sql.DB` pool against the proxy, and returns a ready instance. On failure, the subprocess is killed and stderr is surfaced in the error.
 
-- `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
-- `opts` — functional options: `WithPort(port)`, `WithConfig(config)`, `WithExtraArgs(args...)`
+Construction options:
 
-### `gl.Start() (*Connection, error)`
+- `WithPort(port)` — proxy port (default `7932`)
+- `WithLogLevel(level)` — proxy log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` (only trace/debug/info produce visible output; warn/error are the default level)
+- `WithConfig(map)` — structured config map mapped to CLI flags (see below)
+- `WithExtraArgs(args...)` — raw CLI arguments passed through to the binary
 
-Starts the proxy and returns a database connection with L1 cache.
+### `gl.Stop(ctx) error`
 
-### `gl.Stop() error`
-
-Stops the proxy.
+Sends SIGTERM to the proxy, closes the pool, and waits up to 5 seconds. Cancelling `ctx` forces an immediate kill. Safe to call multiple times. `gl.Close()` is available too — it calls `Stop(context.Background())` so the type satisfies `io.Closer`.
 
 ### `gl.URL() string`
 
-Returns the current proxy URL, or `""` if not running.
+Returns the proxy connection string (`postgresql://user:pass@localhost:7932/mydb`). Pass this to `sql.Open` with your driver of choice.
 
-### `gl.DashboardURL() string`
+### `gl.DB() *sql.DB`
 
-Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `""` if not running. The dashboard port defaults to 7933 and can be changed via config:
+Returns the pool opened by `Start`. Nil if no driver was registered or the initial ping failed — in that case open your own pool via `sql.Open(..., gl.URL())`.
+
+### `gl.InTx(ctx, db, fn)` — scoped transactions
 
 ```go
-gl := goldlapel.New("postgresql://user:pass@localhost:5432/mydb",
-    goldlapel.WithConfig(map[string]interface{}{
-        "dashboard_port": 8080,
-    }),
-)
-conn, err := gl.Start()
-fmt.Println(gl.DashboardURL()) // http://127.0.0.1:8080
+err := gl.InTx(ctx, db, func(gl *goldlapel.GoldLapel) error {
+    if _, err := gl.DocInsert(ctx, "events", map[string]any{"type": "order.created"}); err != nil {
+        return err
+    }
+    if _, err := gl.DocInsert(ctx, "events", map[string]any{"type": "email.sent"}); err != nil {
+        return err
+    }
+    return nil
+})
 ```
 
-Set `dashboard_port` to `0` to disable.
+`InTx` begins a transaction on `db`, hands `fn` a scoped `*GoldLapel` whose wrapper methods automatically target that transaction, and commits on success or rolls back on error or panic. Pass `nil` for `db` to reuse the pool opened at `Start` (i.e. `gl.DB()`).
 
-### Other instance methods
+### `goldlapel.WithTx(tx)` — per-call transaction
 
-`gl.Port()`, `gl.Running()`.
+Any wrapper method can take `WithTx(tx)` as the last argument to target a specific `*sql.Tx` for that one call:
+
+```go
+tx, _ := db.BeginTx(ctx, nil)
+_, _ = gl.DocInsert(ctx, "events", map[string]any{"type": "x"}, goldlapel.WithTx(tx))
+// ... more work on tx ...
+tx.Commit()
+```
+
+### Dashboard & introspection
+
+- `gl.Port() int`
+- `gl.Running() bool`
+- `gl.DashboardURL() string` — e.g. `http://127.0.0.1:7933`, or `""` if disabled
+
+The dashboard port defaults to proxy-port + 1. Set `dashboard_port: 0` in `WithConfig` to disable.
 
 ## Configuration
 
-Pass a config map using `WithConfig`:
+Pass a config map via `WithConfig`:
 
 ```go
-import goldlapel "github.com/goldlapel/goldlapel-go"
-
-gl := goldlapel.New("postgresql://user:pass@localhost/mydb",
+gl, _ := goldlapel.Start(ctx, "postgresql://user:pass@localhost/mydb",
     goldlapel.WithConfig(map[string]interface{}{
         "mode":              "waiter",
         "pool_size":         50,
@@ -95,45 +139,63 @@ gl := goldlapel.New("postgresql://user:pass@localhost/mydb",
         "replica":           []interface{}{"postgresql://user:pass@replica1/mydb"},
     }),
 )
-conn, err := gl.Start()
 ```
 
-Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Boolean keys are flags — `true` enables them. Slice keys produce repeated flags.
-
-Unknown keys return an error. To see all valid keys:
+Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Boolean keys emit a bare flag when true. Slice keys produce repeated flags. Unknown keys return an error.
 
 ```go
-goldlapel.ConfigKeys()
+goldlapel.ConfigKeys() // sorted list of all valid keys
 ```
 
-For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
-
-### Raw flags
-
-You can also pass raw CLI flags via `WithExtraArgs`:
+Or pass raw CLI flags directly:
 
 ```go
-gl := goldlapel.New(
-	"postgresql://user:pass@localhost:5432/mydb",
-	goldlapel.WithExtraArgs("--threshold-duration-ms", "200", "--refresh-interval-secs", "30"),
+gl, _ := goldlapel.Start(ctx, upstream,
+    goldlapel.WithExtraArgs("--threshold-duration-ms", "200", "--refresh-interval-secs", "30"),
 )
-conn, err := gl.Start()
 ```
 
-Or set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
+## Wrapper methods
 
-## How It Works
+Every helper is available both as a package-level function (taking `ctx`, `execQuerier`, and any args) and as a receiver method on `*GoldLapel` (which resolves the target automatically based on `InTx` / `WithTx`):
 
-This module bundles the Gold Lapel Rust binary for your platform. When you call `gl.Start()`, it:
+- **Document store**: `DocInsert`, `DocInsertMany`, `DocFind`, `DocFindOne`, `DocUpdate`, `DocUpdateOne`, `DocDelete`, `DocDeleteOne`, `DocCount`, `DocCreateIndex`, `DocAggregate`, `DocWatch`, `DocUnwatch`, `DocCreateTtlIndex`, `DocRemoveTtlIndex`, `DocCreateCapped`, `DocRemoveCap`
+- **Full-text / fuzzy search**: `Search`, `SearchFuzzy`, `SearchPhonetic`, `Similar`, `Suggest`, `Facets`, `Aggregate`, `Analyze`, `ExplainScore`, `CreateSearchConfig`
+- **Pub/Sub**: `Publish`, `Subscribe`, `SubscribeAsync`
+- **Queues**: `Enqueue`, `Dequeue`
+- **Counters / hashes / sorted sets**: `Incr`, `GetCounter`, `Hset`, `Hget`, `Hgetall`, `Hdel`, `Zadd`, `Zincrby`, `Zrange`, `Zrank`, `Zscore`, `Zrem`
+- **Geo**: `Geoadd`, `Georadius`, `Geodist`
+- **Streams**: `StreamAdd`, `StreamCreateGroup`, `StreamRead`, `StreamAck`, `StreamClaim`
+- **Percolator**: `PercolateAdd`, `Percolate`, `PercolateDelete`
+- **Misc**: `CountDistinct`, `Script`
 
-1. Locates the binary (bundled in module, on PATH, or via `GOLDLAPEL_BINARY` env var)
-2. Spawns it as a subprocess listening on localhost
-3. Waits for the port to be ready
-4. Returns a database connection with L1 native cache built in
+## How it works
 
-Go convention: use `defer gl.Stop()` for cleanup.
+1. `Start` locates the bundled Rust binary (honouring `GOLDLAPEL_BINARY`), spawns it as a subprocess, and waits for its port to accept TCP connections.
+2. It then eagerly opens a `database/sql` pool against the proxy — trying `pgx` first, then `postgres` (lib/pq) — and pings once. If the ping fails the pool is closed and `gl.DB()` returns `nil`; the proxy itself still runs, and callers can open their own pool via `gl.URL()`.
+3. Wrapper methods run through `gl.DB()` by default. `InTx` begins a transaction and hands a scoped `*GoldLapel` to a closure; `WithTx(tx)` overrides the target for a single call.
+4. `Stop(ctx)` sends `SIGTERM`, waits for the child to exit, and closes the pool.
+
+## Testing
+
+Run your test suite with the race detector enabled: `go test -race ./...`. The wrapper spawns a subprocess and holds shared state (the last-started instance used by `Wrap` auto-detection), and `-race` catches concurrency issues that silent PASSes would otherwise hide.
+
+## Upgrading from v0.1
+
+Breaking changes at v0.2.0. No deprecation aliases.
+
+| v0.1 | v0.2 |
+| --- | --- |
+| `gl := goldlapel.New(url); gl.Start()` | `gl, err := goldlapel.Start(ctx, url, opts...)` |
+| `gl.Stop()` | `gl.Stop(ctx)` (or `gl.Close()`) |
+| `gl.DocInsert("users", doc)` | `gl.DocInsert(ctx, "users", doc)` |
+| `DocInsert(db, "users", doc)` | `DocInsert(ctx, db, "users", doc)` |
+| `goldlapel.Start(url)` (singleton) | `goldlapel.Start(ctx, url)` (instance) |
+| none | `gl.InTx(ctx, db, fn)`, `goldlapel.WithTx(tx)` |
+
+All wrapper methods now take `context.Context` as the first argument. Package-level helpers take an `execQuerier` (either `*sql.DB` or `*sql.Tx`) as the second argument.
 
 ## Links
 
 - [Website](https://goldlapel.com)
-- [Documentation](https://github.com/goldlapel/goldlapel)
+- [Main project](https://github.com/goldlapel/goldlapel)

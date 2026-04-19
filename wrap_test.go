@@ -529,14 +529,14 @@ func TestWrap_CustomPort(t *testing.T) {
 // --- detectInvalidationPort ---
 
 func TestDetectInvalidationPort_Default(t *testing.T) {
-	singletonMu.Lock()
-	old := instance
-	instance = nil
-	singletonMu.Unlock()
+	lastStartedInstanceMu.Lock()
+	old := lastStartedInstance
+	lastStartedInstance = nil
+	lastStartedInstanceMu.Unlock()
 	defer func() {
-		singletonMu.Lock()
-		instance = old
-		singletonMu.Unlock()
+		lastStartedInstanceMu.Lock()
+		lastStartedInstance = old
+		lastStartedInstanceMu.Unlock()
 	}()
 
 	port := detectInvalidationPort()
@@ -546,14 +546,14 @@ func TestDetectInvalidationPort_Default(t *testing.T) {
 }
 
 func TestDetectInvalidationPort_FromInstance(t *testing.T) {
-	singletonMu.Lock()
-	old := instance
-	instance = &GoldLapel{port: 8000}
-	singletonMu.Unlock()
+	lastStartedInstanceMu.Lock()
+	old := lastStartedInstance
+	lastStartedInstance = &GoldLapel{port: 8000}
+	lastStartedInstanceMu.Unlock()
 	defer func() {
-		singletonMu.Lock()
-		instance = old
-		singletonMu.Unlock()
+		lastStartedInstanceMu.Lock()
+		lastStartedInstance = old
+		lastStartedInstanceMu.Unlock()
 	}()
 
 	port := detectInvalidationPort()
@@ -563,17 +563,17 @@ func TestDetectInvalidationPort_FromInstance(t *testing.T) {
 }
 
 func TestDetectInvalidationPort_FromConfig(t *testing.T) {
-	singletonMu.Lock()
-	old := instance
-	instance = &GoldLapel{
+	lastStartedInstanceMu.Lock()
+	old := lastStartedInstance
+	lastStartedInstance = &GoldLapel{
 		port:   8000,
 		config: map[string]interface{}{"invalidation_port": 9999},
 	}
-	singletonMu.Unlock()
+	lastStartedInstanceMu.Unlock()
 	defer func() {
-		singletonMu.Lock()
-		instance = old
-		singletonMu.Unlock()
+		lastStartedInstanceMu.Lock()
+		lastStartedInstance = old
+		lastStartedInstanceMu.Unlock()
 	}()
 
 	port := detectInvalidationPort()

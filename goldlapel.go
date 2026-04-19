@@ -1,10 +1,35 @@
+// Package goldlapel is the Go wrapper for the Gold Lapel self-optimizing
+// Postgres proxy. It spawns the bundled Rust binary as a subprocess, exposes
+// the proxy connection string via URL(), and provides higher-level helpers
+// (document store, full-text search, pub/sub, queues, counters, streams, ...)
+// built on top of the standard database/sql package.
+//
+// Quick start:
+//
+//	import (
+//	    "context"
+//	    "database/sql"
+//	    _ "github.com/jackc/pgx/v5/stdlib"  // any database/sql Postgres driver
+//	    "github.com/goldlapel/goldlapel-go"
+//	)
+//
+//	ctx := context.Background()
+//	gl, err := goldlapel.Start(ctx, "postgresql://user:pass@db/mydb")
+//	if err != nil { panic(err) }
+//	defer gl.Stop(ctx)
+//
+//	db, _ := sql.Open("pgx", gl.URL())
+//	defer db.Close()
+//
+//	hits, err := gl.Search(ctx, "articles", "body", "postgres tuning")
 package goldlapel
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,8 +43,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	_ "github.com/lib/pq"
 )
 
 const (
@@ -46,14 +69,14 @@ var (
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
 		"tls_cert": true, "tls_key": true, "tls_client_ca": true, "config": true,
-		"dashboard_port": true, "invalidation_port": true,
+		"dashboard_port": true, "invalidation_port": true, "log_level": true,
 		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
 		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
 		"disable_result_cache": true, "disable_pool": true,
 		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
 		"enable_coalescing": true,
-		"replica": true, "exclude_tables": true,
+		"replica":           true, "exclude_tables": true,
 	}
 
 	booleanKeys = map[string]bool{
@@ -71,42 +94,182 @@ var (
 	}
 )
 
-// Option configures a GoldLapel instance.
-type Option func(*GoldLapel)
+// --- Options ---
+//
+// Options form a single Option interface that covers both construction-time
+// options (passed to Start) and per-call options (passed to individual
+// methods like DocInsert). Internally an Option can set fields on the
+// GoldLapel struct before it boots (startOption) and/or override per-call
+// state such as the transaction target (callOption). Any given option
+// implements only the facets it cares about; irrelevant facets are no-ops.
 
-// WithPort sets the proxy listen port.
-func WithPort(port int) Option {
-	return func(gl *GoldLapel) {
-		gl.port = port
-	}
+// Option is the unified functional-options type accepted by Start and by
+// every receiver method. Implementations typically set construction
+// parameters (e.g. WithPort) or per-call overrides (e.g. WithTx). A single
+// Option may participate in any combination of the four facets:
+//
+//	applyStart  — set fields on *GoldLapel before spawn (WithPort, WithConfig)
+//	applyCall   — override per-call state such as the tx target (WithTx)
+//	applySearch — populate search-specific options (WithLimit, WithLang, ...)
+//	applyDoc    — populate DocFind-specific options (DocSort, DocLimit, ...)
+//
+// Implementations no-op the facets they do not care about. This keeps a
+// single pipe of options flowing through every method in the API.
+type Option interface {
+	applyStart(*GoldLapel)
+	applyCall(*callOptions)
+	applySearch(*searchOptions)
+	applyDoc(*docFindOptions)
 }
 
-// WithExtraArgs passes additional CLI flags to the binary.
+// SearchOption is retained as an alias for Option so existing callers that
+// named the type (e.g. when holding options in a variable) keep compiling.
+// Every SearchOption is an Option and vice-versa.
+type SearchOption = Option
+
+// DocFindOption is retained as an alias for Option for the same reason.
+type DocFindOption = Option
+
+// startOnly is an Option that only affects construction.
+type startOnly func(*GoldLapel)
+
+func (f startOnly) applyStart(gl *GoldLapel)  { f(gl) }
+func (f startOnly) applyCall(*callOptions)    {}
+func (f startOnly) applySearch(*searchOptions) {}
+func (f startOnly) applyDoc(*docFindOptions)   {}
+
+// callOnly is an Option that only affects a single method call.
+type callOnly func(*callOptions)
+
+func (f callOnly) applyStart(*GoldLapel)       {}
+func (f callOnly) applyCall(o *callOptions)    { f(o) }
+func (f callOnly) applySearch(*searchOptions)  {}
+func (f callOnly) applyDoc(*docFindOptions)    {}
+
+// searchOnly is an Option that only affects search-specific options.
+type searchOnly func(*searchOptions)
+
+func (f searchOnly) applyStart(*GoldLapel)       {}
+func (f searchOnly) applyCall(*callOptions)      {}
+func (f searchOnly) applySearch(o *searchOptions) { f(o) }
+func (f searchOnly) applyDoc(*docFindOptions)    {}
+
+// docOnly is an Option that only affects DocFind-specific options.
+type docOnly func(*docFindOptions)
+
+func (f docOnly) applyStart(*GoldLapel)       {}
+func (f docOnly) applyCall(*callOptions)      {}
+func (f docOnly) applySearch(*searchOptions)  {}
+func (f docOnly) applyDoc(o *docFindOptions)  { f(o) }
+
+// callOptions collects per-call overrides. Currently only a transaction
+// target, but this is the hook for future per-call options.
+type callOptions struct {
+	tx *sql.Tx
+}
+
+// WithPort sets the proxy listen port. Construction-time only.
+func WithPort(port int) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.port = port
+	})
+}
+
+// WithLogLevel sets the proxy log level. Accepted values:
+// "trace", "debug", "info", "warn"/"warning", "error". Only trace/debug/info
+// produce additional output; warn/error are the binary's default level and
+// emit nothing extra. Any other value returns an error at Start time.
+// Construction-time only.
+func WithLogLevel(level string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		if gl.config == nil {
+			gl.config = map[string]interface{}{}
+		}
+		gl.config["log_level"] = level
+	})
+}
+
+// WithExtraArgs passes additional CLI flags to the binary. Construction-time only.
 func WithExtraArgs(args ...string) Option {
-	return func(gl *GoldLapel) {
+	return startOnly(func(gl *GoldLapel) {
 		gl.extraArgs = args
-	}
+	})
+}
+
+// WithSilent suppresses the one-line startup banner that Start would
+// otherwise print to stderr. Use it in library code, CLI tools, or test
+// harnesses that don't want the wrapper chattering on their streams.
+// Construction-time only.
+func WithSilent() Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.silent = true
+	})
 }
 
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
+// Construction-time only.
 func WithConfig(config map[string]interface{}) Option {
-	return func(gl *GoldLapel) {
-		gl.config = config
+	return startOnly(func(gl *GoldLapel) {
+		// Merge into any pre-existing config (e.g. from WithLogLevel).
+		if gl.config == nil {
+			gl.config = map[string]interface{}{}
+		}
+		for k, v := range config {
+			gl.config[k] = v
+		}
+	})
+}
+
+// WithTx directs a single wrapper method call at a specific transaction.
+// Pass as the last argument to any receiver method:
+//
+//	gl.DocInsert(ctx, "events", doc, goldlapel.WithTx(tx))
+//
+// Per-call only; ignored if passed to Start.
+func WithTx(tx *sql.Tx) Option {
+	return callOnly(func(o *callOptions) {
+		o.tx = tx
+	})
+}
+
+// logLevelToVerboseFlag translates the wrapper-facing log_level string into
+// the proxy binary's count-based verbosity flag. The binary does not accept
+// --log-level; it accepts -v / -vv / -vvv on top of a default (warn/error)
+// level. Returns empty string when no flag should be emitted.
+//
+// Accepted inputs: "trace" → -vvv, "debug" → -vv, "info" → -v,
+// "warn"/"warning"/"error" → "" (default level, no flag).
+// Any other value returns an error with the expected set.
+func logLevelToVerboseFlag(level string) (string, error) {
+	switch strings.ToLower(level) {
+	case "":
+		return "", nil
+	case "trace":
+		return "-vvv", nil
+	case "debug":
+		return "-vv", nil
+	case "info":
+		return "-v", nil
+	case "warn", "warning", "error":
+		return "", nil
+	default:
+		return "", fmt.Errorf("log_level must be one of: trace, debug, info, warn, error (got %q)", level)
 	}
 }
 
 // ConfigToArgs converts a config map into CLI argument strings.
-// Keys are snake_case strings; each is validated against the known set of config keys.
-// Boolean keys emit a bare flag when true, nothing when false.
-// List keys emit repeated --flag value pairs for each element.
-// All other keys emit --flag value pairs.
+// Keys are snake_case strings; each is validated against the known set of
+// config keys. Boolean keys emit a bare flag when true, nothing when false.
+// List keys emit repeated --flag value pairs for each element. The
+// log_level key is a wrapper-side concept: it translates to the proxy's
+// count-based -v/-vv/-vvv flag rather than --log-level. All other keys
+// emit --flag value pairs.
 func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 	if len(config) == 0 {
 		return nil, nil
 	}
 
-	// Sort keys for deterministic output
 	keys := make([]string, 0, len(config))
 	for k := range config {
 		keys = append(keys, k)
@@ -120,6 +283,22 @@ func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 		}
 
 		value := config[key]
+
+		if key == "log_level" {
+			levelStr, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("config key %q expects a string value, got %T", key, value)
+			}
+			flag, err := logLevelToVerboseFlag(levelStr)
+			if err != nil {
+				return nil, err
+			}
+			if flag != "" {
+				args = append(args, flag)
+			}
+			continue
+		}
+
 		flag := "--" + strings.ReplaceAll(key, "_", "-")
 
 		if booleanKeys[key] {
@@ -165,7 +344,11 @@ func ConfigKeys() []string {
 	return keys
 }
 
-// GoldLapel manages a Gold Lapel proxy process.
+// --- GoldLapel instance ---
+
+// GoldLapel manages a Gold Lapel proxy process and exposes wrapper methods
+// (document store, search, pub/sub, queues, etc.) bound to a database/sql
+// connection pointed at the proxy.
 type GoldLapel struct {
 	upstream      string
 	port          int
@@ -176,53 +359,80 @@ type GoldLapel struct {
 	proxyURL      string
 	stderr        string
 	done          chan struct{} // closed when process exits
+	waitErr       error         // set by spawn's reaper goroutine before closing done
+	weSignaled    bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
 	db            *sql.DB
+	tx            *sql.Tx // non-nil only for GoldLapel instances returned by InTx
+	silent        bool    // when true, printBanner is a no-op
 	mu            sync.Mutex
 }
 
-// New creates a new GoldLapel instance.
-func New(upstream string, opts ...Option) *GoldLapel {
+// Start spawns the Gold Lapel proxy against the given upstream, waits for it
+// to accept connections, opens a pooled database/sql connection, and returns
+// a ready-to-use *GoldLapel. Call gl.Stop(ctx) to terminate — typically via
+// defer gl.Stop(ctx).
+//
+// Options may include construction-time settings (WithPort, WithLogLevel,
+// WithConfig, WithExtraArgs).
+func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, error) {
 	gl := &GoldLapel{
-		upstream:      upstream,
-		port:          DefaultPort,
-		dashboardPort: DefaultDashboardPort,
+		upstream: upstream,
+		port:     DefaultPort,
 	}
 	for _, opt := range opts {
-		opt(gl)
+		opt.applyStart(gl)
 	}
+	// Dashboard defaults to proxy port + 1 (matches what the Rust binary
+	// binds when no --dashboard-port is passed). Only when the user supplies
+	// an explicit dashboard_port via WithConfig does that value override the
+	// derivation. This means WithPort(17932) correctly reports the dashboard
+	// at :17933 rather than the hardcoded 7933.
+	gl.dashboardPort = gl.port + 1
 	if gl.config != nil {
 		if dp, ok := gl.config["dashboard_port"]; ok {
-			gl.dashboardPort = toInt(dp)
+			n, err := toInt(dp)
+			if err != nil {
+				return nil, fmt.Errorf("invalid dashboard_port: %w", err)
+			}
+			gl.dashboardPort = n
+		}
+		// Validate invalidation_port up front so Wrap()'s later lookup via
+		// detectInvalidationPort() is guaranteed to succeed.
+		if ip, ok := gl.config["invalidation_port"]; ok {
+			if _, err := toInt(ip); err != nil {
+				return nil, fmt.Errorf("invalid invalidation_port: %w", err)
+			}
 		}
 	}
-	return gl
+
+	if err := gl.spawn(ctx); err != nil {
+		return nil, err
+	}
+	registerStartedInstance(gl)
+	return gl, nil
 }
 
-// Start spawns the proxy and returns the proxy connection string.
-func (gl *GoldLapel) Start() (string, error) {
-	gl.mu.Lock()
-	defer gl.mu.Unlock()
-
-	if gl.done != nil {
-		select {
-		case <-gl.done:
-			// Process exited, fall through to restart
-		default:
-			// Still running
-			return gl.proxyURL, nil
-		}
-	}
-
+// spawn boots the underlying binary and opens the database pool. Called
+// exclusively from Start.
+//
+// No gl.mu lock is held across spawn: the *GoldLapel being constructed is
+// not yet visible to any other goroutine (Start hasn't returned, so no
+// public method has a receiver yet, and registerStartedInstance runs only
+// after spawn returns). Holding the mutex across the 10s port poll + 5s
+// ping would serialise any concurrent accessor for the entire startup
+// window once gl became visible — it was guarding against nothing and
+// penalising every path that sees the instance after Start returns.
+func (gl *GoldLapel) spawn(ctx context.Context) error {
 	bin, err := FindBinary()
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	args := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.port)}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)
 		if err != nil {
-			return "", fmt.Errorf("invalid config: %w", err)
+			return fmt.Errorf("invalid config: %w", err)
 		}
 		args = append(args, configArgs...)
 	}
@@ -236,14 +446,13 @@ func (gl *GoldLapel) Start() (string, error) {
 
 	stderrPipe, err := gl.cmd.StderrPipe()
 	if err != nil {
-		return "", fmt.Errorf("failed to create stderr pipe: %w", err)
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
 	if err := gl.cmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start Gold Lapel: %w", err)
+		return fmt.Errorf("failed to start Gold Lapel: %w", err)
 	}
 
-	// Drain stderr in background to prevent deadlock
 	var stderrBuf strings.Builder
 	stderrDone := make(chan struct{})
 	go func() {
@@ -251,14 +460,13 @@ func (gl *GoldLapel) Start() (string, error) {
 		close(stderrDone)
 	}()
 
-	if !WaitForPort("127.0.0.1", gl.port, startupTimeout) {
-		// Startup failed — kill and collect stderr
+	if !waitForPortCtx(ctx, "127.0.0.1", gl.port, startupTimeout) {
 		gl.cmd.Process.Kill()
 		gl.cmd.Wait()
 		<-stderrDone
 		gl.stderr = stderrBuf.String()
 		gl.cmd = nil
-		return "", fmt.Errorf("Gold Lapel failed to start on port %d within %ds.\nstderr: %s",
+		return fmt.Errorf("Gold Lapel failed to start on port %d within %ds.\nstderr: %s",
 			gl.port, int(startupTimeout.Seconds()), gl.stderr)
 	}
 
@@ -266,57 +474,134 @@ func (gl *GoldLapel) Start() (string, error) {
 	go func() {
 		<-stderrDone
 		gl.stderr = stderrBuf.String()
-		gl.cmd.Wait()
+		// Capture Wait()'s error so Stop can surface it (E2). Stop
+		// synchronises on <-gl.done, so the write here happens-before any
+		// read of gl.waitErr on the Stop side — no additional locking
+		// is needed for this field.
+		gl.waitErr = gl.cmd.Wait()
 		close(gl.done)
 	}()
 
 	gl.proxyURL = MakeProxyURL(gl.upstream, gl.port)
 
-	db, err := sql.Open("postgres", gl.proxyURL)
-	if err != nil {
-		// Non-fatal: proxy is running, user can still call URL() and open their own db
-		db = nil
+	// Eagerly open a database/sql pool against the proxy. The user may
+	// register any Postgres driver — we prefer "pgx" (from
+	// github.com/jackc/pgx/v5/stdlib) and fall back to "postgres"
+	// (github.com/lib/pq). If neither is registered, gl.db stays nil
+	// and URL() remains usable for the caller to open their own pool.
+	db, openErr := openDB(gl.proxyURL)
+	if openErr == nil {
+		// Verify the pool can actually reach the proxy.
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if pingErr := db.PingContext(pingCtx); pingErr != nil {
+			db.Close()
+			db = nil
+		}
+		cancel()
 	}
 	gl.db = db
 
-	if gl.dashboardPort > 0 {
-		fmt.Printf("goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
-	} else {
-		fmt.Printf("goldlapel → :%d (proxy)\n", gl.port)
-	}
+	gl.printBanner(os.Stderr)
 
-	return gl.proxyURL, nil
+	return nil
 }
 
-// Stop terminates the proxy process.
-func (gl *GoldLapel) Stop() error {
+// printBanner writes the one-line startup banner to w. Library code should
+// never write to stdout, so Start calls this with os.Stderr. WithSilent()
+// makes it a no-op. Exposed as a method (rather than inlined in spawn) so
+// tests can exercise both the routing and the silent-suppression paths
+// without spawning the real binary.
+func (gl *GoldLapel) printBanner(w io.Writer) {
+	if gl.silent {
+		return
+	}
+	if gl.dashboardPort > 0 {
+		fmt.Fprintf(w, "goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
+	} else {
+		fmt.Fprintf(w, "goldlapel → :%d (proxy)\n", gl.port)
+	}
+}
+
+// openDB tries common registered Postgres drivers in a stable order.
+// Users are expected to import a driver (pgx or lib/pq) into their app.
+func openDB(url string) (*sql.DB, error) {
+	var lastErr error
+	for _, drv := range []string{"pgx", "postgres"} {
+		db, err := sql.Open(drv, url)
+		if err == nil {
+			return db, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no Postgres database/sql driver registered (import pgx/stdlib or lib/pq)")
+	}
+	return nil, lastErr
+}
+
+// Stop terminates the proxy process and closes the database pool.
+// Safe to call multiple times. The context is honoured during the graceful
+// shutdown wait — if ctx is cancelled the process is killed immediately.
+//
+// Return value contract:
+//   - nil when the proxy shut down as expected — including the normal case
+//     where Stop itself signalled SIGTERM/Kill (the resulting non-zero exit
+//     is expected, not an error).
+//   - non-nil when the subprocess exited on its own before Stop was called
+//     (e.g. crashed with a non-zero status, OOM-killed) — in that case the
+//     exit error from cmd.Wait() is surfaced so callers checking the return
+//     value see the failure.
+//
+// Scoped instances (the *GoldLapel returned by InTx) share the parent's
+// process and pool but must not tear them down if a caller mistakenly
+// calls Stop on them. Stop is a no-op on a scoped instance — the caller
+// should Stop the parent.
+func (gl *GoldLapel) Stop(ctx context.Context) error {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 
-	if gl.done == nil {
+	// Scoped instance (bound to an *sql.Tx from InTx): never tear down
+	// the shared proxy process or pool. The parent owns those.
+	if gl.tx != nil {
 		return nil
 	}
 
-	// Check if already exited
+	// Unstarted / already-stopped: nothing to do.
+	//
+	// F: the guard chain used to have a third path (cmd != nil && done == nil)
+	// that returned without nilling cmd — harmless in practice because
+	// spawn's port-poll timeout path already nils cmd, but fragile if a
+	// future spawn error path left cmd set without installing a reaper.
+	// The check below consolidates to a single exit: if there's no reaper
+	// channel to wait on, we clear any stale cmd defensively and return.
+	// Callers never see such an instance today (Start returns nil on
+	// failure), but this keeps Stop reliably idempotent under any
+	// construction path (including hand-rolled test harnesses).
+	if gl.done == nil {
+		gl.cmd = nil
+		return nil
+	}
+
+	// Fast path: process exited on its own before Stop was called. This
+	// is NOT an our-signal shutdown — surface any Wait() error so callers
+	// see e.g. a non-zero crash exit.
 	select {
 	case <-gl.done:
-		if gl.db != nil {
-			gl.db.Close()
-			gl.db = nil
-		}
-		gl.done = nil
-		gl.proxyURL = ""
-		return nil
+		gl.teardownLocked()
+		return filterStopExit(gl.waitErr, gl.weSignaled)
 	default:
 	}
 
-	// Close the database connection before stopping the proxy
 	if gl.db != nil {
 		gl.db.Close()
 		gl.db = nil
 	}
 
-	// Graceful shutdown: SIGTERM on Unix, Kill on Windows (no SIGTERM support)
+	// Mark that we're about to issue a signal so the resulting ExitError
+	// from cmd.Wait() can be filtered as expected-shutdown rather than
+	// surfaced to the caller.
+	gl.weSignaled = true
+
 	if runtime.GOOS == "windows" {
 		gl.cmd.Process.Kill()
 	} else {
@@ -325,19 +610,68 @@ func (gl *GoldLapel) Stop() error {
 
 	select {
 	case <-gl.done:
-		// Exited
+	case <-ctx.Done():
+		gl.cmd.Process.Kill()
+		<-gl.done
 	case <-time.After(shutdownTimeout):
-		// Force kill (only needed for Unix SIGTERM path)
 		gl.cmd.Process.Kill()
 		<-gl.done
 	}
 
-	gl.done = nil
-	gl.proxyURL = ""
-	return nil
+	gl.teardownLocked()
+	return filterStopExit(gl.waitErr, gl.weSignaled)
 }
 
-// URL returns the proxy connection string, or "" if not running.
+// teardownLocked nils out the process/pool state after the reaper has
+// completed. Caller must hold gl.mu. Centralising this in one helper
+// keeps Stop's two return paths (already-exited fast path, post-signal
+// path) in sync — previously they diverged on whether gl.cmd was cleared.
+func (gl *GoldLapel) teardownLocked() {
+	if gl.db != nil {
+		gl.db.Close()
+		gl.db = nil
+	}
+	gl.done = nil
+	gl.cmd = nil
+	gl.proxyURL = ""
+}
+
+// filterStopExit classifies cmd.Wait()'s error and decides whether to
+// surface it. When weSignaled is true, the subprocess was killed by us
+// (SIGTERM or Process.Kill) — *exec.ExitError in that case reflects the
+// expected shutdown path and is swallowed. Any other non-nil error
+// (subprocess-crashed, OOM, I/O errors inside Wait) is returned so the
+// caller of Stop sees the failure.
+//
+// This is platform-agnostic: on both POSIX and Windows, cmd.Wait() returns
+// an *exec.ExitError for any non-zero exit — including signal-induced
+// termination on POSIX and Kill-induced termination on Windows. Filtering
+// by "did we issue the kill?" rather than by platform-specific WaitStatus
+// bits keeps the logic simple and uniform across all four targets
+// (linux-x86_64, linux-aarch64, darwin-aarch64, windows-x86_64).
+func filterStopExit(err error, weSignaled bool) error {
+	if err == nil {
+		return nil
+	}
+	if !weSignaled {
+		return err
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return nil
+	}
+	return err
+}
+
+// Close implements io.Closer. It calls Stop with context.Background().
+// Prefer Stop(ctx) in application code so the shutdown deadline is explicit.
+// Like Stop, Close is a no-op on scoped instances returned by InTx.
+func (gl *GoldLapel) Close() error {
+	return gl.Stop(context.Background())
+}
+
+// URL returns the proxy connection string, or "" if the proxy is stopped.
+// Use with database/sql: sql.Open("pgx", gl.URL()).
 func (gl *GoldLapel) URL() string {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
@@ -349,7 +683,7 @@ func (gl *GoldLapel) Port() int {
 	return gl.port
 }
 
-// Running returns true if the proxy process is alive.
+// Running reports whether the proxy process is still alive.
 func (gl *GoldLapel) Running() bool {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
@@ -364,8 +698,7 @@ func (gl *GoldLapel) Running() bool {
 	}
 }
 
-// DashboardURL returns the dashboard URL if the proxy is running and
-// the dashboard port is configured, or "" otherwise.
+// DashboardURL returns the dashboard URL while the proxy is running, or "".
 func (gl *GoldLapel) DashboardURL() string {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
@@ -375,21 +708,44 @@ func (gl *GoldLapel) DashboardURL() string {
 	return ""
 }
 
-// ErrNotConnected is returned by receiver methods when the proxy has not been
-// started or the database connection is not available.
-var ErrNotConnected = fmt.Errorf("goldlapel: proxy not started or database connection unavailable")
-
 // DB returns the underlying *sql.DB connected to the proxy.
-// Returns nil if the proxy has not been started.
+// Returns nil if Start did not manage to open a pool (e.g. no driver
+// registered). Users can always sql.Open(..., gl.URL()) themselves.
 func (gl *GoldLapel) DB() *sql.DB {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 	return gl.db
 }
 
-// requireDB returns the stored *sql.DB or ErrNotConnected.
-func (gl *GoldLapel) requireDB() (*sql.DB, error) {
+// ErrNotConnected is returned by receiver methods when no database handle is
+// available — typically because Start failed to open a pool.
+var ErrNotConnected = errors.New("goldlapel: proxy not started or database connection unavailable")
+
+// execQuerier is the subset of *sql.DB / *sql.Tx our wrapper methods need.
+// Both types implement ExecContext, QueryContext, and QueryRowContext with
+// identical signatures, so method bodies can target either freely.
+type execQuerier interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// resolveExec selects the query target for a single call, honouring
+// WithTx overrides and any transaction bound by InTx.
+func (gl *GoldLapel) resolveExec(opts []Option) (execQuerier, error) {
+	co := callOptions{}
+	for _, opt := range opts {
+		opt.applyCall(&co)
+	}
+	if co.tx != nil {
+		return co.tx, nil
+	}
 	gl.mu.Lock()
+	if gl.tx != nil {
+		tx := gl.tx
+		gl.mu.Unlock()
+		return tx, nil
+	}
 	db := gl.db
 	gl.mu.Unlock()
 	if db == nil {
@@ -398,562 +754,68 @@ func (gl *GoldLapel) requireDB() (*sql.DB, error) {
 	return db, nil
 }
 
-// --- Document store receiver methods ---
-
-func (gl *GoldLapel) DocInsert(collection string, document interface{}) (map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
+// InTx runs fn inside a database transaction. It begins a transaction on db,
+// hands fn a scoped *GoldLapel whose wrapper methods automatically target
+// that transaction, and commits on success or rolls back on error/panic.
+//
+// The scoped instance shares the proxy process with its parent, so URL(),
+// Running(), DashboardURL(), etc. continue to work inside the closure.
+// WithTx on an individual call inside fn overrides the scoped transaction.
+func (gl *GoldLapel) InTx(ctx context.Context, db *sql.DB, fn func(*GoldLapel) error) (err error) {
+	if db == nil {
+		// Fall back to the pool we opened at Start, if the caller didn't
+		// bring their own *sql.DB.
+		db = gl.DB()
 	}
-	return DocInsert(db, collection, document)
-}
-
-func (gl *GoldLapel) DocInsertMany(collection string, documents []interface{}) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return DocInsertMany(db, collection, documents)
-}
-
-func (gl *GoldLapel) DocFind(collection string, filter interface{}, opts ...DocFindOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return DocFind(db, collection, filter, opts...)
-}
-
-func (gl *GoldLapel) DocFindOne(collection string, filter interface{}) (map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return DocFindOne(db, collection, filter)
-}
-
-func (gl *GoldLapel) DocUpdate(collection string, filter, update interface{}) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return DocUpdate(db, collection, filter, update)
-}
-
-func (gl *GoldLapel) DocUpdateOne(collection string, filter, update interface{}) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return DocUpdateOne(db, collection, filter, update)
-}
-
-func (gl *GoldLapel) DocDelete(collection string, filter interface{}) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return DocDelete(db, collection, filter)
-}
-
-func (gl *GoldLapel) DocDeleteOne(collection string, filter interface{}) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return DocDeleteOne(db, collection, filter)
-}
-
-func (gl *GoldLapel) DocCount(collection string, filter interface{}) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return DocCount(db, collection, filter)
-}
-
-func (gl *GoldLapel) DocCreateIndex(collection string, keys ...string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocCreateIndex(db, collection, keys...)
-}
-
-func (gl *GoldLapel) DocAggregate(collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return DocAggregate(db, collection, pipeline)
-}
-
-// --- Search receiver methods ---
-
-func (gl *GoldLapel) Search(table string, columns interface{}, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Search(db, table, columns, query, opts...)
-}
-
-func (gl *GoldLapel) SearchFuzzy(table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return SearchFuzzy(db, table, column, query, opts...)
-}
-
-func (gl *GoldLapel) SearchPhonetic(table, column, query string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return SearchPhonetic(db, table, column, query, opts...)
-}
-
-func (gl *GoldLapel) Similar(table, column string, vector []float64, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Similar(db, table, column, vector, opts...)
-}
-
-func (gl *GoldLapel) Suggest(table, column, prefix string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Suggest(db, table, column, prefix, opts...)
-}
-
-func (gl *GoldLapel) Facets(table, column string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Facets(db, table, column, opts...)
-}
-
-func (gl *GoldLapel) Aggregate(table, column, funcName string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Aggregate(db, table, column, funcName, opts...)
-}
-
-func (gl *GoldLapel) CreateSearchConfig(name, copyFrom string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return CreateSearchConfig(db, name, copyFrom)
-}
-
-func (gl *GoldLapel) Analyze(text string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Analyze(db, text, opts...)
-}
-
-func (gl *GoldLapel) ExplainScore(table, column, query, idColumn string, idValue interface{}, opts ...SearchOption) (map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return ExplainScore(db, table, column, query, idColumn, idValue, opts...)
-}
-
-// --- Pub/Sub receiver methods ---
-
-func (gl *GoldLapel) Publish(channel, message string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return Publish(db, channel, message)
-}
-
-func (gl *GoldLapel) Subscribe(channel string, callback func(channel, payload string)) error {
-	gl.mu.Lock()
-	url := gl.proxyURL
-	gl.mu.Unlock()
-	if url == "" {
+	if db == nil {
 		return ErrNotConnected
 	}
-	return Subscribe(url, channel, callback)
-}
 
-func (gl *GoldLapel) SubscribeAsync(channel string, callback func(channel, payload string)) chan error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	// Build a scoped instance that shares the process state but carries
+	// the transaction. Copying the struct under the lock keeps us from
+	// racing against Stop/Start.
 	gl.mu.Lock()
-	url := gl.proxyURL
+	scoped := &GoldLapel{
+		upstream:      gl.upstream,
+		port:          gl.port,
+		dashboardPort: gl.dashboardPort,
+		cmd:           gl.cmd,
+		proxyURL:      gl.proxyURL,
+		done:          gl.done,
+		db:            gl.db,
+		tx:            tx,
+	}
 	gl.mu.Unlock()
-	if url == "" {
-		ch := make(chan error, 1)
-		ch <- ErrNotConnected
-		return ch
-	}
-	return SubscribeAsync(url, channel, callback)
-}
 
-// --- Queue receiver methods ---
-
-func (gl *GoldLapel) Enqueue(queueTable string, payload interface{}) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return Enqueue(db, queueTable, payload)
-}
-
-func (gl *GoldLapel) Dequeue(queueTable string) (json.RawMessage, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Dequeue(db, queueTable)
-}
-
-// --- Counter receiver methods ---
-
-func (gl *GoldLapel) Incr(table, key string, amount int64) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return Incr(db, table, key, amount)
-}
-
-func (gl *GoldLapel) GetCounter(table, key string) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return GetCounter(db, table, key)
-}
-
-// --- Hash receiver methods ---
-
-func (gl *GoldLapel) Hset(table, key, field string, value interface{}) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return Hset(db, table, key, field, value)
-}
-
-func (gl *GoldLapel) Hget(table, key, field string) (json.RawMessage, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Hget(db, table, key, field)
-}
-
-func (gl *GoldLapel) Hgetall(table, key string) (json.RawMessage, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Hgetall(db, table, key)
-}
-
-func (gl *GoldLapel) Hdel(table, key, field string) (bool, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return false, err
-	}
-	return Hdel(db, table, key, field)
-}
-
-// --- Sorted set receiver methods ---
-
-func (gl *GoldLapel) Zadd(table, member string, score float64) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return Zadd(db, table, member, score)
-}
-
-func (gl *GoldLapel) Zincrby(table, member string, amount float64) (float64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return Zincrby(db, table, member, amount)
-}
-
-func (gl *GoldLapel) Zrange(table string, start, stop int, desc bool) ([]ZMember, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Zrange(db, table, start, stop, desc)
-}
-
-func (gl *GoldLapel) Zrank(table, member string, desc bool) (*int, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Zrank(db, table, member, desc)
-}
-
-func (gl *GoldLapel) Zscore(table, member string) (*float64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Zscore(db, table, member)
-}
-
-func (gl *GoldLapel) Zrem(table, member string) (bool, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return false, err
-	}
-	return Zrem(db, table, member)
-}
-
-// --- Geo receiver methods ---
-
-func (gl *GoldLapel) Georadius(table, geomColumn string, lon, lat, radiusMeters float64, limit int) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Georadius(db, table, geomColumn, lon, lat, radiusMeters, limit)
-}
-
-func (gl *GoldLapel) Geoadd(table, nameColumn, geomColumn, name string, lon, lat float64) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return Geoadd(db, table, nameColumn, geomColumn, name, lon, lat)
-}
-
-func (gl *GoldLapel) Geodist(table, geomColumn, nameColumn, nameA, nameB string) (*float64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Geodist(db, table, geomColumn, nameColumn, nameA, nameB)
-}
-
-// --- Misc receiver methods ---
-
-func (gl *GoldLapel) CountDistinct(table, column string) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return CountDistinct(db, table, column)
-}
-
-func (gl *GoldLapel) Script(luaCode string, args ...string) (*string, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Script(db, luaCode, args...)
-}
-
-// --- Stream receiver methods ---
-
-func (gl *GoldLapel) StreamAdd(stream string, payload string) (int64, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return 0, err
-	}
-	return StreamAdd(db, stream, payload)
-}
-
-func (gl *GoldLapel) StreamCreateGroup(stream, group string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return StreamCreateGroup(db, stream, group)
-}
-
-func (gl *GoldLapel) StreamRead(stream, group, consumer string, count int) ([]StreamMessage, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return StreamRead(db, stream, group, consumer, count)
-}
-
-func (gl *GoldLapel) StreamAck(stream, group string, messageID int64) (bool, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return false, err
-	}
-	return StreamAck(db, stream, group, messageID)
-}
-
-func (gl *GoldLapel) StreamClaim(stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return StreamClaim(db, stream, group, consumer, minIdleMs)
-}
-
-// --- Percolate receiver methods ---
-
-func (gl *GoldLapel) PercolateAdd(name, queryID, query string, opts ...SearchOption) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return PercolateAdd(db, name, queryID, query, opts...)
-}
-
-func (gl *GoldLapel) Percolate(name, text string, opts ...SearchOption) ([]map[string]interface{}, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	return Percolate(db, name, text, opts...)
-}
-
-func (gl *GoldLapel) PercolateDelete(name, queryID string) (bool, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return false, err
-	}
-	return PercolateDelete(db, name, queryID)
-}
-
-// --- Operational Doc receiver methods ---
-
-func (gl *GoldLapel) DocWatch(collection string, callback func(op, data string)) (chan error, error) {
-	db, err := gl.requireDB()
-	if err != nil {
-		return nil, err
-	}
-	gl.mu.Lock()
-	url := gl.proxyURL
-	gl.mu.Unlock()
-	if url == "" {
-		return nil, ErrNotConnected
-	}
-	return DocWatch(db, url, collection, callback)
-}
-
-func (gl *GoldLapel) DocUnwatch(collection string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocUnwatch(db, collection)
-}
-
-func (gl *GoldLapel) DocCreateTtlIndex(collection string, ttlSeconds int) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocCreateTtlIndex(db, collection, ttlSeconds)
-}
-
-func (gl *GoldLapel) DocRemoveTtlIndex(collection string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocRemoveTtlIndex(db, collection)
-}
-
-func (gl *GoldLapel) DocCreateCapped(collection string, maxDocs int) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocCreateCapped(db, collection, maxDocs)
-}
-
-func (gl *GoldLapel) DocRemoveCap(collection string) error {
-	db, err := gl.requireDB()
-	if err != nil {
-		return err
-	}
-	return DocRemoveCap(db, collection)
-}
-
-// --- Singleton API ---
-
-var (
-	instance   *GoldLapel
-	singletonMu sync.Mutex
-)
-
-// Start creates or reuses a singleton proxy instance.
-func Start(upstream string, opts ...Option) (string, error) {
-	singletonMu.Lock()
-	defer singletonMu.Unlock()
-
-	if instance != nil && instance.Running() {
-		if instance.upstream != upstream {
-			return "", fmt.Errorf("Gold Lapel is already running for a different upstream. Call goldlapel.Stop() before starting with a new upstream.")
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
 		}
-		return instance.URL(), nil
-	}
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				err = fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
+			}
+			return
+		}
+		if cmErr := tx.Commit(); cmErr != nil {
+			err = fmt.Errorf("commit tx: %w", cmErr)
+		}
+	}()
 
-	instance = New(upstream, opts...)
-	return instance.Start()
-}
-
-// Stop stops the singleton proxy instance.
-func Stop() error {
-	singletonMu.Lock()
-	defer singletonMu.Unlock()
-
-	if instance == nil {
-		return nil
-	}
-
-	err := instance.Stop()
-	instance = nil
-	return err
-}
-
-// ProxyURL returns the singleton's proxy URL, or "" if not started.
-func ProxyURL() string {
-	singletonMu.Lock()
-	defer singletonMu.Unlock()
-
-	if instance == nil {
-		return ""
-	}
-	return instance.URL()
-}
-
-// DashboardURL returns the singleton's dashboard URL, or "" if not started.
-func DashboardURL() string {
-	singletonMu.Lock()
-	defer singletonMu.Unlock()
-
-	if instance == nil {
-		return ""
-	}
-	return instance.DashboardURL()
+	return fn(scoped)
 }
 
 // --- Binary lookup ---
 
-// FindBinary locates the Gold Lapel binary using a 3-tier lookup.
+// FindBinary locates the Gold Lapel binary using a 3-tier lookup:
+// GOLDLAPEL_BINARY env var, bundled binary next to this source, system PATH.
 func FindBinary() (string, error) {
-	// 1. GOLDLAPEL_BINARY env var
 	if envPath := os.Getenv("GOLDLAPEL_BINARY"); envPath != "" {
 		info, err := os.Stat(envPath)
 		if err != nil || !info.Mode().IsRegular() {
@@ -962,7 +824,6 @@ func FindBinary() (string, error) {
 		return envPath, nil
 	}
 
-	// 2. Bundled binary relative to this source file
 	osName := runtime.GOOS
 	arch := runtime.GOARCH
 	switch arch {
@@ -986,16 +847,12 @@ func FindBinary() (string, error) {
 			if isExecutable(info) {
 				return bundled, nil
 			}
-			// Binary exists but isn't executable (e.g. read-only Go module cache).
-			// Copy to a temp location and make it executable.
 			if tmp, err := copyToExecutableTemp(bundled, binaryName); err == nil {
 				return tmp, nil
 			}
-			// Fall through to PATH lookup
 		}
 	}
 
-	// 3. System PATH
 	if path, err := exec.LookPath("goldlapel"); err == nil {
 		return path, nil
 	}
@@ -1023,13 +880,10 @@ func copyToExecutableTemp(src, name string) (string, error) {
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	// Include a content hash in the filename so different binary versions
-	// get different paths, even if the file size happens to be identical.
 	hash := sha256.Sum256(data)
-	hashPrefix := hex.EncodeToString(hash[:8]) // 16 hex chars
+	hashPrefix := hex.EncodeToString(hash[:8])
 	dst := filepath.Join(dir, name+"-"+hashPrefix)
 
-	// If the hashed temp copy already exists and is executable, reuse it
 	if info, err := os.Stat(dst); err == nil && info.Mode().IsRegular() && isExecutable(info) {
 		return dst, nil
 	}
@@ -1038,14 +892,11 @@ func copyToExecutableTemp(src, name string) (string, error) {
 		return "", fmt.Errorf("failed to write executable copy: %w", err)
 	}
 
-	// Clean up stale copies for this platform (old hashes)
 	cleanOldTempBinaries(dir, name, dst)
 
 	return dst, nil
 }
 
-// cleanOldTempBinaries removes old hashed copies for the same platform binary,
-// keeping only the current version to prevent /tmp clutter.
 func cleanOldTempBinaries(dir, namePrefix, keep string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1063,18 +914,25 @@ func cleanOldTempBinaries(dir, namePrefix, keep string) {
 	}
 }
 
-func toInt(v interface{}) int {
+// toInt coerces a config value to an int. Returns an error if the value is a
+// string that cannot be parsed or a type we don't understand — this prevents
+// silent conversion of e.g. "abc" into 0, which would quietly disable ports.
+func toInt(v interface{}) (int, error) {
 	switch n := v.(type) {
 	case int:
-		return n
+		return n, nil
+	case int64:
+		return int(n), nil
 	case float64:
-		return int(n)
+		return int(n), nil
 	case string:
 		var i int
-		fmt.Sscanf(n, "%d", &i)
-		return i
+		if _, err := fmt.Sscanf(n, "%d", &i); err != nil {
+			return 0, fmt.Errorf("cannot parse %q as int: %w", n, err)
+		}
+		return i, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("cannot convert %T to int", v)
 	}
 }
 
@@ -1084,22 +942,18 @@ func toInt(v interface{}) int {
 func MakeProxyURL(upstream string, port int) string {
 	portStr := fmt.Sprintf("%d", port)
 
-	// PostgreSQL URL with explicit port
 	if m := withPortRe.FindStringSubmatch(upstream); m != nil {
 		return m[1] + "localhost:" + portStr + m[4]
 	}
 
-	// PostgreSQL URL without explicit port
 	if m := withoutPortRe.FindStringSubmatch(upstream); m != nil {
 		return m[1] + "localhost:" + portStr + m[3]
 	}
 
-	// Bare host:port (no ://)
 	if !strings.Contains(upstream, "://") && strings.Contains(upstream, ":") {
 		return "localhost:" + portStr
 	}
 
-	// Bare hostname
 	return "localhost:" + portStr
 }
 
@@ -1107,10 +961,19 @@ func MakeProxyURL(upstream string, port int) string {
 
 // WaitForPort polls until a TCP connection succeeds or the timeout expires.
 func WaitForPort(host string, port int, timeout time.Duration) bool {
+	return waitForPortCtx(context.Background(), host, port, timeout)
+}
+
+func waitForPortCtx(ctx context.Context, host string, port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
 		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 		if err == nil {
 			conn.Close()

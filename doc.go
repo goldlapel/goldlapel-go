@@ -1,18 +1,13 @@
 package goldlapel
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
-	"time"
-
-	"github.com/lib/pq"
 )
-
-// DocFindOption configures a DocFind call.
-type DocFindOption func(*docFindOptions)
 
 type docFindOptions struct {
 	sort  map[string]int // key -> 1 (ASC) or -1 (DESC)
@@ -22,31 +17,31 @@ type docFindOptions struct {
 
 // DocSort sets the sort order for DocFind. Keys are JSONB field names,
 // values are 1 for ascending or -1 for descending. Like MongoDB's sort.
-func DocSort(fields map[string]int) DocFindOption {
-	return func(o *docFindOptions) { o.sort = fields }
+func DocSort(fields map[string]int) Option {
+	return docOnly(func(o *docFindOptions) { o.sort = fields })
 }
 
 // DocLimit sets the maximum number of documents to return. Like MongoDB's limit.
-func DocLimit(n int) DocFindOption {
-	return func(o *docFindOptions) { o.limit = n }
+func DocLimit(n int) Option {
+	return docOnly(func(o *docFindOptions) { o.limit = n })
 }
 
 // DocSkip sets the number of documents to skip before returning results.
 // Like MongoDB's skip.
-func DocSkip(n int) DocFindOption {
-	return func(o *docFindOptions) { o.skip = n }
+func DocSkip(n int) Option {
+	return docOnly(func(o *docFindOptions) { o.skip = n })
 }
 
 // ensureCollection creates the document store table if it doesn't exist.
 // Schema: id BIGSERIAL PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ.
-func ensureCollection(db *sql.DB, collection string) error {
+func ensureCollection(ctx context.Context, q execQuerier, collection string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
-	_, err := db.Exec(
-		"CREATE TABLE IF NOT EXISTS " + collection + " (" +
-			"id BIGSERIAL PRIMARY KEY, " +
-			"data JSONB NOT NULL, " +
+	_, err := q.ExecContext(ctx,
+		"CREATE TABLE IF NOT EXISTS "+collection+" ("+
+			"id BIGSERIAL PRIMARY KEY, "+
+			"data JSONB NOT NULL, "+
 			"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
 	if err != nil {
 		return fmt.Errorf("create collection %s: %w", collection, err)
@@ -56,9 +51,9 @@ func ensureCollection(db *sql.DB, collection string) error {
 
 // DocInsert inserts a single document into a collection. Like MongoDB's insertOne().
 // Creates the collection table if it doesn't exist. Returns the inserted document
-// with id and created_at fields added.
-func DocInsert(db *sql.DB, collection string, document interface{}) (map[string]interface{}, error) {
-	if err := ensureCollection(db, collection); err != nil {
+// with _id and _created_at fields added.
+func DocInsert(ctx context.Context, q execQuerier, collection string, document interface{}) (map[string]interface{}, error) {
+	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
 	}
 
@@ -70,7 +65,7 @@ func DocInsert(db *sql.DB, collection string, document interface{}) (map[string]
 	var id int64
 	var createdAt string
 	var rawData string
-	err = db.QueryRow(
+	err = q.QueryRowContext(ctx,
 		"INSERT INTO "+collection+" (data) VALUES ($1::jsonb) RETURNING id, data, created_at",
 		string(data)).Scan(&id, &rawData, &createdAt)
 	if err != nil {
@@ -87,18 +82,15 @@ func DocInsert(db *sql.DB, collection string, document interface{}) (map[string]
 }
 
 // DocInsertMany inserts multiple documents into a collection. Like MongoDB's insertMany().
-// Creates the collection table if it doesn't exist. Returns inserted documents
-// with id and created_at fields added.
-func DocInsertMany(db *sql.DB, collection string, documents []interface{}) ([]map[string]interface{}, error) {
+func DocInsertMany(ctx context.Context, q execQuerier, collection string, documents []interface{}) ([]map[string]interface{}, error) {
 	if len(documents) == 0 {
 		return nil, nil
 	}
 
-	if err := ensureCollection(db, collection); err != nil {
+	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
 	}
 
-	// Build a batch INSERT with multiple VALUES rows
 	placeholders := make([]string, len(documents))
 	args := make([]interface{}, len(documents))
 	for i, doc := range documents {
@@ -110,11 +102,11 @@ func DocInsertMany(db *sql.DB, collection string, documents []interface{}) ([]ma
 		args[i] = string(data)
 	}
 
-	q := "INSERT INTO " + collection + " (data) VALUES " +
+	query := "INSERT INTO " + collection + " (data) VALUES " +
 		strings.Join(placeholders, ", ") +
 		" RETURNING id, data, created_at"
 
-	rows, err := db.Query(q, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -140,19 +132,17 @@ func DocInsertMany(db *sql.DB, collection string, documents []interface{}) ([]ma
 }
 
 // DocFind queries documents from a collection. Like MongoDB's find().
-// If filter is nil, returns all documents. Otherwise uses JSONB containment (@>)
-// to match. Supports DocSort, DocLimit, and DocSkip options.
-func DocFind(db *sql.DB, collection string, filter interface{}, opts ...DocFindOption) ([]map[string]interface{}, error) {
+func DocFind(ctx context.Context, q execQuerier, collection string, filter interface{}, opts ...Option) ([]map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
 
 	o := &docFindOptions{limit: 100}
-	for _, fn := range opts {
-		fn(o)
+	for _, opt := range opts {
+		opt.applyDoc(o)
 	}
 
-	q := "SELECT id, data, created_at FROM " + collection
+	query := "SELECT id, data, created_at FROM " + collection
 	paramIdx := 1
 	var args []interface{}
 
@@ -161,34 +151,31 @@ func DocFind(db *sql.DB, collection string, filter interface{}, opts ...DocFindO
 		return nil, err
 	}
 	if whereClause != "" {
-		q += " WHERE " + whereClause
+		query += " WHERE " + whereClause
 		args = append(args, filterParams...)
 		paramIdx = nextParam
 	}
 
-	// ORDER BY
 	if len(o.sort) > 0 {
 		orderParts, err := buildSortClause(o.sort)
 		if err != nil {
 			return nil, err
 		}
-		q += " ORDER BY " + strings.Join(orderParts, ", ")
+		query += " ORDER BY " + strings.Join(orderParts, ", ")
 	} else {
-		q += " ORDER BY id"
+		query += " ORDER BY id"
 	}
 
-	// LIMIT
-	q += fmt.Sprintf(" LIMIT $%d", paramIdx)
+	query += fmt.Sprintf(" LIMIT $%d", paramIdx)
 	args = append(args, o.limit)
 	paramIdx++
 
-	// OFFSET
 	if o.skip > 0 {
-		q += fmt.Sprintf(" OFFSET $%d", paramIdx)
+		query += fmt.Sprintf(" OFFSET $%d", paramIdx)
 		args = append(args, o.skip)
 	}
 
-	rows, err := db.Query(q, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -198,14 +185,12 @@ func DocFind(db *sql.DB, collection string, filter interface{}, opts ...DocFindO
 }
 
 // DocFindOne queries a single document from a collection. Like MongoDB's findOne().
-// If filter is nil, returns the first document. Otherwise uses JSONB containment (@>)
-// or comparison operators. Returns nil (not an error) if no document matches.
-func DocFindOne(db *sql.DB, collection string, filter interface{}) (map[string]interface{}, error) {
+func DocFindOne(ctx context.Context, q execQuerier, collection string, filter interface{}) (map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
 
-	q := "SELECT id, data, created_at FROM " + collection
+	query := "SELECT id, data, created_at FROM " + collection
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -213,13 +198,13 @@ func DocFindOne(db *sql.DB, collection string, filter interface{}) (map[string]i
 		return nil, err
 	}
 	if whereClause != "" {
-		q += " WHERE " + whereClause
+		query += " WHERE " + whereClause
 		args = append(args, filterParams...)
 	}
 
-	q += " ORDER BY id LIMIT 1"
+	query += " ORDER BY id LIMIT 1"
 
-	rows, err := db.Query(q, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -236,9 +221,7 @@ func DocFindOne(db *sql.DB, collection string, filter interface{}) (map[string]i
 }
 
 // DocUpdate updates all documents matching a filter. Like MongoDB's updateMany().
-// Uses JSONB containment (@>) or comparison operators for matching, and || for
-// merging the update. Returns the number of rows affected.
-func DocUpdate(db *sql.DB, collection string, filter, update interface{}) (int64, error) {
+func DocUpdate(ctx context.Context, q execQuerier, collection string, filter, update interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
@@ -248,7 +231,7 @@ func DocUpdate(db *sql.DB, collection string, filter, update interface{}) (int64
 		return 0, fmt.Errorf("marshal update: %w", err)
 	}
 
-	q := "UPDATE " + collection + " SET data = data || $1::jsonb"
+	query := "UPDATE " + collection + " SET data = data || $1::jsonb"
 	args := []interface{}{string(updateJSON)}
 	paramIdx := 2
 
@@ -257,11 +240,11 @@ func DocUpdate(db *sql.DB, collection string, filter, update interface{}) (int64
 		return 0, err
 	}
 	if whereClause != "" {
-		q += " WHERE " + whereClause
+		query += " WHERE " + whereClause
 		args = append(args, filterParams...)
 	}
 
-	result, err := db.Exec(q, args...)
+	result, err := q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -269,9 +252,7 @@ func DocUpdate(db *sql.DB, collection string, filter, update interface{}) (int64
 }
 
 // DocUpdateOne updates a single document matching a filter. Like MongoDB's updateOne().
-// Uses a CTE with LIMIT 1 to ensure only one row is updated.
-// Returns the number of rows affected (0 or 1).
-func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (int64, error) {
+func DocUpdateOne(ctx context.Context, q execQuerier, collection string, filter, update interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
@@ -281,7 +262,6 @@ func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (in
 		return 0, fmt.Errorf("marshal update: %w", err)
 	}
 
-	// Build WHERE clause for the CTE starting at $1
 	whereClause, filterParams, nextParam, err := buildFilter(filter, 1)
 	if err != nil {
 		return 0, err
@@ -292,13 +272,13 @@ func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (in
 		cteWhere = " WHERE " + whereClause
 	}
 
-	q := "WITH target AS (" +
+	query := "WITH target AS (" +
 		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
 		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
 		"FROM target WHERE " + collection + ".id = target.id"
 
 	args := append(filterParams, string(updateJSON))
-	result, err := db.Exec(q, args...)
+	result, err := q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -306,14 +286,12 @@ func DocUpdateOne(db *sql.DB, collection string, filter, update interface{}) (in
 }
 
 // DocDelete deletes all documents matching a filter. Like MongoDB's deleteMany().
-// Uses JSONB containment (@>) or comparison operators for matching.
-// Returns the number of rows deleted.
-func DocDelete(db *sql.DB, collection string, filter interface{}) (int64, error) {
+func DocDelete(ctx context.Context, q execQuerier, collection string, filter interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
 
-	q := "DELETE FROM " + collection
+	query := "DELETE FROM " + collection
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -321,11 +299,11 @@ func DocDelete(db *sql.DB, collection string, filter interface{}) (int64, error)
 		return 0, err
 	}
 	if whereClause != "" {
-		q += " WHERE " + whereClause
+		query += " WHERE " + whereClause
 		args = append(args, filterParams...)
 	}
 
-	result, err := db.Exec(q, args...)
+	result, err := q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -333,9 +311,7 @@ func DocDelete(db *sql.DB, collection string, filter interface{}) (int64, error)
 }
 
 // DocDeleteOne deletes a single document matching a filter. Like MongoDB's deleteOne().
-// Uses a CTE with LIMIT 1 to ensure only one row is deleted.
-// Returns the number of rows deleted (0 or 1).
-func DocDeleteOne(db *sql.DB, collection string, filter interface{}) (int64, error) {
+func DocDeleteOne(ctx context.Context, q execQuerier, collection string, filter interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
@@ -350,10 +326,10 @@ func DocDeleteOne(db *sql.DB, collection string, filter interface{}) (int64, err
 		cteWhere = " WHERE " + whereClause
 	}
 
-	q := "WITH target AS (" +
+	query := "WITH target AS (" +
 		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
 		") DELETE FROM " + collection + " USING target WHERE " + collection + ".id = target.id"
-	result, err := db.Exec(q, filterParams...)
+	result, err := q.ExecContext(ctx, query, filterParams...)
 	if err != nil {
 		return 0, err
 	}
@@ -361,13 +337,12 @@ func DocDeleteOne(db *sql.DB, collection string, filter interface{}) (int64, err
 }
 
 // DocCount counts documents matching a filter. Like MongoDB's countDocuments().
-// If filter is nil, counts all documents in the collection.
-func DocCount(db *sql.DB, collection string, filter interface{}) (int64, error) {
+func DocCount(ctx context.Context, q execQuerier, collection string, filter interface{}) (int64, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
 
-	q := "SELECT COUNT(*) FROM " + collection
+	query := "SELECT COUNT(*) FROM " + collection
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -375,12 +350,12 @@ func DocCount(db *sql.DB, collection string, filter interface{}) (int64, error) 
 		return 0, err
 	}
 	if whereClause != "" {
-		q += " WHERE " + whereClause
+		query += " WHERE " + whereClause
 		args = append(args, filterParams...)
 	}
 
 	var count int64
-	err = db.QueryRow(q, args...).Scan(&count)
+	err = q.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
 		return 0, err
 	}
@@ -388,10 +363,9 @@ func DocCount(db *sql.DB, collection string, filter interface{}) (int64, error) 
 }
 
 // DocCreateIndex creates a GIN index on one or more JSONB keys in a collection.
-// Like MongoDB's createIndex(). Uses jsonb_path_ops for efficient containment queries.
-// With a single key, creates a functional index on (data->'key').
-// With no keys, creates a full GIN index on the entire data column.
-func DocCreateIndex(db *sql.DB, collection string, keys ...string) error {
+// Pass keys as a slice so that functional options (e.g. WithTx) remain
+// available as trailing variadic parameters.
+func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys []string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
@@ -404,11 +378,9 @@ func DocCreateIndex(db *sql.DB, collection string, keys ...string) error {
 
 	var indexExpr, indexName string
 	if len(keys) == 0 {
-		// Full GIN index on data column
 		indexExpr = "(data jsonb_path_ops)"
 		indexName = collection + "_data_gin"
 	} else {
-		// Index on specific keys
 		parts := make([]string, len(keys))
 		nameParts := make([]string, len(keys))
 		for i, key := range keys {
@@ -419,9 +391,9 @@ func DocCreateIndex(db *sql.DB, collection string, keys ...string) error {
 		indexName = collection + "_" + strings.Join(nameParts, "_") + "_idx"
 	}
 
-	q := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING GIN %s",
+	query := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING GIN %s",
 		indexName, collection, indexExpr)
-	_, err := db.Exec(q)
+	_, err := q.ExecContext(ctx, query)
 	return err
 }
 
@@ -448,13 +420,7 @@ func scanDocRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 }
 
 // DocAggregate runs a MongoDB-style aggregation pipeline against a collection.
-// Supported stages: $match, $group, $sort, $limit, $skip, $project, $unwind, $lookup.
-// $group translates to SQL GROUP BY with accumulators ($sum, $avg, $min, $max, $count).
-// $project selects/renames fields (1=include, 0 on _id=exclude, "$field"=rename).
-// $unwind expands a JSONB array field via CROSS JOIN jsonb_array_elements_text.
-// $lookup performs a correlated subquery join against another collection.
-// Returns a slice of result maps.
-func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
+func DocAggregate(ctx context.Context, q execQuerier, collection string, pipeline []map[string]interface{}) ([]map[string]interface{}, error) {
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
@@ -467,8 +433,7 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 		groupStage   map[string]interface{}
 		sortStage    map[string]interface{}
 		projectStage map[string]interface{}
-		unwindField  string                   // bare field name (no $)
-		unwindMap    map[string]interface{}    // passed to group builder when $unwind precedes $group
+		unwindField  string
 		lookupStage  map[string]interface{}
 		limitVal     int
 		skipVal      int
@@ -539,7 +504,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 						return nil, fmt.Errorf("$unwind path must be a $field reference")
 					}
 					unwindField = pathStr[1:]
-					unwindMap = v
 				default:
 					return nil, fmt.Errorf("$unwind must be a string or map")
 				}
@@ -565,17 +529,13 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 		}
 	}
 
-	_ = unwindMap // reserved for future $unwind options (preserveNullAndEmptyArrays, etc.)
-
 	var args []interface{}
 	paramIdx := 1
 
-	// SELECT clause
 	var selectParts []string
 	var groupByParts []string
 
 	if hasProject {
-		// $project: build explicit select list
 		projKeys := make([]string, 0, len(projectStage))
 		for k := range projectStage {
 			projKeys = append(projKeys, k)
@@ -592,7 +552,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				}
 			}
 			if n, ok := val.(float64); ok && n == 1 {
-				// Include field: data->>'field' AS field
 				if err := validateIdentifier(key); err != nil {
 					return nil, fmt.Errorf("$project: invalid field %q: %w", key, err)
 				}
@@ -602,7 +561,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				}
 				selectParts = append(selectParts, fmt.Sprintf("%s AS %s", fp, key))
 			} else if s, ok := val.(string); ok && len(s) > 0 && s[0] == '$' {
-				// Rename: data->>'sourceField' AS alias
 				srcField := s[1:]
 				if err := validateIdentifier(key); err != nil {
 					return nil, fmt.Errorf("$project: invalid alias %q: %w", key, err)
@@ -617,25 +575,21 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 			}
 		}
 		if !excludeID {
-			// Include _id by default (prepend)
 			selectParts = append([]string{"id AS _id"}, selectParts...)
 		}
 	} else if hasGroup {
-		// _id field determines grouping
 		idVal, hasID := groupStage["_id"]
 		if !hasID {
 			return nil, fmt.Errorf("$group stage requires an _id field")
 		}
 
 		if idVal == nil {
-			// null _id → aggregate entire collection, no GROUP BY
 			selectParts = append(selectParts, "NULL AS _id")
 		} else if idStr, ok := idVal.(string); ok && len(idStr) > 0 && idStr[0] == '$' {
 			field := idStr[1:]
 			if err := validateIdentifier(field); err != nil {
 				return nil, fmt.Errorf("invalid $group _id field: %w", err)
 			}
-			// When $unwind precedes $group on the same field, use the unwound alias
 			if hasUnwind && field == unwindField {
 				selectParts = append(selectParts, fmt.Sprintf("%s AS _id", unwindField))
 				groupByParts = append(groupByParts, unwindField)
@@ -644,7 +598,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				groupByParts = append(groupByParts, fmt.Sprintf("data->>'%s'", field))
 			}
 		} else if idMap, ok := idVal.(map[string]interface{}); ok {
-			// Composite _id: {alias: "$field", ...} → json_build_object + multi GROUP BY
 			if len(idMap) == 0 {
 				return nil, fmt.Errorf("$group _id map must not be empty")
 			}
@@ -671,7 +624,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 			return nil, fmt.Errorf("$group _id must be null, a $field reference, or a map of $field references")
 		}
 
-		// Accumulators (all keys except _id)
 		accKeys := make([]string, 0, len(groupStage)-1)
 		for k := range groupStage {
 			if k != "_id" {
@@ -699,32 +651,28 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 		selectParts = append(selectParts, "id AS _id", "data", "created_at")
 	}
 
-	q := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
+	query := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
 
-	// CROSS JOIN for $unwind
 	if hasUnwind {
-		q += fmt.Sprintf(" CROSS JOIN jsonb_array_elements_text(data->'%s') AS %s", unwindField, unwindField)
+		query += fmt.Sprintf(" CROSS JOIN jsonb_array_elements_text(data->'%s') AS %s", unwindField, unwindField)
 	}
 
-	// WHERE from $match
 	if matchFilter != nil {
 		whereClause, filterParams, nextP, err := buildFilter(matchFilter, paramIdx)
 		if err != nil {
 			return nil, fmt.Errorf("$match: %w", err)
 		}
 		if whereClause != "" {
-			q += " WHERE " + whereClause
+			query += " WHERE " + whereClause
 			args = append(args, filterParams...)
 			paramIdx = nextP
 		}
 	}
 
-	// GROUP BY
 	if len(groupByParts) > 0 {
-		q += " GROUP BY " + strings.Join(groupByParts, ", ")
+		query += " GROUP BY " + strings.Join(groupByParts, ", ")
 	}
 
-	// $lookup: correlated subquery appended as additional select column via wrapping
 	if hasLookup {
 		fromColl, _ := lookupStage["from"].(string)
 		localField, _ := lookupStage["localField"].(string)
@@ -746,18 +694,15 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 		if err != nil {
 			return nil, fmt.Errorf("$lookup: invalid foreignField: %w", err)
 		}
-		// Qualify foreignExpr to reference the lookup table
 		foreignExpr = strings.Replace(foreignExpr, "data", fromColl+".data", 1)
 
 		subquery := fmt.Sprintf(
 			"(SELECT COALESCE(json_agg(%s.data), '[]'::json) FROM %s WHERE %s = %s) AS %s",
 			fromColl, fromColl, foreignExpr, localExpr, asField)
 
-		// Inject the subquery into the SELECT by rebuilding
-		q = strings.Replace(q, "SELECT ", "SELECT "+subquery+", ", 1)
+		query = strings.Replace(query, "SELECT ", "SELECT "+subquery+", ", 1)
 	}
 
-	// ORDER BY
 	if sortStage != nil {
 		sortKeys := make([]string, 0, len(sortStage))
 		for k := range sortStage {
@@ -772,7 +717,6 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				dir = "DESC"
 			}
 			if hasGroup {
-				// After $group, sort keys refer to aliases
 				if err := validateIdentifier(key); err != nil {
 					return nil, fmt.Errorf("invalid sort key: %w", err)
 				}
@@ -784,24 +728,22 @@ func DocAggregate(db *sql.DB, collection string, pipeline []map[string]interface
 				orderParts = append(orderParts, fmt.Sprintf("data->>'%s' %s", key, dir))
 			}
 		}
-		q += " ORDER BY " + strings.Join(orderParts, ", ")
+		query += " ORDER BY " + strings.Join(orderParts, ", ")
 	}
 
-	// LIMIT
 	if hasLimit {
-		q += fmt.Sprintf(" LIMIT $%d", paramIdx)
+		query += fmt.Sprintf(" LIMIT $%d", paramIdx)
 		args = append(args, limitVal)
 		paramIdx++
 	}
 
-	// OFFSET
 	if hasSkip {
-		q += fmt.Sprintf(" OFFSET $%d", paramIdx)
+		query += fmt.Sprintf(" OFFSET $%d", paramIdx)
 		args = append(args, skipVal)
 		paramIdx++
 	}
 
-	rows, err := db.Query(q, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -821,11 +763,9 @@ func buildAccumulator(acc map[string]interface{}) (string, error) {
 	for op, val := range acc {
 		switch op {
 		case "$sum":
-			// $sum: 1 → COUNT(*)
 			if n, ok := val.(float64); ok && n == 1 {
 				return "COUNT(*)", nil
 			}
-			// $sum: "$field" → SUM((data->>'field')::numeric)
 			field, err := extractField(val)
 			if err != nil {
 				return "", fmt.Errorf("$sum: %w", err)
@@ -870,7 +810,6 @@ func buildAccumulator(acc map[string]interface{}) (string, error) {
 	return "", fmt.Errorf("empty accumulator")
 }
 
-// extractField extracts and validates a field name from a $field reference.
 func extractField(val interface{}) (string, error) {
 	s, ok := val.(string)
 	if !ok || len(s) == 0 || s[0] != '$' {
@@ -883,7 +822,6 @@ func extractField(val interface{}) (string, error) {
 	return field, nil
 }
 
-// numToInt converts a numeric value to int. Handles float64 (JSON default) and int.
 func numToInt(v interface{}) (int, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -896,10 +834,6 @@ func numToInt(v interface{}) (int, bool) {
 	return 0, false
 }
 
-// scanAggregateRows reads aggregate result rows by column names and returns
-// them as maps. Numeric string values are converted to float64.
-// JSON object strings (from json_build_object) in the _id column are parsed
-// back into maps. Postgres array strings (from array_agg) are parsed into slices.
 func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -924,7 +858,6 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 			}
 			s, isStr := val.(string)
 			if isStr {
-				// Try to parse JSON arrays (from json_agg in $lookup)
 				if len(s) > 0 && s[0] == '[' {
 					var arr []interface{}
 					if err := json.Unmarshal([]byte(s), &arr); err == nil {
@@ -932,7 +865,6 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 						continue
 					}
 				}
-				// Try to parse JSON objects (from json_build_object) and arrays
 				if len(s) > 0 && s[0] == '{' && col == "_id" {
 					var m map[string]interface{}
 					if err := json.Unmarshal([]byte(s), &m); err == nil {
@@ -940,7 +872,6 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 						continue
 					}
 				}
-				// Parse Postgres array format {val1,val2,...} into a string slice
 				if len(s) > 1 && s[0] == '{' && s[len(s)-1] == '}' && col != "_id" {
 					row[col] = parsePgArray(s)
 					continue
@@ -953,10 +884,8 @@ func scanAggregateRows(rows *sql.Rows) ([]map[string]interface{}, error) {
 	return results, rows.Err()
 }
 
-// parsePgArray parses a Postgres text array literal like {a,b,c} into a string slice.
-// Handles quoted elements and NULL.
 func parsePgArray(s string) []string {
-	inner := s[1 : len(s)-1] // strip { }
+	inner := s[1 : len(s)-1]
 	if inner == "" {
 		return []string{}
 	}
@@ -990,23 +919,17 @@ func parsePgArray(s string) []string {
 	return result
 }
 
-// comparisonOps maps MongoDB-style comparison operators to SQL operators.
 var comparisonOps = map[string]string{
 	"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=",
 	"$eq": "=", "$ne": "!=",
 }
 
-// supportedFilterOps is the set of all recognized $-prefixed filter operators.
 var supportedFilterOps = map[string]bool{
 	"$gt": true, "$gte": true, "$lt": true, "$lte": true,
 	"$eq": true, "$ne": true, "$in": true, "$nin": true,
 	"$exists": true, "$regex": true,
 }
 
-// expandDotKeys expands dot-notation keys in a flat map into nested maps.
-// For example, {"addr.city": "NY"} becomes {"addr": {"city": "NY"}}.
-// Non-dotted keys pass through unchanged. Multiple dotted keys sharing a
-// prefix are merged: {"a.b": 1, "a.c": 2} becomes {"a": {"b": 1, "c": 2}}.
 func expandDotKeys(m map[string]interface{}) map[string]interface{} {
 	result := make(map[string]interface{}, len(m))
 	for key, value := range m {
@@ -1015,16 +938,12 @@ func expandDotKeys(m map[string]interface{}) map[string]interface{} {
 			result[key] = value
 			continue
 		}
-		// Walk/create nested maps for all but the last segment
 		cur := result
 		for _, seg := range parts[:len(parts)-1] {
 			if existing, ok := cur[seg]; ok {
 				if nested, isMap := existing.(map[string]interface{}); isMap {
 					cur = nested
 				} else {
-					// Conflict: a scalar already sits at this path.
-					// Overwrite with a nested map (last write wins,
-					// same as MongoDB behaviour).
 					nested := make(map[string]interface{})
 					cur[seg] = nested
 					cur = nested
@@ -1040,9 +959,6 @@ func expandDotKeys(m map[string]interface{}) map[string]interface{} {
 	return result
 }
 
-// fieldPath converts a dot-notation key into a Postgres JSONB path expression.
-// "name" becomes "data->>'name'". "address.city" becomes "data->'address'->>'city'".
-// Each segment is validated against the identifier regex.
 func fieldPath(key string) (string, error) {
 	parts := strings.Split(key, ".")
 	for _, part := range parts {
@@ -1061,8 +977,6 @@ func fieldPath(key string) (string, error) {
 	return expr, nil
 }
 
-// isOperatorMap checks if a map has at least one $-prefixed key, indicating
-// it contains comparison operators rather than a literal value.
 func isOperatorMap(m map[string]interface{}) bool {
 	for k := range m {
 		if len(k) > 0 && k[0] == '$' {
@@ -1072,15 +986,6 @@ func isOperatorMap(m map[string]interface{}) bool {
 	return false
 }
 
-// buildFilter translates a MongoDB-style filter into a SQL WHERE clause
-// with numbered placeholders starting at startParam. Returns the clause
-// (without WHERE keyword), the parameter values, and the next available
-// parameter number.
-//
-// Plain key-value pairs use JSONB containment (@>). Keys whose values are
-// operator maps (e.g. {"$gt": 10}) are translated to individual comparison
-// clauses. Supported operators: $gt, $gte, $lt, $lte, $eq, $ne, $in, $nin,
-// $exists, $regex. Dot notation (e.g. "address.city") is supported.
 func buildFilter(filter interface{}, startParam int) (string, []interface{}, int, error) {
 	if filter == nil {
 		return "", nil, startParam, nil
@@ -1088,7 +993,6 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 
 	filterMap, ok := filter.(map[string]interface{})
 	if !ok {
-		// Not a map — fall back to JSON containment of the whole thing
 		filterJSON, err := json.Marshal(filter)
 		if err != nil {
 			return "", nil, startParam, fmt.Errorf("marshal filter: %w", err)
@@ -1105,7 +1009,6 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 		return "", nil, startParam, nil
 	}
 
-	// First pass: separate plain key-value pairs (containment) from operator maps
 	containment := make(map[string]interface{})
 	var operatorKeys []string
 
@@ -1125,8 +1028,6 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 		}
 	}
 
-	// Build clauses with monotonically increasing param indices.
-	// Containment clause comes first (if any), then operator clauses.
 	var allClauses []string
 	var allParams []interface{}
 	paramIdx := startParam
@@ -1149,7 +1050,6 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 			return "", nil, startParam, err
 		}
 
-		// Process operators in sorted order for deterministic output
 		opKeys := make([]string, 0, len(valMap))
 		for k := range valMap {
 			opKeys = append(opKeys, k)
@@ -1215,7 +1115,6 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 	return strings.Join(allClauses, " AND "), allParams, paramIdx, nil
 }
 
-// isNumeric returns true if the value is a numeric type (float64, int, int64).
 func isNumeric(v interface{}) bool {
 	switch v.(type) {
 	case float64, int, int64:
@@ -1224,10 +1123,6 @@ func isNumeric(v interface{}) bool {
 	return false
 }
 
-// buildSortClause generates ORDER BY expressions from a sort map.
-// Keys are JSONB field names, values are 1 (ASC) or -1 (DESC).
-// Sort keys are validated as identifiers and applied in deterministic
-// (alphabetical) order.
 func buildSortClause(sortMap map[string]int) ([]string, error) {
 	keys := make([]string, 0, len(sortMap))
 	for k := range sortMap {
@@ -1249,120 +1144,15 @@ func buildSortClause(sortMap map[string]int) ([]string, error) {
 	return parts, nil
 }
 
-// DocWatch listens for changes on a collection. Like MongoDB's change streams.
-// Creates a trigger that fires NOTIFY on INSERT, UPDATE, and DELETE, then
-// uses pq.NewListener (LISTEN/NOTIFY) to stream change events to the callback.
-// The callback receives an operation string ("INSERT", "UPDATE", or "DELETE")
-// and the affected row's data as a JSON string.
-// Runs in a background goroutine; returns immediately. The returned channel
-// receives an error if setup fails; otherwise it is closed on success.
-// Pass a connection string (DSN), not a *sql.DB, because LISTEN requires
-// a dedicated connection. The db parameter is used only for trigger DDL.
-func DocWatch(db *sql.DB, conn string, collection string, callback func(op, data string)) (chan error, error) {
-	if err := validateIdentifier(collection); err != nil {
-		return nil, err
-	}
-	if err := ensureCollection(db, collection); err != nil {
-		return nil, err
-	}
-
-	channel := collection + "_changes"
-	funcName := collection + "_notify_changes"
-	triggerName := collection + "_watch_trigger"
-
-	// Create the trigger function that sends NOTIFY with operation + row data.
-	createFunc := "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS trigger AS $$ " +
-		"BEGIN " +
-		"IF TG_OP = 'DELETE' THEN " +
-		"PERFORM pg_notify('" + channel + "', TG_OP || '|' || OLD.data::text); " +
-		"RETURN OLD; " +
-		"ELSE " +
-		"PERFORM pg_notify('" + channel + "', TG_OP || '|' || NEW.data::text); " +
-		"RETURN NEW; " +
-		"END IF; " +
-		"END; " +
-		"$$ LANGUAGE plpgsql"
-	if _, err := db.Exec(createFunc); err != nil {
-		return nil, fmt.Errorf("create watch function: %w", err)
-	}
-
-	// Create the trigger (drop first to ensure idempotency).
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
-		return nil, fmt.Errorf("drop existing watch trigger: %w", err)
-	}
-
-	createTrigger := "CREATE TRIGGER " + triggerName +
-		" AFTER INSERT OR UPDATE OR DELETE ON " + collection +
-		" FOR EACH ROW EXECUTE FUNCTION " + funcName + "()"
-	if _, err := db.Exec(createTrigger); err != nil {
-		return nil, fmt.Errorf("create watch trigger: %w", err)
-	}
-
-	// Start listening in a background goroutine using pq.NewListener.
-	errCh := make(chan error, 1)
-	go func() {
-		minReconn := 10 * time.Second
-		maxReconn := time.Minute
-		listener := pq.NewListener(conn, minReconn, maxReconn, nil)
-		defer listener.Close()
-
-		if err := listener.Listen(channel); err != nil {
-			errCh <- fmt.Errorf("listen on channel %q: %w", channel, err)
-			return
-		}
-		close(errCh)
-
-		for {
-			n := <-listener.Notify
-			if n == nil {
-				continue
-			}
-			parts := strings.SplitN(n.Extra, "|", 2)
-			if len(parts) == 2 {
-				callback(parts[0], parts[1])
-			}
-		}
-	}()
-
-	return errCh, nil
-}
-
-// DocUnwatch removes the change stream trigger and function from a collection.
-// Reverses what DocWatch set up.
-func DocUnwatch(db *sql.DB, collection string) error {
-	if err := validateIdentifier(collection); err != nil {
-		return err
-	}
-
-	triggerName := collection + "_watch_trigger"
-	funcName := collection + "_notify_changes"
-
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
-		return fmt.Errorf("drop watch trigger: %w", err)
-	}
-
-	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
-	if _, err := db.Exec(dropFunc); err != nil {
-		return fmt.Errorf("drop watch function: %w", err)
-	}
-
-	return nil
-}
-
 // DocCreateTtlIndex creates a TTL (time-to-live) trigger on a collection.
-// Like MongoDB's TTL indexes. Rows whose created_at is older than ttlSeconds
-// are automatically deleted when any new INSERT occurs.
-// The TTL is baked into the PL/pgSQL trigger body as an integer constant.
-func DocCreateTtlIndex(db *sql.DB, collection string, ttlSeconds int) error {
+func DocCreateTtlIndex(ctx context.Context, q execQuerier, collection string, ttlSeconds int) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
 	if ttlSeconds <= 0 {
 		return fmt.Errorf("ttlSeconds must be positive, got %d", ttlSeconds)
 	}
-	if err := ensureCollection(db, collection); err != nil {
+	if err := ensureCollection(ctx, q, collection); err != nil {
 		return err
 	}
 
@@ -1377,19 +1167,19 @@ func DocCreateTtlIndex(db *sql.DB, collection string, ttlSeconds int) error {
 			"END; "+
 			"$$ LANGUAGE plpgsql",
 		funcName, collection, ttlSeconds)
-	if _, err := db.Exec(createFunc); err != nil {
+	if _, err := q.ExecContext(ctx, createFunc); err != nil {
 		return fmt.Errorf("create ttl function: %w", err)
 	}
 
 	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop existing ttl trigger: %w", err)
 	}
 
 	createTrigger := "CREATE TRIGGER " + triggerName +
 		" AFTER INSERT ON " + collection +
 		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
-	if _, err := db.Exec(createTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, createTrigger); err != nil {
 		return fmt.Errorf("create ttl trigger: %w", err)
 	}
 
@@ -1397,8 +1187,7 @@ func DocCreateTtlIndex(db *sql.DB, collection string, ttlSeconds int) error {
 }
 
 // DocRemoveTtlIndex removes the TTL trigger and function from a collection.
-// Reverses what DocCreateTtlIndex set up.
-func DocRemoveTtlIndex(db *sql.DB, collection string) error {
+func DocRemoveTtlIndex(ctx context.Context, q execQuerier, collection string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
@@ -1407,30 +1196,27 @@ func DocRemoveTtlIndex(db *sql.DB, collection string) error {
 	funcName := collection + "_ttl_cleanup"
 
 	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop ttl trigger: %w", err)
 	}
 
 	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
-	if _, err := db.Exec(dropFunc); err != nil {
+	if _, err := q.ExecContext(ctx, dropFunc); err != nil {
 		return fmt.Errorf("drop ttl function: %w", err)
 	}
 
 	return nil
 }
 
-// DocCreateCapped creates a capped collection trigger. Like MongoDB's capped collections.
-// Limits the collection to maxDocs rows by deleting the oldest rows (by id)
-// whenever an INSERT would exceed the cap. The cap size is baked into the
-// PL/pgSQL trigger body as an integer constant.
-func DocCreateCapped(db *sql.DB, collection string, maxDocs int) error {
+// DocCreateCapped creates a capped collection trigger.
+func DocCreateCapped(ctx context.Context, q execQuerier, collection string, maxDocs int) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
 	if maxDocs <= 0 {
 		return fmt.Errorf("maxDocs must be positive, got %d", maxDocs)
 	}
-	if err := ensureCollection(db, collection); err != nil {
+	if err := ensureCollection(ctx, q, collection); err != nil {
 		return err
 	}
 
@@ -1445,19 +1231,19 @@ func DocCreateCapped(db *sql.DB, collection string, maxDocs int) error {
 			"END; "+
 			"$$ LANGUAGE plpgsql",
 		funcName, collection, collection, maxDocs)
-	if _, err := db.Exec(createFunc); err != nil {
+	if _, err := q.ExecContext(ctx, createFunc); err != nil {
 		return fmt.Errorf("create cap function: %w", err)
 	}
 
 	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop existing cap trigger: %w", err)
 	}
 
 	createTrigger := "CREATE TRIGGER " + triggerName +
 		" AFTER INSERT ON " + collection +
 		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
-	if _, err := db.Exec(createTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, createTrigger); err != nil {
 		return fmt.Errorf("create cap trigger: %w", err)
 	}
 
@@ -1465,8 +1251,7 @@ func DocCreateCapped(db *sql.DB, collection string, maxDocs int) error {
 }
 
 // DocRemoveCap removes the capped collection trigger and function.
-// Reverses what DocCreateCapped set up.
-func DocRemoveCap(db *sql.DB, collection string) error {
+func DocRemoveCap(ctx context.Context, q execQuerier, collection string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
@@ -1475,12 +1260,12 @@ func DocRemoveCap(db *sql.DB, collection string) error {
 	funcName := collection + "_cap_enforce"
 
 	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
-	if _, err := db.Exec(dropTrigger); err != nil {
+	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop cap trigger: %w", err)
 	}
 
 	dropFunc := "DROP FUNCTION IF EXISTS " + funcName + "()"
-	if _, err := db.Exec(dropFunc); err != nil {
+	if _, err := q.ExecContext(ctx, dropFunc); err != nil {
 		return fmt.Errorf("drop cap function: %w", err)
 	}
 
