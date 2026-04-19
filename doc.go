@@ -434,7 +434,6 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 		sortStage    map[string]interface{}
 		projectStage map[string]interface{}
 		unwindField  string
-		unwindMap    map[string]interface{}
 		lookupStage  map[string]interface{}
 		limitVal     int
 		skipVal      int
@@ -505,7 +504,6 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 						return nil, fmt.Errorf("$unwind path must be a $field reference")
 					}
 					unwindField = pathStr[1:]
-					unwindMap = v
 				default:
 					return nil, fmt.Errorf("$unwind must be a string or map")
 				}
@@ -530,8 +528,6 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 			}
 		}
 	}
-
-	_ = unwindMap
 
 	var args []interface{}
 	paramIdx := 1
