@@ -35,11 +35,19 @@ func DocSkip(n int) Option {
 // ensureCollection creates the document store table if it doesn't exist.
 // Schema: id BIGSERIAL PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ.
 func ensureCollection(ctx context.Context, q execQuerier, collection string) error {
+	return ensureCollectionOpts(ctx, q, collection, false)
+}
+
+func ensureCollectionOpts(ctx context.Context, q execQuerier, collection string, unlogged bool) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
+	prefix := "CREATE TABLE"
+	if unlogged {
+		prefix = "CREATE UNLOGGED TABLE"
+	}
 	_, err := q.ExecContext(ctx,
-		"CREATE TABLE IF NOT EXISTS "+collection+" ("+
+		prefix+" IF NOT EXISTS "+collection+" ("+
 			"id BIGSERIAL PRIMARY KEY, "+
 			"data JSONB NOT NULL, "+
 			"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
@@ -47,6 +55,17 @@ func ensureCollection(ctx context.Context, q execQuerier, collection string) err
 		return fmt.Errorf("create collection %s: %w", collection, err)
 	}
 	return nil
+}
+
+// DocCreateCollection explicitly creates a collection table. Like MongoDB's
+// createCollection(). Pass unlogged=true for an UNLOGGED table (higher
+// throughput, not crash-safe; ideal for ephemeral data).
+//
+// Collections are also auto-created on first DocInsert/DocInsertMany, so
+// calling DocCreateCollection is only strictly required when you want to
+// control the unlogged flag or pre-create without inserting.
+func DocCreateCollection(ctx context.Context, q execQuerier, collection string, unlogged bool) error {
+	return ensureCollectionOpts(ctx, q, collection, unlogged)
 }
 
 // DocInsert inserts a single document into a collection. Like MongoDB's insertOne().
@@ -334,6 +353,224 @@ func DocDeleteOne(ctx context.Context, q execQuerier, collection string, filter 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// DocFindOneAndUpdate atomically finds a single document matching filter and
+// applies update (merged into data via JSONB concatenation), returning the
+// updated document. Like MongoDB's findOneAndUpdate(). Returns nil if no
+// document matches.
+func DocFindOneAndUpdate(ctx context.Context, q execQuerier, collection string, filter, update interface{}) (map[string]interface{}, error) {
+	if err := validateIdentifier(collection); err != nil {
+		return nil, err
+	}
+
+	updateJSON, err := json.Marshal(update)
+	if err != nil {
+		return nil, fmt.Errorf("marshal update: %w", err)
+	}
+
+	whereClause, filterParams, nextParam, err := buildFilter(filter, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	cteWhere := ""
+	if whereClause != "" {
+		cteWhere = " WHERE " + whereClause
+	}
+
+	query := "WITH target AS (" +
+		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
+		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
+		"FROM target WHERE " + collection + ".id = target.id " +
+		"RETURNING " + collection + ".id, " + collection + ".data, " + collection + ".created_at"
+
+	args := append(append([]interface{}{}, filterParams...), string(updateJSON))
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results, err := scanDocRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
+}
+
+// DocFindOneAndDelete atomically finds a single document matching filter,
+// deletes it, and returns the deleted document. Like MongoDB's findOneAndDelete().
+// Returns nil if no document matches.
+func DocFindOneAndDelete(ctx context.Context, q execQuerier, collection string, filter interface{}) (map[string]interface{}, error) {
+	if err := validateIdentifier(collection); err != nil {
+		return nil, err
+	}
+
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	cteWhere := ""
+	if whereClause != "" {
+		cteWhere = " WHERE " + whereClause
+	}
+
+	query := "WITH target AS (" +
+		"SELECT id FROM " + collection + cteWhere + " ORDER BY id LIMIT 1" +
+		") DELETE FROM " + collection + " USING target WHERE " + collection + ".id = target.id " +
+		"RETURNING " + collection + ".id, " + collection + ".data, " + collection + ".created_at"
+
+	rows, err := q.QueryContext(ctx, query, filterParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results, err := scanDocRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
+}
+
+// DocDistinct returns the distinct values of the given JSONB field across
+// documents matching filter. Like MongoDB's distinct().
+func DocDistinct(ctx context.Context, q execQuerier, collection, field string, filter interface{}) ([]interface{}, error) {
+	if err := validateIdentifier(collection); err != nil {
+		return nil, err
+	}
+	fieldExpr, err := fieldPath(field)
+	if err != nil {
+		return nil, err
+	}
+
+	query := "SELECT DISTINCT " + fieldExpr + " FROM " + collection
+	var args []interface{}
+
+	whereParts := []string{fieldExpr + " IS NOT NULL"}
+
+	whereClause, filterParams, _, err := buildFilter(filter, 1)
+	if err != nil {
+		return nil, err
+	}
+	if whereClause != "" {
+		whereParts = append(whereParts, whereClause)
+		args = append(args, filterParams...)
+	}
+
+	query += " WHERE " + strings.Join(whereParts, " AND ")
+
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []interface{}
+	for rows.Next() {
+		var val interface{}
+		if err := rows.Scan(&val); err != nil {
+			return nil, err
+		}
+		if b, ok := val.([]byte); ok {
+			val = string(b)
+		}
+		results = append(results, val)
+	}
+	return results, rows.Err()
+}
+
+// DocFindCursor streams documents matching filter to a callback, fetching in
+// batches (default 100). Like MongoDB's find().cursor() — useful for large
+// result sets where materializing the full list would be wasteful.
+//
+// The callback returns (continue bool, err error). Returning false halts
+// iteration cleanly; returning an error aborts iteration and propagates.
+// Accepts the same DocSort/DocLimit/DocSkip options as DocFind.
+func DocFindCursor(ctx context.Context, q execQuerier, collection string, filter interface{}, callback func(doc map[string]interface{}) (bool, error), opts ...Option) error {
+	if err := validateIdentifier(collection); err != nil {
+		return err
+	}
+	if callback == nil {
+		return fmt.Errorf("callback must not be nil")
+	}
+
+	o := &docFindOptions{limit: 0}
+	for _, opt := range opts {
+		opt.applyDoc(o)
+	}
+
+	query := "SELECT id, data, created_at FROM " + collection
+	paramIdx := 1
+	var args []interface{}
+
+	whereClause, filterParams, nextParam, err := buildFilter(filter, paramIdx)
+	if err != nil {
+		return err
+	}
+	if whereClause != "" {
+		query += " WHERE " + whereClause
+		args = append(args, filterParams...)
+		paramIdx = nextParam
+	}
+
+	if len(o.sort) > 0 {
+		orderParts, err := buildSortClause(o.sort)
+		if err != nil {
+			return err
+		}
+		query += " ORDER BY " + strings.Join(orderParts, ", ")
+	} else {
+		query += " ORDER BY id"
+	}
+
+	if o.limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", paramIdx)
+		args = append(args, o.limit)
+		paramIdx++
+	}
+
+	if o.skip > 0 {
+		query += fmt.Sprintf(" OFFSET $%d", paramIdx)
+		args = append(args, o.skip)
+	}
+
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var rawData string
+		var createdAt string
+		if err := rows.Scan(&id, &rawData, &createdAt); err != nil {
+			return err
+		}
+		var doc map[string]interface{}
+		if err := json.Unmarshal([]byte(rawData), &doc); err != nil {
+			return fmt.Errorf("unmarshal document: %w", err)
+		}
+		doc["_id"] = id
+		doc["_created_at"] = createdAt
+		cont, cbErr := callback(doc)
+		if cbErr != nil {
+			return cbErr
+		}
+		if !cont {
+			return nil
+		}
+	}
+	return rows.Err()
 }
 
 // DocCount counts documents matching a filter. Like MongoDB's countDocuments().

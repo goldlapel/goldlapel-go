@@ -159,7 +159,7 @@ gl, _ := goldlapel.Start(ctx, upstream,
 
 Every helper is available both as a package-level function (taking `ctx`, `execQuerier`, and any args) and as a receiver method on `*GoldLapel` (which resolves the target automatically based on `InTx` / `WithTx`):
 
-- **Document store**: `DocInsert`, `DocInsertMany`, `DocFind`, `DocFindOne`, `DocUpdate`, `DocUpdateOne`, `DocDelete`, `DocDeleteOne`, `DocCount`, `DocCreateIndex`, `DocAggregate`, `DocWatch`, `DocUnwatch`, `DocCreateTtlIndex`, `DocRemoveTtlIndex`, `DocCreateCapped`, `DocRemoveCap`
+- **Document store**: `DocCreateCollection`, `DocInsert`, `DocInsertMany`, `DocFind`, `DocFindOne`, `DocFindCursor`, `DocUpdate`, `DocUpdateOne`, `DocDelete`, `DocDeleteOne`, `DocFindOneAndUpdate`, `DocFindOneAndDelete`, `DocDistinct`, `DocCount`, `DocCreateIndex`, `DocAggregate`, `DocWatch`, `DocUnwatch`, `DocCreateTtlIndex`, `DocRemoveTtlIndex`, `DocCreateCapped`, `DocRemoveCap`
 - **Full-text / fuzzy search**: `Search`, `SearchFuzzy`, `SearchPhonetic`, `Similar`, `Suggest`, `Facets`, `Aggregate`, `Analyze`, `ExplainScore`, `CreateSearchConfig`
 - **Pub/Sub**: `Publish`, `Subscribe`, `SubscribeAsync`
 - **Queues**: `Enqueue`, `Dequeue`
