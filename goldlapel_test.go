@@ -547,6 +547,118 @@ func TestConfigToArgs_BooleanNonBool(t *testing.T) {
 	}
 }
 
+// --- log_level translation tests ---
+//
+// The proxy binary doesn't accept --log-level; verbosity is count-based
+// (-v/-vv/-vvv). ConfigToArgs translates the ergonomic log_level string
+// into the corresponding -v flag (or omits it for warn/error default).
+
+func TestConfigToArgs_LogLevelDebug(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"log_level": "debug"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"-vv"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("expected %v, got %v", want, args)
+	}
+}
+
+func TestConfigToArgs_LogLevelTrace(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"log_level": "trace"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(args, []string{"-vvv"}) {
+		t.Fatalf("expected [-vvv], got %v", args)
+	}
+}
+
+func TestConfigToArgs_LogLevelInfo(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"log_level": "info"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(args, []string{"-v"}) {
+		t.Fatalf("expected [-v], got %v", args)
+	}
+}
+
+func TestConfigToArgs_LogLevelWarnEmitsNothing(t *testing.T) {
+	for _, lvl := range []string{"warn", "warning", "error"} {
+		args, err := ConfigToArgs(map[string]interface{}{"log_level": lvl})
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", lvl, err)
+		}
+		if len(args) != 0 {
+			t.Fatalf("expected no args for log_level=%q, got %v", lvl, args)
+		}
+	}
+}
+
+func TestConfigToArgs_LogLevelCaseInsensitive(t *testing.T) {
+	args, err := ConfigToArgs(map[string]interface{}{"log_level": "DEBUG"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(args, []string{"-vv"}) {
+		t.Fatalf("expected [-vv], got %v", args)
+	}
+}
+
+func TestConfigToArgs_LogLevelInvalid(t *testing.T) {
+	_, err := ConfigToArgs(map[string]interface{}{"log_level": "loud"})
+	if err == nil {
+		t.Fatal("expected error for invalid log_level")
+	}
+	if !strings.Contains(err.Error(), "log_level must be one of") {
+		t.Fatalf("expected 'log_level must be one of' in error, got: %v", err)
+	}
+}
+
+func TestConfigToArgs_LogLevelNonString(t *testing.T) {
+	_, err := ConfigToArgs(map[string]interface{}{"log_level": 42})
+	if err == nil {
+		t.Fatal("expected error for non-string log_level")
+	}
+}
+
+func TestConfigToArgs_LogLevelNeverEmitsLongFlag(t *testing.T) {
+	// Regression guard: the proxy binary rejects --log-level. Make sure we
+	// never emit it under any circumstances.
+	for _, lvl := range []string{"trace", "debug", "info", "warn", "error"} {
+		args, err := ConfigToArgs(map[string]interface{}{"log_level": lvl})
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", lvl, err)
+		}
+		for _, a := range args {
+			if a == "--log-level" {
+				t.Fatalf("emitted --log-level for level=%q (proxy does not support it)", lvl)
+			}
+		}
+	}
+}
+
+func TestWithLogLevelTranslatesToVerboseFlag(t *testing.T) {
+	// End-to-end sanity: WithLogLevel → ConfigToArgs via the stored config map.
+	gl := &GoldLapel{}
+	WithLogLevel("debug").applyStart(gl)
+	args, err := ConfigToArgs(gl.config)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	found := false
+	for _, a := range args {
+		if a == "-vv" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected -vv in args, got %v", args)
+	}
+}
+
 // --- ConfigKeys tests ---
 
 func TestConfigKeys_ReturnsSlice(t *testing.T) {

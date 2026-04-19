@@ -175,7 +175,11 @@ func WithPort(port int) Option {
 	})
 }
 
-// WithLogLevel sets the proxy log level (e.g. "info", "debug"). Construction-time only.
+// WithLogLevel sets the proxy log level. Accepted values:
+// "trace", "debug", "info", "warn"/"warning", "error". Only trace/debug/info
+// produce additional output; warn/error are the binary's default level and
+// emit nothing extra. Any other value returns an error at Start time.
+// Construction-time only.
 func WithLogLevel(level string) Option {
 	return startOnly(func(gl *GoldLapel) {
 		if gl.config == nil {
@@ -219,11 +223,38 @@ func WithTx(tx *sql.Tx) Option {
 	})
 }
 
+// logLevelToVerboseFlag translates the wrapper-facing log_level string into
+// the proxy binary's count-based verbosity flag. The binary does not accept
+// --log-level; it accepts -v / -vv / -vvv on top of a default (warn/error)
+// level. Returns empty string when no flag should be emitted.
+//
+// Accepted inputs: "trace" → -vvv, "debug" → -vv, "info" → -v,
+// "warn"/"warning"/"error" → "" (default level, no flag).
+// Any other value returns an error with the expected set.
+func logLevelToVerboseFlag(level string) (string, error) {
+	switch strings.ToLower(level) {
+	case "":
+		return "", nil
+	case "trace":
+		return "-vvv", nil
+	case "debug":
+		return "-vv", nil
+	case "info":
+		return "-v", nil
+	case "warn", "warning", "error":
+		return "", nil
+	default:
+		return "", fmt.Errorf("log_level must be one of: trace, debug, info, warn, error (got %q)", level)
+	}
+}
+
 // ConfigToArgs converts a config map into CLI argument strings.
 // Keys are snake_case strings; each is validated against the known set of
 // config keys. Boolean keys emit a bare flag when true, nothing when false.
-// List keys emit repeated --flag value pairs for each element. All other
-// keys emit --flag value pairs.
+// List keys emit repeated --flag value pairs for each element. The
+// log_level key is a wrapper-side concept: it translates to the proxy's
+// count-based -v/-vv/-vvv flag rather than --log-level. All other keys
+// emit --flag value pairs.
 func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 	if len(config) == 0 {
 		return nil, nil
@@ -242,6 +273,22 @@ func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 		}
 
 		value := config[key]
+
+		if key == "log_level" {
+			levelStr, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("config key %q expects a string value, got %T", key, value)
+			}
+			flag, err := logLevelToVerboseFlag(levelStr)
+			if err != nil {
+				return nil, err
+			}
+			if flag != "" {
+				args = append(args, flag)
+			}
+			continue
+		}
+
 		flag := "--" + strings.ReplaceAll(key, "_", "-")
 
 		if booleanKeys[key] {

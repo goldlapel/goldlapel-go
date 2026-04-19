@@ -75,7 +75,7 @@ Spawns the proxy binary, waits for it to accept connections, eagerly opens a `*s
 Construction options:
 
 - `WithPort(port)` — proxy port (default `7932`)
-- `WithLogLevel(level)` — proxy log level (`"info"`, `"debug"`, ...)
+- `WithLogLevel(level)` — proxy log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` (only trace/debug/info produce visible output; warn/error are the default level)
 - `WithConfig(map)` — structured config map mapped to CLI flags (see below)
 - `WithExtraArgs(args...)` — raw CLI arguments passed through to the binary
 
