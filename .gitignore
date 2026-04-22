@@ -1,3 +1,8 @@
 bin/*
 !bin/.gitkeep
 coverage.out
+
+# Local secrets
+.env
+.env.local
+.env.*.local
