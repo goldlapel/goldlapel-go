@@ -10,8 +10,14 @@ import (
 
 // identifierRe caps at 63 chars (Postgres NAMEDATALEN-1) so wrapper-side
 // validation matches the proxy's server-side regex exactly:
-// `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+// `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. Use this for Postgres identifiers
+// (table/column names) where the 63-char ceiling applies.
 var identifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
+
+// fieldPartRe is the unbounded variant for JSONB field-path parts, which are
+// JSON object keys interpolated into single-quoted literals (not Postgres
+// identifiers). No 63-char cap — MongoDB-style keys can be longer.
+var fieldPartRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 func validateIdentifier(name string) error {
 	if name == "" {

@@ -1193,7 +1193,9 @@ func expandDotKeys(m map[string]interface{}) map[string]interface{} {
 func fieldPath(key string) (string, error) {
 	parts := strings.Split(key, ".")
 	for _, part := range parts {
-		if !identifierRe.MatchString(part) {
+		// JSONB field-path parts are JSON keys, not Postgres identifiers —
+		// no 63-char NAMEDATALEN cap applies.
+		if !fieldPartRe.MatchString(part) {
 			return "", fmt.Errorf("invalid filter key: %s", key)
 		}
 	}
@@ -1215,7 +1217,7 @@ func fieldPath(key string) (string, error) {
 func fieldPathJson(key string) (string, error) {
 	parts := strings.Split(key, ".")
 	for _, part := range parts {
-		if !identifierRe.MatchString(part) {
+		if !fieldPartRe.MatchString(part) {
 			return "", fmt.Errorf("invalid filter key: %s", key)
 		}
 	}
