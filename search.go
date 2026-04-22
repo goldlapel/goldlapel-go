@@ -8,7 +8,10 @@ import (
 	"strings"
 )
 
-var identifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+// identifierRe caps at 63 chars (Postgres NAMEDATALEN-1) so wrapper-side
+// validation matches the proxy's server-side regex exactly:
+// `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+var identifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
 
 func validateIdentifier(name string) error {
 	if name == "" {

@@ -1180,3 +1180,16 @@ func TestValidateIdentifier_Invalid(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateIdentifier_LengthBound asserts the 63-char ceiling that matches
+// the proxy's server-side validator (Postgres NAMEDATALEN-1).
+func TestValidateIdentifier_LengthBound(t *testing.T) {
+	max := strings.Repeat("a", 63)
+	if err := validateIdentifier(max); err != nil {
+		t.Fatalf("63-char identifier should be valid, got: %v", err)
+	}
+	over := strings.Repeat("a", 64)
+	if err := validateIdentifier(over); err == nil {
+		t.Fatalf("64-char identifier should be rejected")
+	}
+}
