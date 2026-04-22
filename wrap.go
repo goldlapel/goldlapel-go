@@ -87,21 +87,11 @@ func detectInvalidationPort() int {
 	inst := lastStartedInstance
 	lastStartedInstanceMu.Unlock()
 	if inst != nil {
-		port := inst.port
-		if inst.config != nil {
-			if ip, ok := inst.config["invalidation_port"]; ok {
-				// Start validates this up front, so this parse is expected
-				// to succeed. On unexpected failure, fall back to the derived
-				// default rather than panicking — better a best-effort port
-				// than a hard crash in Wrap().
-				if n, err := toInt(ip); err == nil {
-					return n
-				}
-			}
-		}
-		return port + 2
+		// invalidationPort is resolved at Start time: either the explicit
+		// WithInvalidationPort value or proxyPort + 2.
+		return inst.invalidationPort
 	}
-	return DefaultPort + 2
+	return DefaultProxyPort + 2
 }
 
 // Unwrap returns the underlying Querier.

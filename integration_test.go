@@ -98,8 +98,9 @@ func startForIntegration(t *testing.T) *GoldLapel {
 
 	port := nextTestPort()
 	gl, err := Start(ctx, upstream,
-		WithPort(port),
-		WithConfig(map[string]interface{}{"dashboard_port": 0, "invalidation_port": 0}),
+		WithProxyPort(port),
+		WithDashboardPort(0),
+		WithInvalidationPort(0),
 	)
 	if err != nil {
 		t.Fatalf("Start: %v", err)

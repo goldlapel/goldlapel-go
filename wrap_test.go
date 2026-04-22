@@ -531,15 +531,15 @@ func TestDetectInvalidationPort_Default(t *testing.T) {
 	}()
 
 	port := detectInvalidationPort()
-	if port != DefaultPort+2 {
-		t.Fatalf("expected %d, got %d", DefaultPort+2, port)
+	if port != DefaultProxyPort+2 {
+		t.Fatalf("expected %d, got %d", DefaultProxyPort+2, port)
 	}
 }
 
 func TestDetectInvalidationPort_FromInstance(t *testing.T) {
 	lastStartedInstanceMu.Lock()
 	old := lastStartedInstance
-	lastStartedInstance = &GoldLapel{port: 8000}
+	lastStartedInstance = &GoldLapel{proxyPort: 8000, invalidationPort: 8002}
 	lastStartedInstanceMu.Unlock()
 	defer func() {
 		lastStartedInstanceMu.Lock()
@@ -553,12 +553,13 @@ func TestDetectInvalidationPort_FromInstance(t *testing.T) {
 	}
 }
 
-func TestDetectInvalidationPort_FromConfig(t *testing.T) {
+func TestDetectInvalidationPort_FromExplicitOverride(t *testing.T) {
 	lastStartedInstanceMu.Lock()
 	old := lastStartedInstance
 	lastStartedInstance = &GoldLapel{
-		port:   8000,
-		config: map[string]interface{}{"invalidation_port": 9999},
+		proxyPort:           8000,
+		invalidationPort:    9999,
+		invalidationPortSet: true,
 	}
 	lastStartedInstanceMu.Unlock()
 	defer func() {

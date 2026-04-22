@@ -47,7 +47,7 @@ import (
 )
 
 const (
-	DefaultPort          = 7932
+	DefaultProxyPort     = 7932
 	DefaultDashboardPort = 7933
 	startupTimeout       = 10 * time.Second
 	startupPollInterval  = 50 * time.Millisecond
@@ -61,16 +61,20 @@ var (
 	withPortRe    = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$`)
 	withoutPortRe = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$`)
 
+	// validConfigKeys enumerates the tuning knobs still accepted inside the
+	// structured `config` map. Top-level concepts (proxy_port, dashboard_port,
+	// invalidation_port, log_level, mode, license, client, config_file) are
+	// exposed via their own With* functional options and are NOT valid keys
+	// here — passing them through WithConfig raises at argv build time.
 	validConfigKeys = map[string]bool{
-		"mode": true, "min_pattern_count": true, "refresh_interval_secs": true,
+		"min_pattern_count": true, "refresh_interval_secs": true,
 		"pattern_ttl_secs": true, "max_tables_per_view": true, "max_columns_per_view": true,
 		"deep_pagination_threshold": true, "report_interval_secs": true,
 		"result_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
 		"pool_size": true, "pool_timeout_secs": true, "pool_mode": true,
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
-		"tls_cert": true, "tls_key": true, "tls_client_ca": true, "config": true,
-		"dashboard_port": true, "invalidation_port": true, "log_level": true,
+		"tls_cert": true, "tls_key": true, "tls_client_ca": true,
 		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
 		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
@@ -106,10 +110,10 @@ var (
 
 // Option is the unified functional-options type accepted by Start and by
 // every receiver method. Implementations typically set construction
-// parameters (e.g. WithPort) or per-call overrides (e.g. WithTx). A single
-// Option may participate in any combination of the four facets:
+// parameters (e.g. WithProxyPort) or per-call overrides (e.g. WithTx). A
+// single Option may participate in any combination of the four facets:
 //
-//	applyStart  — set fields on *GoldLapel before spawn (WithPort, WithConfig)
+//	applyStart  — set fields on *GoldLapel before spawn (WithProxyPort, WithConfig)
 //	applyCall   — override per-call state such as the tx target (WithTx)
 //	applySearch — populate search-specific options (WithLimit, WithLang, ...)
 //	applyDoc    — populate DocFind-specific options (DocSort, DocLimit, ...)
@@ -169,10 +173,29 @@ type callOptions struct {
 	tx *sql.Tx
 }
 
-// WithPort sets the proxy listen port. Construction-time only.
-func WithPort(port int) Option {
+// WithProxyPort sets the proxy listen port. Construction-time only.
+func WithProxyPort(port int) Option {
 	return startOnly(func(gl *GoldLapel) {
-		gl.port = port
+		gl.proxyPort = port
+	})
+}
+
+// WithDashboardPort sets the dashboard listen port. When unset, the port is
+// derived as proxy_port + 1. Set to 0 to disable the dashboard entirely.
+// Construction-time only.
+func WithDashboardPort(port int) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.dashboardPort = port
+		gl.dashboardPortSet = true
+	})
+}
+
+// WithInvalidationPort sets the cache-invalidation listen port. When unset,
+// the port is derived as proxy_port + 2. Construction-time only.
+func WithInvalidationPort(port int) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.invalidationPort = port
+		gl.invalidationPortSet = true
 	})
 }
 
@@ -183,10 +206,41 @@ func WithPort(port int) Option {
 // Construction-time only.
 func WithLogLevel(level string) Option {
 	return startOnly(func(gl *GoldLapel) {
-		if gl.config == nil {
-			gl.config = map[string]interface{}{}
-		}
-		gl.config["log_level"] = level
+		gl.logLevel = level
+	})
+}
+
+// WithMode sets the proxy operating mode (e.g. "waiter", "bellhop"). Passed
+// as --mode. Construction-time only.
+func WithMode(mode string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.mode = mode
+	})
+}
+
+// WithLicense sets the path to the license file. Passed as --license.
+// Construction-time only.
+func WithLicense(path string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.license = path
+	})
+}
+
+// WithClient sets the client identifier, emitted via GOLDLAPEL_CLIENT for
+// per-wrapper telemetry tagging. Defaults to "go" when unset.
+// Construction-time only.
+func WithClient(client string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.client = client
+	})
+}
+
+// WithConfigFile sets the path to a TOML config file the Rust binary will
+// parse. Passed as --config. Distinct from WithConfig (which accepts a
+// structured map of tuning keys). Construction-time only.
+func WithConfigFile(path string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.configFile = path
 	})
 }
 
@@ -197,22 +251,24 @@ func WithExtraArgs(args ...string) Option {
 	})
 }
 
-// WithSilent suppresses the one-line startup banner that Start would
-// otherwise print to stderr. Use it in library code, CLI tools, or test
-// harnesses that don't want the wrapper chattering on their streams.
-// Construction-time only.
-func WithSilent() Option {
+// WithSilent toggles the one-line startup banner that Start would otherwise
+// print to stderr. Pass true (or omit the argument if calling via the zero
+// value) to suppress the banner in library code, CLI tools, or test
+// harnesses. Construction-time only.
+func WithSilent(silent bool) Option {
 	return startOnly(func(gl *GoldLapel) {
-		gl.silent = true
+		gl.silent = silent
 	})
 }
 
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
+// Top-level concepts (proxy_port, dashboard_port, invalidation_port,
+// log_level, mode, license, client, config_file) must use their own
+// WithX option and are rejected from this map at Start time.
 // Construction-time only.
 func WithConfig(config map[string]interface{}) Option {
 	return startOnly(func(gl *GoldLapel) {
-		// Merge into any pre-existing config (e.g. from WithLogLevel).
 		if gl.config == nil {
 			gl.config = map[string]interface{}{}
 		}
@@ -234,7 +290,7 @@ func WithTx(tx *sql.Tx) Option {
 	})
 }
 
-// logLevelToVerboseFlag translates the wrapper-facing log_level string into
+// LogLevelToVerboseFlag translates the wrapper-facing log_level string into
 // the proxy binary's count-based verbosity flag. The binary does not accept
 // --log-level; it accepts -v / -vv / -vvv on top of a default (warn/error)
 // level. Returns empty string when no flag should be emitted.
@@ -242,7 +298,7 @@ func WithTx(tx *sql.Tx) Option {
 // Accepted inputs: "trace" → -vvv, "debug" → -vv, "info" → -v,
 // "warn"/"warning"/"error" → "" (default level, no flag).
 // Any other value returns an error with the expected set.
-func logLevelToVerboseFlag(level string) (string, error) {
+func LogLevelToVerboseFlag(level string) (string, error) {
 	switch strings.ToLower(level) {
 	case "":
 		return "", nil
@@ -261,11 +317,9 @@ func logLevelToVerboseFlag(level string) (string, error) {
 
 // ConfigToArgs converts a config map into CLI argument strings.
 // Keys are snake_case strings; each is validated against the known set of
-// config keys. Boolean keys emit a bare flag when true, nothing when false.
-// List keys emit repeated --flag value pairs for each element. The
-// log_level key is a wrapper-side concept: it translates to the proxy's
-// count-based -v/-vv/-vvv flag rather than --log-level. All other keys
-// emit --flag value pairs.
+// tuning-key names. Boolean keys emit a bare flag when true, nothing when
+// false. List keys emit repeated --flag value pairs for each element. All
+// other keys emit --flag value pairs.
 func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 	if len(config) == 0 {
 		return nil, nil
@@ -284,22 +338,6 @@ func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 		}
 
 		value := config[key]
-
-		if key == "log_level" {
-			levelStr, ok := value.(string)
-			if !ok {
-				return nil, fmt.Errorf("config key %q expects a string value, got %T", key, value)
-			}
-			flag, err := logLevelToVerboseFlag(levelStr)
-			if err != nil {
-				return nil, err
-			}
-			if flag != "" {
-				args = append(args, flag)
-			}
-			continue
-		}
-
 		flag := "--" + strings.ReplaceAll(key, "_", "-")
 
 		if booleanKeys[key] {
@@ -351,21 +389,29 @@ func ConfigKeys() []string {
 // (document store, search, pub/sub, queues, etc.) bound to a database/sql
 // connection pointed at the proxy.
 type GoldLapel struct {
-	upstream      string
-	port          int
-	dashboardPort int
-	config        map[string]interface{}
-	extraArgs     []string
-	cmd           *exec.Cmd
-	proxyURL      string
-	stderr        string
-	done          chan struct{} // closed when process exits
-	waitErr       error         // set by spawn's reaper goroutine before closing done
-	weSignaled    bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
-	db            *sql.DB
-	tx            *sql.Tx // non-nil only for GoldLapel instances returned by InTx
-	silent        bool    // when true, printBanner is a no-op
-	mu            sync.Mutex
+	upstream            string
+	proxyPort           int
+	dashboardPort       int
+	dashboardPortSet    bool // true once WithDashboardPort has overridden the derivation
+	invalidationPort    int
+	invalidationPortSet bool // true once WithInvalidationPort has overridden the derivation
+	logLevel            string
+	mode                string
+	license             string
+	client              string
+	configFile          string
+	config              map[string]interface{}
+	extraArgs           []string
+	cmd                 *exec.Cmd
+	proxyURL            string
+	stderr              string
+	done                chan struct{} // closed when process exits
+	waitErr             error         // set by spawn's reaper goroutine before closing done
+	weSignaled          bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
+	db                  *sql.DB
+	tx                  *sql.Tx // non-nil only for GoldLapel instances returned by InTx
+	silent              bool    // when true, printBanner is a no-op
+	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
 	dashboardToken string   // provisioned on spawn; cleared on Stop
 	ddlCache       sync.Map // per-instance cache keyed on "family:name" → *DdlEntry
@@ -376,37 +422,27 @@ type GoldLapel struct {
 // a ready-to-use *GoldLapel. Call gl.Stop(ctx) to terminate — typically via
 // defer gl.Stop(ctx).
 //
-// Options may include construction-time settings (WithPort, WithLogLevel,
-// WithConfig, WithExtraArgs).
+// Options may include construction-time settings (WithProxyPort, WithLogLevel,
+// WithConfig, WithExtraArgs, WithDashboardPort, WithInvalidationPort, ...).
 func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, error) {
 	gl := &GoldLapel{
-		upstream: upstream,
-		port:     DefaultPort,
+		upstream:  upstream,
+		proxyPort: DefaultProxyPort,
 	}
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
-	// Dashboard defaults to proxy port + 1 (matches what the Rust binary
-	// binds when no --dashboard-port is passed). Only when the user supplies
-	// an explicit dashboard_port via WithConfig does that value override the
-	// derivation. This means WithPort(17932) correctly reports the dashboard
-	// at :17933 rather than the hardcoded 7933.
-	gl.dashboardPort = gl.port + 1
-	if gl.config != nil {
-		if dp, ok := gl.config["dashboard_port"]; ok {
-			n, err := toInt(dp)
-			if err != nil {
-				return nil, fmt.Errorf("invalid dashboard_port: %w", err)
-			}
-			gl.dashboardPort = n
-		}
-		// Validate invalidation_port up front so Wrap()'s later lookup via
-		// detectInvalidationPort() is guaranteed to succeed.
-		if ip, ok := gl.config["invalidation_port"]; ok {
-			if _, err := toInt(ip); err != nil {
-				return nil, fmt.Errorf("invalid invalidation_port: %w", err)
-			}
-		}
+	// Dashboard and invalidation ports default to proxy port + 1 / + 2
+	// (matches what the Rust binary binds when no --dashboard-port /
+	// --invalidation-port is passed). WithDashboardPort / WithInvalidationPort
+	// set the `*Set` flag to signal an explicit override — those values are
+	// then emitted verbatim at spawn time, including 0 which disables the
+	// dashboard entirely.
+	if !gl.dashboardPortSet {
+		gl.dashboardPort = gl.proxyPort + 1
+	}
+	if !gl.invalidationPortSet {
+		gl.invalidationPort = gl.proxyPort + 2
 	}
 
 	if err := gl.spawn(ctx); err != nil {
@@ -432,7 +468,37 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 		return err
 	}
 
-	args := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.port)}
+	args := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.proxyPort)}
+	// Top-level options (promoted out of the config map by the canonical
+	// surface) emit their own CLI flags. Each is suppressed when the user
+	// hasn't set it, so the binary applies its own defaults.
+	if gl.dashboardPortSet {
+		args = append(args, "--dashboard-port", fmt.Sprintf("%d", gl.dashboardPort))
+	}
+	if gl.invalidationPortSet {
+		args = append(args, "--invalidation-port", fmt.Sprintf("%d", gl.invalidationPort))
+	}
+	if gl.logLevel != "" {
+		flag, err := LogLevelToVerboseFlag(gl.logLevel)
+		if err != nil {
+			return fmt.Errorf("invalid log_level: %w", err)
+		}
+		if flag != "" {
+			args = append(args, flag)
+		}
+	}
+	if gl.mode != "" {
+		args = append(args, "--mode", gl.mode)
+	}
+	if gl.license != "" {
+		args = append(args, "--license", gl.license)
+	}
+	if gl.client != "" {
+		args = append(args, "--client", gl.client)
+	}
+	if gl.configFile != "" {
+		args = append(args, "--config", gl.configFile)
+	}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)
 		if err != nil {
@@ -444,7 +510,10 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 
 	gl.cmd = exec.Command(bin, args...)
 	gl.cmd.Env = os.Environ()
-	if os.Getenv("GOLDLAPEL_CLIENT") == "" {
+	// GOLDLAPEL_CLIENT env var is only set when the caller hasn't supplied
+	// --client via WithClient (explicit --client flag takes precedence) and
+	// the env var isn't already set by the surrounding shell.
+	if gl.client == "" && os.Getenv("GOLDLAPEL_CLIENT") == "" {
 		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_CLIENT=go")
 	}
 	// Provision a session-scoped dashboard token so ddl.go can authenticate
@@ -476,14 +545,14 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 		close(stderrDone)
 	}()
 
-	if !waitForPortCtx(ctx, "127.0.0.1", gl.port, startupTimeout) {
+	if !waitForPortCtx(ctx, "127.0.0.1", gl.proxyPort, startupTimeout) {
 		gl.cmd.Process.Kill()
 		gl.cmd.Wait()
 		<-stderrDone
 		gl.stderr = stderrBuf.String()
 		gl.cmd = nil
 		return fmt.Errorf("Gold Lapel failed to start on port %d within %ds.\nstderr: %s",
-			gl.port, int(startupTimeout.Seconds()), gl.stderr)
+			gl.proxyPort, int(startupTimeout.Seconds()), gl.stderr)
 	}
 
 	gl.done = make(chan struct{})
@@ -498,7 +567,7 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 		close(gl.done)
 	}()
 
-	gl.proxyURL = MakeProxyURL(gl.upstream, gl.port)
+	gl.proxyURL = MakeProxyURL(gl.upstream, gl.proxyPort)
 
 	// Eagerly open a database/sql pool against the proxy. The user may
 	// register any Postgres driver — we prefer "pgx" (from
@@ -532,9 +601,9 @@ func (gl *GoldLapel) printBanner(w io.Writer) {
 		return
 	}
 	if gl.dashboardPort > 0 {
-		fmt.Fprintf(w, "goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.port, gl.dashboardPort)
+		fmt.Fprintf(w, "goldlapel → :%d (proxy) | http://127.0.0.1:%d (dashboard)\n", gl.proxyPort, gl.dashboardPort)
 	} else {
-		fmt.Fprintf(w, "goldlapel → :%d (proxy)\n", gl.port)
+		fmt.Fprintf(w, "goldlapel → :%d (proxy)\n", gl.proxyPort)
 	}
 }
 
@@ -702,9 +771,17 @@ func (gl *GoldLapel) URL() string {
 	return gl.proxyURL
 }
 
-// Port returns the configured proxy port.
-func (gl *GoldLapel) Port() int {
-	return gl.port
+// ProxyPort returns the configured proxy port.
+func (gl *GoldLapel) ProxyPort() int {
+	return gl.proxyPort
+}
+
+// InvalidationPort returns the cache-invalidation port (proxy port + 2 by
+// default, overridden via WithInvalidationPort).
+func (gl *GoldLapel) InvalidationPort() int {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	return gl.invalidationPort
 }
 
 // Running reports whether the proxy process is still alive.
@@ -861,14 +938,15 @@ func (gl *GoldLapel) InTx(ctx context.Context, db *sql.DB, fn func(*GoldLapel) e
 	// racing against Stop/Start.
 	gl.mu.Lock()
 	scoped := &GoldLapel{
-		upstream:      gl.upstream,
-		port:          gl.port,
-		dashboardPort: gl.dashboardPort,
-		cmd:           gl.cmd,
-		proxyURL:      gl.proxyURL,
-		done:          gl.done,
-		db:            gl.db,
-		tx:            tx,
+		upstream:         gl.upstream,
+		proxyPort:        gl.proxyPort,
+		dashboardPort:    gl.dashboardPort,
+		invalidationPort: gl.invalidationPort,
+		cmd:              gl.cmd,
+		proxyURL:         gl.proxyURL,
+		done:             gl.done,
+		db:               gl.db,
+		tx:               tx,
 	}
 	gl.mu.Unlock()
 

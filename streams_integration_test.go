@@ -23,10 +23,10 @@ func startForStreams(t *testing.T) *GoldLapel {
 
 	port := nextTestPort()
 	gl, err := Start(ctx, upstream,
-		WithPort(port),
+		WithProxyPort(port),
+		WithInvalidationPort(0),
 		WithConfig(map[string]interface{}{
-			"invalidation_port":   0,
-			"disable_result_cache": true,
+			"disable_result_cache":  true,
 			"disable_consolidation": true,
 		}),
 	)

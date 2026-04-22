@@ -360,45 +360,38 @@ func TestWaitForPortClosedPort(t *testing.T) {
 // --- GoldLapel struct tests ---
 
 // buildForTest constructs a *GoldLapel without spawning the binary. Used by
-// unit tests that exercise field-level behaviour (Port, DashboardURL parsing,
-// Stop idempotency on an unstarted instance, etc.).
+// unit tests that exercise field-level behaviour (ProxyPort, DashboardURL
+// parsing, Stop idempotency on an unstarted instance, etc.).
 func buildForTest(upstream string, opts ...Option) *GoldLapel {
 	gl := &GoldLapel{
-		upstream: upstream,
-		port:     DefaultPort,
+		upstream:  upstream,
+		proxyPort: DefaultProxyPort,
 	}
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
-	// Mirrors Start: default dashboard port to proxy port + 1 so custom
-	// WithPort values propagate to the dashboard. Explicit dashboard_port
-	// in config overrides.
-	gl.dashboardPort = gl.port + 1
-	if gl.config != nil {
-		if dp, ok := gl.config["dashboard_port"]; ok {
-			// Test helper: panic on malformed config — callers pass valid
-			// values. Real Start() returns an error instead.
-			n, err := toInt(dp)
-			if err != nil {
-				panic(err)
-			}
-			gl.dashboardPort = n
-		}
+	// Mirrors Start: default dashboard / invalidation ports derive from
+	// proxyPort unless WithDashboardPort / WithInvalidationPort set them.
+	if !gl.dashboardPortSet {
+		gl.dashboardPort = gl.proxyPort + 1
+	}
+	if !gl.invalidationPortSet {
+		gl.invalidationPort = gl.proxyPort + 2
 	}
 	return gl
 }
 
-func TestDefaultPort(t *testing.T) {
+func TestDefaultProxyPort(t *testing.T) {
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
-	if gl.Port() != 7932 {
-		t.Fatalf("expected default port 7932, got %d", gl.Port())
+	if gl.ProxyPort() != 7932 {
+		t.Fatalf("expected default proxy port 7932, got %d", gl.ProxyPort())
 	}
 }
 
-func TestCustomPort(t *testing.T) {
-	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithPort(9000))
-	if gl.Port() != 9000 {
-		t.Fatalf("expected port 9000, got %d", gl.Port())
+func TestCustomProxyPort(t *testing.T) {
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithProxyPort(9000))
+	if gl.ProxyPort() != 9000 {
+		t.Fatalf("expected proxy port 9000, got %d", gl.ProxyPort())
 	}
 }
 
@@ -436,11 +429,11 @@ func TestCloseMirrorsStop(t *testing.T) {
 // --- ConfigToArgs tests ---
 
 func TestConfigToArgs_StringValue(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"mode": "waiter"})
+	args, err := ConfigToArgs(map[string]interface{}{"pool_mode": "transaction"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"--mode", "waiter"}
+	want := []string{"--pool-mode", "transaction"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("got %v, want %v", args, want)
 	}
@@ -516,15 +509,15 @@ func TestConfigToArgs_UnknownKey(t *testing.T) {
 
 func TestConfigToArgs_MultipleKeys(t *testing.T) {
 	args, err := ConfigToArgs(map[string]interface{}{
-		"mode":         "waiter",
+		"pool_mode":    "transaction",
 		"pool_size":    10,
 		"disable_pool": true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Keys are sorted: disable_pool, mode, pool_size
-	want := []string{"--disable-pool", "--mode", "waiter", "--pool-size", "10"}
+	// Keys are sorted: disable_pool, pool_mode, pool_size
+	want := []string{"--disable-pool", "--pool-mode", "transaction", "--pool-size", "10"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("got %v, want %v", args, want)
 	}
@@ -563,64 +556,66 @@ func TestConfigToArgs_BooleanNonBool(t *testing.T) {
 // --- log_level translation tests ---
 //
 // The proxy binary doesn't accept --log-level; verbosity is count-based
-// (-v/-vv/-vvv). ConfigToArgs translates the ergonomic log_level string
-// into the corresponding -v flag (or omits it for warn/error default).
+// (-v/-vv/-vvv). LogLevelToVerboseFlag translates the ergonomic log_level
+// string into the corresponding -v flag (or "" for the warn/error default).
+// Under the canonical config surface log_level lives on the top-level
+// WithLogLevel option — not inside the config map — so this suite exercises
+// the translator directly.
 
-func TestConfigToArgs_LogLevelDebug(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"log_level": "debug"})
+func TestLogLevelToVerboseFlag_Debug(t *testing.T) {
+	flag, err := LogLevelToVerboseFlag("debug")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"-vv"}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("expected %v, got %v", want, args)
+	if flag != "-vv" {
+		t.Fatalf("expected -vv, got %q", flag)
 	}
 }
 
-func TestConfigToArgs_LogLevelTrace(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"log_level": "trace"})
+func TestLogLevelToVerboseFlag_Trace(t *testing.T) {
+	flag, err := LogLevelToVerboseFlag("trace")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !reflect.DeepEqual(args, []string{"-vvv"}) {
-		t.Fatalf("expected [-vvv], got %v", args)
+	if flag != "-vvv" {
+		t.Fatalf("expected -vvv, got %q", flag)
 	}
 }
 
-func TestConfigToArgs_LogLevelInfo(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"log_level": "info"})
+func TestLogLevelToVerboseFlag_Info(t *testing.T) {
+	flag, err := LogLevelToVerboseFlag("info")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !reflect.DeepEqual(args, []string{"-v"}) {
-		t.Fatalf("expected [-v], got %v", args)
+	if flag != "-v" {
+		t.Fatalf("expected -v, got %q", flag)
 	}
 }
 
-func TestConfigToArgs_LogLevelWarnEmitsNothing(t *testing.T) {
+func TestLogLevelToVerboseFlag_WarnEmitsNothing(t *testing.T) {
 	for _, lvl := range []string{"warn", "warning", "error"} {
-		args, err := ConfigToArgs(map[string]interface{}{"log_level": lvl})
+		flag, err := LogLevelToVerboseFlag(lvl)
 		if err != nil {
 			t.Fatalf("unexpected error for %q: %v", lvl, err)
 		}
-		if len(args) != 0 {
-			t.Fatalf("expected no args for log_level=%q, got %v", lvl, args)
+		if flag != "" {
+			t.Fatalf("expected empty flag for log_level=%q, got %q", lvl, flag)
 		}
 	}
 }
 
-func TestConfigToArgs_LogLevelCaseInsensitive(t *testing.T) {
-	args, err := ConfigToArgs(map[string]interface{}{"log_level": "DEBUG"})
+func TestLogLevelToVerboseFlag_CaseInsensitive(t *testing.T) {
+	flag, err := LogLevelToVerboseFlag("DEBUG")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !reflect.DeepEqual(args, []string{"-vv"}) {
-		t.Fatalf("expected [-vv], got %v", args)
+	if flag != "-vv" {
+		t.Fatalf("expected -vv, got %q", flag)
 	}
 }
 
-func TestConfigToArgs_LogLevelInvalid(t *testing.T) {
-	_, err := ConfigToArgs(map[string]interface{}{"log_level": "loud"})
+func TestLogLevelToVerboseFlag_Invalid(t *testing.T) {
+	_, err := LogLevelToVerboseFlag("loud")
 	if err == nil {
 		t.Fatal("expected error for invalid log_level")
 	}
@@ -629,46 +624,40 @@ func TestConfigToArgs_LogLevelInvalid(t *testing.T) {
 	}
 }
 
-func TestConfigToArgs_LogLevelNonString(t *testing.T) {
-	_, err := ConfigToArgs(map[string]interface{}{"log_level": 42})
-	if err == nil {
-		t.Fatal("expected error for non-string log_level")
-	}
-}
-
-func TestConfigToArgs_LogLevelNeverEmitsLongFlag(t *testing.T) {
+func TestLogLevelToVerboseFlag_NeverEmitsLongFlag(t *testing.T) {
 	// Regression guard: the proxy binary rejects --log-level. Make sure we
 	// never emit it under any circumstances.
 	for _, lvl := range []string{"trace", "debug", "info", "warn", "error"} {
-		args, err := ConfigToArgs(map[string]interface{}{"log_level": lvl})
+		flag, err := LogLevelToVerboseFlag(lvl)
 		if err != nil {
 			t.Fatalf("unexpected error for %q: %v", lvl, err)
 		}
-		for _, a := range args {
-			if a == "--log-level" {
-				t.Fatalf("emitted --log-level for level=%q (proxy does not support it)", lvl)
-			}
+		if flag == "--log-level" {
+			t.Fatalf("emitted --log-level for level=%q (proxy does not support it)", lvl)
 		}
 	}
 }
 
-func TestWithLogLevelTranslatesToVerboseFlag(t *testing.T) {
-	// End-to-end sanity: WithLogLevel → ConfigToArgs via the stored config map.
+func TestWithLogLevelSetsFieldForSpawn(t *testing.T) {
+	// End-to-end sanity: WithLogLevel populates the top-level logLevel
+	// field (not the config map). The flag emission happens in spawn().
 	gl := &GoldLapel{}
 	WithLogLevel("debug").applyStart(gl)
-	args, err := ConfigToArgs(gl.config)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if gl.logLevel != "debug" {
+		t.Fatalf("expected gl.logLevel = 'debug', got %q", gl.logLevel)
 	}
-	found := false
-	for _, a := range args {
-		if a == "-vv" {
-			found = true
-			break
-		}
+	if gl.config != nil {
+		t.Fatalf("expected WithLogLevel not to allocate gl.config, got %v", gl.config)
 	}
-	if !found {
-		t.Fatalf("expected -vv in args, got %v", args)
+}
+
+func TestConfigToArgs_LogLevelInMapRejected(t *testing.T) {
+	// Regression guard: log_level was promoted out of the config map to a
+	// top-level option. Passing it via WithConfig must raise — no silent
+	// fallback.
+	_, err := ConfigToArgs(map[string]interface{}{"log_level": "debug"})
+	if err == nil {
+		t.Fatal("expected error for log_level inside config map")
 	}
 }
 
@@ -690,9 +679,17 @@ func TestConfigKeys_ContainsKnownKeys(t *testing.T) {
 	for _, k := range keys {
 		keySet[k] = true
 	}
-	for _, expected := range []string{"mode", "pool_size", "disable_matviews", "replica"} {
+	// Tuning knobs still live in the structured config map.
+	for _, expected := range []string{"pool_size", "disable_matviews", "replica"} {
 		if !keySet[expected] {
 			t.Fatalf("expected ConfigKeys() to contain %q", expected)
+		}
+	}
+	// Top-level concepts must NOT appear — passing them through the config
+	// map is a user error.
+	for _, promoted := range []string{"mode", "log_level", "dashboard_port", "invalidation_port", "config", "license", "client"} {
+		if keySet[promoted] {
+			t.Fatalf("ConfigKeys() unexpectedly contains promoted top-level key %q", promoted)
 		}
 	}
 }
@@ -724,18 +721,14 @@ func TestDashboardURLDefaultPort(t *testing.T) {
 }
 
 func TestDashboardURLCustomPort(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
-		"dashboard_port": 8080,
-	}))
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDashboardPort(8080))
 	if gl.dashboardPort != 8080 {
 		t.Fatalf("expected dashboard port 8080, got %d", gl.dashboardPort)
 	}
 }
 
 func TestDashboardURLDisabled(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
-		"dashboard_port": 0,
-	}))
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDashboardPort(0))
 	if gl.dashboardPort != 0 {
 		t.Fatalf("expected dashboard port 0, got %d", gl.dashboardPort)
 	}
@@ -751,17 +744,8 @@ func TestDashboardURLNotRunning(t *testing.T) {
 	}
 }
 
-func TestDashboardPortFromConfigString(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithConfig(map[string]interface{}{
-		"dashboard_port": "9090",
-	}))
-	if gl.dashboardPort != 9090 {
-		t.Fatalf("expected dashboard port 9090, got %d", gl.dashboardPort)
-	}
-}
-
 func TestDashboardPortDerivesFromCustomProxyPort(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithPort(17932))
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithProxyPort(17932))
 	if gl.dashboardPort != 17933 {
 		t.Fatalf("expected dashboard port 17933 (proxy+1), got %d", gl.dashboardPort)
 	}
@@ -769,28 +753,59 @@ func TestDashboardPortDerivesFromCustomProxyPort(t *testing.T) {
 
 func TestExplicitDashboardPortOverridesDerivation(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb",
-		WithPort(17932),
-		WithConfig(map[string]interface{}{"dashboard_port": 9999}),
+		WithProxyPort(17932),
+		WithDashboardPort(9999),
 	)
 	if gl.dashboardPort != 9999 {
 		t.Fatalf("expected explicit dashboard port 9999, got %d", gl.dashboardPort)
 	}
 }
 
+func TestInvalidationPortDerivesFromCustomProxyPort(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithProxyPort(17932))
+	if gl.invalidationPort != 17934 {
+		t.Fatalf("expected invalidation port 17934 (proxy+2), got %d", gl.invalidationPort)
+	}
+}
+
+func TestExplicitInvalidationPortOverridesDerivation(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb",
+		WithProxyPort(17932),
+		WithInvalidationPort(9999),
+	)
+	if gl.invalidationPort != 9999 {
+		t.Fatalf("expected explicit invalidation port 9999, got %d", gl.invalidationPort)
+	}
+}
+
 func TestWithConfig_Integration(t *testing.T) {
 	config := map[string]interface{}{
-		"mode":      "waiter",
+		"pool_mode": "transaction",
 		"pool_size": 20,
 	}
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithConfig(config))
 	if gl.config == nil {
 		t.Fatal("expected config to be set")
 	}
-	if gl.config["mode"] != "waiter" {
-		t.Fatalf("expected mode=waiter, got %v", gl.config["mode"])
+	if gl.config["pool_mode"] != "transaction" {
+		t.Fatalf("expected pool_mode=transaction, got %v", gl.config["pool_mode"])
 	}
 	if gl.config["pool_size"] != 20 {
 		t.Fatalf("expected pool_size=20, got %v", gl.config["pool_size"])
+	}
+}
+
+func TestWithMode_SetsTopLevelField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithMode("waiter"))
+	if gl.mode != "waiter" {
+		t.Fatalf("expected mode=waiter, got %q", gl.mode)
+	}
+}
+
+func TestWithClient_SetsTopLevelField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithClient("django"))
+	if gl.client != "django" {
+		t.Fatalf("expected client=django, got %q", gl.client)
 	}
 }
 
@@ -832,22 +847,26 @@ func TestToInt_ErrorOnUnknownType(t *testing.T) {
 	}
 }
 
-func TestStart_ErrorsOnBadDashboardPort(t *testing.T) {
+func TestStart_ErrorsOnDashboardPortInConfigMap(t *testing.T) {
+	// Regression guard: dashboard_port was promoted to a top-level option.
+	// Passing it via WithConfig must fail at argv build time.
 	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
-		WithConfig(map[string]interface{}{"dashboard_port": "abc"}))
+		WithConfig(map[string]interface{}{"dashboard_port": 9090}))
 	if err == nil {
-		t.Fatal("expected Start to error on unparseable dashboard_port")
+		t.Fatal("expected Start to error when dashboard_port is passed via WithConfig")
 	}
 	if !strings.Contains(err.Error(), "dashboard_port") {
 		t.Fatalf("expected error to mention dashboard_port, got %q", err.Error())
 	}
 }
 
-func TestStart_ErrorsOnBadInvalidationPort(t *testing.T) {
+func TestStart_ErrorsOnInvalidationPortInConfigMap(t *testing.T) {
+	// Regression guard: invalidation_port was promoted to a top-level option.
+	// Passing it via WithConfig must fail at argv build time.
 	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
-		WithConfig(map[string]interface{}{"invalidation_port": "xyz"}))
+		WithConfig(map[string]interface{}{"invalidation_port": 9090}))
 	if err == nil {
-		t.Fatal("expected Start to error on unparseable invalidation_port")
+		t.Fatal("expected Start to error when invalidation_port is passed via WithConfig")
 	}
 	if !strings.Contains(err.Error(), "invalidation_port") {
 		t.Fatalf("expected error to mention invalidation_port, got %q", err.Error())
@@ -858,7 +877,7 @@ func TestStart_ErrorsOnBadInvalidationPort(t *testing.T) {
 //
 // The startup banner must never go to stdout (library code that pollutes
 // stdout breaks callers who capture it — CI tools, test runners, CLIs
-// piping the wrapper's own output). WithSilent() must suppress it on both
+// piping the wrapper's own output). WithSilent(true) must suppress it on both
 // streams. These tests swap os.Stdout/os.Stderr for pipes, invoke the
 // banner helper the same way Start does, and inspect what landed where —
 // all without spawning the real binary.
@@ -934,7 +953,7 @@ func TestBannerWritesToStderrNotStdout(t *testing.T) {
 }
 
 func TestWithSilentSuppressesBanner(t *testing.T) {
-	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent())
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent(true))
 
 	stdout, stderr := captureStdStreams(t, func() {
 		gl.printBanner(os.Stderr)
@@ -957,9 +976,18 @@ func TestWithSilentDefaultsFalse(t *testing.T) {
 }
 
 func TestWithSilentSetsField(t *testing.T) {
-	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent())
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent(true))
 	if !gl.silent {
-		t.Fatal("expected WithSilent() to set silent=true")
+		t.Fatal("expected WithSilent(true) to set silent=true")
+	}
+}
+
+func TestWithSilentFalseLeavesFieldOff(t *testing.T) {
+	// WithSilent(false) is idiomatic explicit opt-out and must not flip
+	// silent=true. It's a plain boolean under the canonical surface.
+	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb", WithSilent(false))
+	if gl.silent {
+		t.Fatal("expected WithSilent(false) to leave silent=false")
 	}
 }
 
