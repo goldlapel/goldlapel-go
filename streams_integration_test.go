@@ -178,6 +178,79 @@ func TestIntegrationStreams_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestIntegrationStreams_ConcurrentReadNoDoubleClaim proves StreamRead's
+// transaction wrapping is load-bearing: two consumers racing on the same
+// consumer group must divide the pending messages between them, never
+// claiming the same message twice.
+//
+// Without BEGIN/COMMIT around the cursor read + advance + pending insert,
+// the SELECT ... FOR UPDATE lock is released immediately under autocommit
+// and the two consumers read the same cursor.
+func TestIntegrationStreams_ConcurrentReadNoDoubleClaim(t *testing.T) {
+	gl := startForStreams(t)
+	gl.UseDB(openIntegrationDB(t, gl))
+	ctx := context.Background()
+	name := fmt.Sprintf("gl_go_int_concurrent_%d", time.Now().UnixNano())
+
+	if err := gl.StreamCreateGroup(ctx, name, "workers"); err != nil {
+		t.Fatalf("StreamCreateGroup: %v", err)
+	}
+	const N = 40
+	for i := 0; i < N; i++ {
+		if _, err := gl.StreamAdd(ctx, name, fmt.Sprintf(`{"i":%d}`, i)); err != nil {
+			t.Fatalf("StreamAdd %d: %v", i, err)
+		}
+	}
+
+	type result struct {
+		ids []int64
+		err error
+	}
+	ch := make(chan result, 2)
+	start := make(chan struct{})
+	for _, consumer := range []string{"ca", "cb"} {
+		consumer := consumer
+		go func() {
+			<-start
+			var out []int64
+			for {
+				batch, err := gl.StreamRead(ctx, name, "workers", consumer, 4)
+				if err != nil {
+					ch <- result{nil, err}
+					return
+				}
+				if len(batch) == 0 {
+					break
+				}
+				for _, m := range batch {
+					out = append(out, m.ID)
+				}
+			}
+			ch <- result{out, nil}
+		}()
+	}
+	close(start)
+
+	seen := make(map[int64]int) // id -> consumer count
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("StreamRead goroutine: %v", r.err)
+		}
+		for _, id := range r.ids {
+			seen[id]++
+		}
+	}
+	if len(seen) != N {
+		t.Errorf("want %d distinct messages, got %d (seen=%v)", N, len(seen), seen)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("message %d claimed %d times (want 1)", id, n)
+		}
+	}
+}
+
 // Suppress unused-import warning on database/sql when integration env isn't
 // set (skip ⇒ none of these functions run).
 var _ = sql.ErrNoRows

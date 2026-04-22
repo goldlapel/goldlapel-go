@@ -586,6 +586,17 @@ func StreamCreateGroup(ctx context.Context, gl *GoldLapel, stream, group string)
 }
 
 // StreamRead reads messages from a stream for a consumer group. Like redis.xreadgroup().
+//
+// StreamRead runs the cursor read → advance → pending insert sequence inside
+// an explicit transaction so that the FOR UPDATE lock from the cursor SELECT
+// is held across the whole claim flow. Under autocommit the lock would be
+// released as soon as the SELECT returns, letting concurrent consumers read
+// the same cursor and claim duplicate messages.
+//
+// If the instance is already scoped to a caller-owned transaction (via
+// InTx/WithTx), we run inside that transaction and let the caller manage
+// commit/rollback. Otherwise we begin our own tx on the pool for the
+// duration of this call.
 func StreamRead(ctx context.Context, gl *GoldLapel, stream, group, consumer string, count int) ([]StreamMessage, error) {
 	if err := validateIdentifier(stream); err != nil {
 		return nil, err
@@ -611,20 +622,57 @@ func StreamRead(ctx context.Context, gl *GoldLapel, stream, group, consumer stri
 		return nil, err
 	}
 
-	q, eqErr := gl.requireExec()
-	if eqErr != nil {
-		return nil, eqErr
+	// If the caller is already inside a tx (InTx/WithTx) we run in it.
+	// Otherwise we open a private tx on the pool just for this call.
+	gl.mu.Lock()
+	scopedTx := gl.tx
+	db := gl.db
+	gl.mu.Unlock()
+
+	var q execQuerier
+	var ownTx *sql.Tx
+	if scopedTx != nil {
+		q = scopedTx
+	} else {
+		if db == nil {
+			return nil, ErrNotConnected
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		ownTx = tx
+		q = tx
 	}
+
+	// commitOrRollback is a no-op when the caller owns the tx.
+	commit := func() error {
+		if ownTx != nil {
+			return ownTx.Commit()
+		}
+		return nil
+	}
+	rollback := func() {
+		if ownTx != nil {
+			_ = ownTx.Rollback()
+		}
+	}
+
 	var lastID int64
 	if err := q.QueryRowContext(ctx, cursorSQL, group).Scan(&lastID); err != nil {
 		if err == sql.ErrNoRows {
+			if cerr := commit(); cerr != nil {
+				return nil, cerr
+			}
 			return nil, nil
 		}
+		rollback()
 		return nil, err
 	}
 
 	rows, err := q.QueryContext(ctx, readSQL, lastID, count)
 	if err != nil {
+		rollback()
 		return nil, err
 	}
 	var msgs []StreamMessage
@@ -632,25 +680,32 @@ func StreamRead(ctx context.Context, gl *GoldLapel, stream, group, consumer stri
 		var m StreamMessage
 		if err := rows.Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
 			rows.Close()
+			rollback()
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		rollback()
 		return nil, err
 	}
 
 	if len(msgs) > 0 {
 		maxID := msgs[len(msgs)-1].ID
 		if _, err := q.ExecContext(ctx, advanceSQL, maxID, group); err != nil {
+			rollback()
 			return nil, err
 		}
 		for _, m := range msgs {
 			if _, err := q.ExecContext(ctx, pendingSQL, m.ID, group, consumer); err != nil {
+				rollback()
 				return nil, err
 			}
 		}
+	}
+	if err := commit(); err != nil {
+		return nil, err
 	}
 	return msgs, nil
 }
