@@ -151,6 +151,89 @@ func TestFetchDDL_CacheHit_DoesNotRePost(t *testing.T) {
 	f.mu.Unlock()
 }
 
+func TestFetchDDL_DifferentOwners_Isolated(t *testing.T) {
+	f := newFakeDashboard()
+	defer f.close()
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_events"},
+		"query_patterns": map[string]any{"insert": "X"},
+	})
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_events"},
+		"query_patterns": map[string]any{"insert": "X"},
+	})
+	glA := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
+	glB := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
+	if _, err := glA.FetchDDL(context.Background(), "stream", "events"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := glB.FetchDDL(context.Background(), "stream", "events"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.captured) != 2 {
+		t.Errorf("isolated caches must each trigger a fetch; got %d POSTs", len(f.captured))
+	}
+}
+
+func TestFetchDDL_DifferentNames_MissCache(t *testing.T) {
+	f := newFakeDashboard()
+	defer f.close()
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_events"},
+		"query_patterns": map[string]any{"insert": "INSERT events"},
+	})
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_orders"},
+		"query_patterns": map[string]any{"insert": "INSERT orders"},
+	})
+	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
+	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gl.FetchDDL(context.Background(), "stream", "orders"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.captured) != 2 {
+		t.Errorf("different names must each trigger a fetch; got %d POSTs", len(f.captured))
+	}
+}
+
+func TestFetchDDL_Invalidate_DropsCache(t *testing.T) {
+	f := newFakeDashboard()
+	defer f.close()
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_events"},
+		"query_patterns": map[string]any{"insert": "X"},
+	})
+	f.queue(200, map[string]any{
+		"tables":         map[string]any{"main": "_goldlapel.stream_events"},
+		"query_patterns": map[string]any{"insert": "X"},
+	})
+	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
+	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+		t.Fatal(err)
+	}
+	// Stop() clears gl.ddlCache; simulate that without spawning a proxy by
+	// ranging the underlying sync.Map directly (mirrors the clear loop in
+	// goldlapel.go Stop()).
+	gl.ddlCache.Range(func(k, _ any) bool {
+		gl.ddlCache.Delete(k)
+		return true
+	})
+	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.captured) != 2 {
+		t.Errorf("invalidate must drop cache; got %d POSTs", len(f.captured))
+	}
+}
+
 func TestFetchDDL_VersionMismatch_Actionable(t *testing.T) {
 	f := newFakeDashboard()
 	defer f.close()
@@ -182,7 +265,7 @@ func TestFetchDDL_Forbidden_TokenError(t *testing.T) {
 func TestFetchDDL_MissingToken_ErrsBeforeHttp(t *testing.T) {
 	// Use t.Setenv so cleanup is automatic.
 	t.Setenv("GOLDLAPEL_DASHBOARD_TOKEN", "")
-	// Also set HOME to a tempdir so no ~/.goldlapel/dashboard_token file
+	// Also set HOME to a tempdir so no ~/.goldlapel/dashboard-token file
 	// is found.
 	t.Setenv("HOME", t.TempDir())
 	gl := &GoldLapel{dashboardPort: 9999, dashboardToken: ""}
