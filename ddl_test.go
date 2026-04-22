@@ -94,7 +94,7 @@ func TestFetchDDL_HappyPath_PostsCorrectBodyAndHeaders(t *testing.T) {
 	})
 
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	entry, err := gl.FetchDDL(context.Background(), "stream", "events")
+	entry, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,11 +133,11 @@ func TestFetchDDL_CacheHit_DoesNotRePost(t *testing.T) {
 		"query_patterns": map[string]any{"insert": "X"},
 	})
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	a, err := gl.FetchDDL(context.Background(), "stream", "events")
+	a, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := gl.FetchDDL(context.Background(), "stream", "events")
+	b, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,10 +164,10 @@ func TestFetchDDL_DifferentOwners_Isolated(t *testing.T) {
 	})
 	glA := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
 	glB := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	if _, err := glA.FetchDDL(context.Background(), "stream", "events"); err != nil {
+	if _, err := glA.FetchPatterns(context.Background(), "stream", "events"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := glB.FetchDDL(context.Background(), "stream", "events"); err != nil {
+	if _, err := glB.FetchPatterns(context.Background(), "stream", "events"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -189,10 +189,10 @@ func TestFetchDDL_DifferentNames_MissCache(t *testing.T) {
 		"query_patterns": map[string]any{"insert": "INSERT orders"},
 	})
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+	if _, err := gl.FetchPatterns(context.Background(), "stream", "events"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gl.FetchDDL(context.Background(), "stream", "orders"); err != nil {
+	if _, err := gl.FetchPatterns(context.Background(), "stream", "orders"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -214,7 +214,7 @@ func TestFetchDDL_Invalidate_DropsCache(t *testing.T) {
 		"query_patterns": map[string]any{"insert": "X"},
 	})
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+	if _, err := gl.FetchPatterns(context.Background(), "stream", "events"); err != nil {
 		t.Fatal(err)
 	}
 	// Stop() clears gl.ddlCache; simulate that without spawning a proxy by
@@ -224,7 +224,7 @@ func TestFetchDDL_Invalidate_DropsCache(t *testing.T) {
 		gl.ddlCache.Delete(k)
 		return true
 	})
-	if _, err := gl.FetchDDL(context.Background(), "stream", "events"); err != nil {
+	if _, err := gl.FetchPatterns(context.Background(), "stream", "events"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -242,7 +242,7 @@ func TestFetchDDL_VersionMismatch_Actionable(t *testing.T) {
 		"detail": "wrapper requested v1; proxy speaks v2 — upgrade proxy",
 	})
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	_, err := gl.FetchDDL(context.Background(), "stream", "events")
+	_, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -256,7 +256,7 @@ func TestFetchDDL_Forbidden_TokenError(t *testing.T) {
 	defer f.close()
 	f.queue(403, map[string]any{"error": "forbidden"})
 	gl := &GoldLapel{dashboardPort: f.port(), dashboardToken: "tok"}
-	_, err := gl.FetchDDL(context.Background(), "stream", "events")
+	_, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err == nil || !strings.Contains(err.Error(), "dashboard token") {
 		t.Errorf("expected token error, got %v", err)
 	}
@@ -269,7 +269,7 @@ func TestFetchDDL_MissingToken_ErrsBeforeHttp(t *testing.T) {
 	// is found.
 	t.Setenv("HOME", t.TempDir())
 	gl := &GoldLapel{dashboardPort: 9999, dashboardToken: ""}
-	_, err := gl.FetchDDL(context.Background(), "stream", "events")
+	_, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err == nil || !strings.Contains(err.Error(), "No dashboard token") {
 		t.Errorf("expected missing-token error, got %v", err)
 	}
@@ -277,7 +277,7 @@ func TestFetchDDL_MissingToken_ErrsBeforeHttp(t *testing.T) {
 
 func TestFetchDDL_MissingPort_Errs(t *testing.T) {
 	gl := &GoldLapel{dashboardPort: 0, dashboardToken: "tok"}
-	_, err := gl.FetchDDL(context.Background(), "stream", "events")
+	_, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err == nil || !strings.Contains(err.Error(), "No dashboard port") {
 		t.Errorf("expected missing-port error, got %v", err)
 	}
@@ -285,7 +285,7 @@ func TestFetchDDL_MissingPort_Errs(t *testing.T) {
 
 func TestFetchDDL_Unreachable_Actionable(t *testing.T) {
 	gl := &GoldLapel{dashboardPort: 1, dashboardToken: "tok"}
-	_, err := gl.FetchDDL(context.Background(), "stream", "events")
+	_, err := gl.FetchPatterns(context.Background(), "stream", "events")
 	if err == nil || !strings.Contains(err.Error(), "dashboard not reachable") {
 		t.Errorf("expected unreachable error, got %v", err)
 	}

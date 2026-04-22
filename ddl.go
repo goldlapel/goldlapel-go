@@ -95,9 +95,9 @@ var ddlPost httpPoster = func(ctx context.Context, url, token string, body []byt
 	return resp.StatusCode, b, nil
 }
 
-// FetchDDL fetches (and caches per-instance) the canonical {tables,
+// FetchPatterns fetches (and caches per-instance) the canonical {tables,
 // query_patterns} for a helper on a specific GoldLapel instance.
-func (gl *GoldLapel) FetchDDL(ctx context.Context, family, name string) (*DdlEntry, error) {
+func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string) (*DdlEntry, error) {
 	key := family + ":" + name
 	if cached, ok := gl.ddlCache.Load(key); ok {
 		return cached.(*DdlEntry), nil
@@ -182,7 +182,7 @@ func (gl *GoldLapel) FetchDDL(ctx context.Context, family, name string) (*DdlEnt
 // StreamPatterns is a typed convenience for callers that only want the
 // query_patterns map.
 func (gl *GoldLapel) streamPatterns(ctx context.Context, stream string) (map[string]string, error) {
-	entry, err := gl.FetchDDL(ctx, "stream", stream)
+	entry, err := gl.FetchPatterns(ctx, "stream", stream)
 	if err != nil {
 		return nil, err
 	}
