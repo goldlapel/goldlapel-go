@@ -12,19 +12,42 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// integrationUpstream and integrationBinary control whether the live tests
-// below try to spawn the Gold Lapel binary. If either is missing, tests are
-// skipped. Set GOLDLAPEL_TEST_UPSTREAM to enable, e.g.
+// integrationEnv gates integration tests on the standardized Gold Lapel
+// convention shared across all 7 wrapper repos:
 //
+//   - GOLDLAPEL_INTEGRATION=1  — explicit opt-in gate
+//   - GOLDLAPEL_TEST_UPSTREAM  — Postgres URL for the test upstream
+//
+// Both must be set. If GOLDLAPEL_INTEGRATION=1 is set but
+// GOLDLAPEL_TEST_UPSTREAM is missing, the gate calls t.Fatal — this
+// prevents a half-configured CI from silently skipping integration tests
+// and producing a false-green unit-only run.
+//
+// If GOLDLAPEL_INTEGRATION is unset, tests skip silently (unit-only run).
+//
+// Also set GOLDLAPEL_BINARY to point at the goldlapel binary, e.g.
+//
+//	GOLDLAPEL_INTEGRATION=1 \
 //	GOLDLAPEL_TEST_UPSTREAM=postgresql://sgibson@localhost/postgres \
 //	GOLDLAPEL_BINARY=/home/sgibson/bin/goldlapel \
 //	go test -run TestIntegration ./...
 func integrationEnv(t *testing.T) string {
 	t.Helper()
+	integration := os.Getenv("GOLDLAPEL_INTEGRATION") == "1"
 	upstream := os.Getenv("GOLDLAPEL_TEST_UPSTREAM")
-	if upstream == "" {
-		t.Skip("set GOLDLAPEL_TEST_UPSTREAM to run integration tests")
+
+	if integration && upstream == "" {
+		// Half-configured CI — fail loudly to prevent false-green.
+		t.Fatal("GOLDLAPEL_INTEGRATION=1 is set but GOLDLAPEL_TEST_UPSTREAM " +
+			"is missing. Set GOLDLAPEL_TEST_UPSTREAM to a Postgres URL " +
+			"(e.g. postgresql://postgres@localhost/postgres) or unset " +
+			"GOLDLAPEL_INTEGRATION to skip integration tests.")
 	}
+
+	if !integration {
+		t.Skip("set GOLDLAPEL_INTEGRATION=1 and GOLDLAPEL_TEST_UPSTREAM to run integration tests")
+	}
+
 	return upstream
 }
 
