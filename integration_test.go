@@ -252,3 +252,133 @@ func TestIntegration_WithTxOverride(t *testing.T) {
 	}
 }
 
+// TestIntegration_DocFilter_ElemMatch asserts the $elemMatch operator against
+// a real Postgres instance — the SQL shape is identical to the cross-wrapper
+// reference (jsonb_array_elements + EXISTS) so passing here confirms the Go
+// translator's output actually executes against Postgres.
+func TestIntegration_DocFilter_ElemMatch(t *testing.T) {
+	gl := startForIntegration(t)
+	db := openIntegrationDB(t, gl)
+
+	ctx := context.Background()
+	collection := fmt.Sprintf("gltest_elemmatch_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+collection)
+	})
+
+	// Seed: three docs with a "scores" array.
+	docs := []interface{}{
+		map[string]interface{}{"name": "alice", "scores": []interface{}{70, 85, 92}, "tags": []interface{}{"python", "sql"}},
+		map[string]interface{}{"name": "bob", "scores": []interface{}{50, 60, 65}, "tags": []interface{}{"java", "go"}},
+		map[string]interface{}{"name": "carol", "scores": []interface{}{88, 95}, "tags": []interface{}{"pytest", "ruby"}},
+	}
+	if _, err := DocInsertMany(ctx, db, collection, docs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Numeric range: at least one score strictly between 80 and 90 →
+	// alice (85) and carol (88) qualify; bob (max 65) doesn't.
+	hits, err := DocFind(ctx, db, collection, map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$gt": 80, "$lt": 90},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocFind $elemMatch numeric: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits for 80<score<90 (alice+carol), got %d", len(hits))
+	}
+	// Verify bob isn't in the results.
+	for _, h := range hits {
+		if h["data"].(map[string]interface{})["name"] == "bob" {
+			t.Fatal("bob should not match — scores all <70")
+		}
+	}
+
+	// Regex on string array: tags starting with "py" → alice ("python"), carol ("pytest").
+	hits, err = DocFind(ctx, db, collection, map[string]interface{}{
+		"tags": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$regex": "^py"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocFind $elemMatch regex: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits for tags^=py, got %d", len(hits))
+	}
+
+	// No match: scores > 100.
+	hits, err = DocFind(ctx, db, collection, map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$gt": 100},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocFind $elemMatch no-match: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits for score>100, got %d", len(hits))
+	}
+}
+
+// TestIntegration_DocFilter_Text asserts the $text operator against a real
+// Postgres — uses the default english full-text config. No extensions
+// required: to_tsvector/plainto_tsquery are built in.
+func TestIntegration_DocFilter_Text(t *testing.T) {
+	gl := startForIntegration(t)
+	db := openIntegrationDB(t, gl)
+
+	ctx := context.Background()
+	collection := fmt.Sprintf("gltest_text_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+collection)
+	})
+
+	// Seed three articles.
+	docs := []interface{}{
+		map[string]interface{}{"title": "A guide to coffee", "body": "Brewing the perfect cup of coffee requires fresh beans."},
+		map[string]interface{}{"title": "Tea ceremonies", "body": "Traditional tea brewing varies by region."},
+		map[string]interface{}{"title": "Roasting techniques", "body": "Dark roasted coffee has a smoky character."},
+	}
+	if _, err := DocInsertMany(ctx, db, collection, docs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Top-level $text: search anywhere in the document for "coffee" → 2 hits.
+	hits, err := DocFind(ctx, db, collection, map[string]interface{}{
+		"$text": map[string]interface{}{"$search": "coffee"},
+	})
+	if err != nil {
+		t.Fatalf("DocFind top-level $text: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits for 'coffee', got %d", len(hits))
+	}
+
+	// Field-level $text on body: "brewing" should hit the first two.
+	hits, err = DocFind(ctx, db, collection, map[string]interface{}{
+		"body": map[string]interface{}{
+			"$text": map[string]interface{}{"$search": "brewing"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocFind field-level $text: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits for body contains 'brewing', got %d", len(hits))
+	}
+
+	// No match.
+	hits, err = DocFind(ctx, db, collection, map[string]interface{}{
+		"$text": map[string]interface{}{"$search": "unobtanium"},
+	})
+	if err != nil {
+		t.Fatalf("DocFind $text no-match: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits for 'unobtanium', got %d", len(hits))
+	}
+}
+

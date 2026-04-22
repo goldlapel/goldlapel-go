@@ -1158,6 +1158,7 @@ var supportedFilterOps = map[string]bool{
 	"$gt": true, "$gte": true, "$lt": true, "$lte": true,
 	"$eq": true, "$ne": true, "$in": true, "$nin": true,
 	"$exists": true, "$regex": true,
+	"$elemMatch": true, "$text": true,
 }
 
 func expandDotKeys(m map[string]interface{}) map[string]interface{} {
@@ -1207,6 +1208,24 @@ func fieldPath(key string) (string, error) {
 	return expr, nil
 }
 
+// fieldPathJson is the JSONB-typed variant of fieldPath — returns the chain of
+// arrow operators that produces a JSONB value (not text). Used by operators
+// that need to expand into JSONB functions like jsonb_array_elements, e.g.
+// $elemMatch.
+func fieldPathJson(key string) (string, error) {
+	parts := strings.Split(key, ".")
+	for _, part := range parts {
+		if !identifierRe.MatchString(part) {
+			return "", fmt.Errorf("invalid filter key: %s", key)
+		}
+	}
+	chain := "data"
+	for _, part := range parts {
+		chain += fmt.Sprintf("->'%s'", part)
+	}
+	return chain, nil
+}
+
 func isOperatorMap(m map[string]interface{}) bool {
 	for k := range m {
 		if len(k) > 0 && k[0] == '$' {
@@ -1241,6 +1260,7 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 
 	containment := make(map[string]interface{})
 	var operatorKeys []string
+	var topLevelTextKeys []string
 
 	keys := make([]string, 0, len(filterMap))
 	for k := range filterMap {
@@ -1249,6 +1269,10 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 	sort.Strings(keys)
 
 	for _, key := range keys {
+		if key == "$text" {
+			topLevelTextKeys = append(topLevelTextKeys, key)
+			continue
+		}
 		value := filterMap[key]
 		valMap, isMap := value.(map[string]interface{})
 		if isMap && isOperatorMap(valMap) {
@@ -1271,6 +1295,26 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 		allClauses = append(allClauses, fmt.Sprintf("data @> $%d::jsonb", paramIdx))
 		allParams = append(allParams, string(cJSON))
 		paramIdx++
+	}
+
+	for _, key := range topLevelTextKeys {
+		textMap, ok := filterMap[key].(map[string]interface{})
+		if !ok {
+			return "", nil, startParam, fmt.Errorf("$text requires {$search: 'query'}")
+		}
+		search, hasSearch := textMap["$search"]
+		if !hasSearch {
+			return "", nil, startParam, fmt.Errorf("$text requires {$search: 'query'}")
+		}
+		lang := "english"
+		if l, ok := textMap["$language"].(string); ok {
+			lang = l
+		}
+		allClauses = append(allClauses, fmt.Sprintf(
+			"to_tsvector($%d, data::text) @@ plainto_tsquery($%d, $%d)",
+			paramIdx, paramIdx+1, paramIdx+2))
+		allParams = append(allParams, lang, lang, fmt.Sprintf("%v", search))
+		paramIdx += 3
 	}
 
 	for _, key := range operatorKeys {
@@ -1338,6 +1382,68 @@ func buildFilter(filter interface{}, startParam int) (string, []interface{}, int
 				allClauses = append(allClauses, fmt.Sprintf("%s ~ $%d", fieldExpr, paramIdx))
 				allParams = append(allParams, operand)
 				paramIdx++
+			} else if op == "$elemMatch" {
+				subMap, ok := operand.(map[string]interface{})
+				if !ok {
+					return "", nil, startParam, fmt.Errorf("$elemMatch value must be an object")
+				}
+				fj, err := fieldPathJson(key)
+				if err != nil {
+					return "", nil, startParam, err
+				}
+				// Sort sub-op keys for deterministic SQL output (matches Python's
+				// dict insertion order + tests; Go maps have random iteration).
+				subOps := make([]string, 0, len(subMap))
+				for k := range subMap {
+					subOps = append(subOps, k)
+				}
+				sort.Strings(subOps)
+
+				var elemClauses []string
+				for _, subOp := range subOps {
+					subVal := subMap[subOp]
+					if sqlOp, isCmp := comparisonOps[subOp]; isCmp {
+						if isNumeric(subVal) {
+							elemClauses = append(elemClauses,
+								fmt.Sprintf("(elem#>>'{}')::numeric %s $%d", sqlOp, paramIdx))
+						} else {
+							elemClauses = append(elemClauses,
+								fmt.Sprintf("elem#>>'{}' %s $%d", sqlOp, paramIdx))
+						}
+						allParams = append(allParams, subVal)
+						paramIdx++
+					} else if subOp == "$regex" {
+						elemClauses = append(elemClauses,
+							fmt.Sprintf("elem#>>'{}' ~ $%d", paramIdx))
+						allParams = append(allParams, subVal)
+						paramIdx++
+					} else {
+						return "", nil, startParam, fmt.Errorf("Unsupported $elemMatch operator: %s", subOp)
+					}
+				}
+				if len(elemClauses) > 0 {
+					allClauses = append(allClauses, fmt.Sprintf(
+						"EXISTS (SELECT 1 FROM jsonb_array_elements(%s) AS elem WHERE %s)",
+						fj, strings.Join(elemClauses, " AND ")))
+				}
+			} else if op == "$text" {
+				textMap, ok := operand.(map[string]interface{})
+				if !ok {
+					return "", nil, startParam, fmt.Errorf("$text requires {$search: 'query'}")
+				}
+				search, hasSearch := textMap["$search"]
+				if !hasSearch {
+					return "", nil, startParam, fmt.Errorf("$text requires {$search: 'query'}")
+				}
+				lang := "english"
+				if l, ok := textMap["$language"].(string); ok {
+					lang = l
+				}
+				allClauses = append(allClauses, fmt.Sprintf(
+					"to_tsvector($%d, %s) @@ plainto_tsquery($%d, $%d)",
+					paramIdx, fieldExpr, paramIdx+1, paramIdx+2))
+				allParams = append(allParams, lang, lang, fmt.Sprintf("%v", search))
+				paramIdx += 3
 			}
 		}
 	}

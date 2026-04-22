@@ -2224,3 +2224,239 @@ func TestDocFindCursor_InvalidCollection(t *testing.T) {
 		t.Fatal("expected error for invalid collection")
 	}
 }
+
+// --- $elemMatch ---
+// Cross-wrapper shape: EXISTS (SELECT 1 FROM jsonb_array_elements(<fieldJson>) AS elem WHERE <subClauses>)
+// where sub-clauses use elem#>>'{}' (text form) or (elem#>>'{}')::numeric for numerics.
+// Patterned after Python's _build_filter in goldlapel-python/src/goldlapel/utils.py
+// and JS buildFilter in goldlapel-js/utils.js.
+
+func TestBuildFilter_ElemMatch_NumericRange(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$gt": 80, "$lt": 90},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "EXISTS")
+	assertContains(t, last.query, "jsonb_array_elements(data->'scores')")
+	assertContains(t, last.query, "(elem#>>'{}')::numeric >")
+	assertContains(t, last.query, "(elem#>>'{}')::numeric <")
+}
+
+func TestBuildFilter_ElemMatch_StringRegex(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"tags": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$regex": "^py"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "EXISTS")
+	assertContains(t, last.query, "jsonb_array_elements(data->'tags')")
+	assertContains(t, last.query, "elem#>>'{}' ~")
+}
+
+func TestBuildFilter_ElemMatch_SingleCondition(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$eq": "perfect"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "EXISTS")
+	// Non-numeric operand → text comparator
+	assertContains(t, last.query, "elem#>>'{}' =")
+}
+
+func TestBuildFilter_ElemMatch_DotNotation(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"profile.tags": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$eq": "gold"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// JSONB array expression for a dotted path uses nested -> (no ->>).
+	assertContains(t, last.query, "jsonb_array_elements(data->'profile'->'tags')")
+}
+
+func TestBuildFilter_ElemMatch_InvalidOperand(t *testing.T) {
+	db, _ := newTestDB(t, []string{"_id", "data", "created_at"}, nil)
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": []interface{}{1, 2},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for $elemMatch non-object operand")
+	}
+	assertContains(t, err.Error(), "must be an object")
+}
+
+func TestBuildFilter_ElemMatch_UnsupportedSubOp(t *testing.T) {
+	db, _ := newTestDB(t, []string{"_id", "data", "created_at"}, nil)
+	_, err := DocFind(ctx, db, "users", map[string]interface{}{
+		"scores": map[string]interface{}{
+			"$elemMatch": map[string]interface{}{"$foo": 1},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported sub-op")
+	}
+	assertContains(t, err.Error(), "Unsupported $elemMatch")
+}
+
+// --- $text ---
+// Cross-wrapper shape: to_tsvector($N, <field_expr_or_data::text>) @@ plainto_tsquery($N+1, $N+2)
+// with params [lang, lang, search]. Top-level $text uses data::text as the target;
+// field-level $text uses the scalar field_expr (data->>'col').
+
+func TestBuildFilter_Text_TopLevel(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"$text": map[string]interface{}{"$search": "hello world"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "to_tsvector($1, data::text)")
+	assertContains(t, last.query, "plainto_tsquery($2, $3)")
+	// Params: [lang, lang, search]
+	if len(last.args) < 3 {
+		t.Fatalf("expected at least 3 params, got %d", len(last.args))
+	}
+	if last.args[0] != "english" || last.args[1] != "english" {
+		t.Fatalf("expected lang=english in first two params, got %v, %v", last.args[0], last.args[1])
+	}
+	if last.args[2] != "hello world" {
+		t.Fatalf("expected search='hello world', got %v", last.args[2])
+	}
+}
+
+func TestBuildFilter_Text_FieldLevel(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"content": map[string]interface{}{
+			"$text": map[string]interface{}{"$search": "coffee"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "to_tsvector($1, data->>'content')")
+	assertContains(t, last.query, "plainto_tsquery($2, $3)")
+}
+
+func TestBuildFilter_Text_CustomLanguage(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"$text": map[string]interface{}{
+			"$search":   "bonjour",
+			"$language": "french",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	assertContains(t, last.query, "to_tsvector($1, data::text)")
+	if len(last.args) < 3 {
+		t.Fatalf("expected at least 3 params, got %d", len(last.args))
+	}
+	if last.args[0] != "french" || last.args[1] != "french" {
+		t.Fatalf("expected lang=french, got %v, %v", last.args[0], last.args[1])
+	}
+	if last.args[2] != "bonjour" {
+		t.Fatalf("expected search='bonjour', got %v", last.args[2])
+	}
+}
+
+func TestBuildFilter_Text_MissingSearch(t *testing.T) {
+	db, _ := newTestDB(t, []string{"_id", "data", "created_at"}, nil)
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"$text": map[string]interface{}{},
+	})
+	if err == nil {
+		t.Fatal("expected error for $text without $search")
+	}
+	assertContains(t, err.Error(), "$text requires")
+}
+
+func TestBuildFilter_Text_FieldLevelMissingSearch(t *testing.T) {
+	db, _ := newTestDB(t, []string{"_id", "data", "created_at"}, nil)
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"body": map[string]interface{}{
+			"$text": map[string]interface{}{"$language": "english"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for field-level $text without $search")
+	}
+	assertContains(t, err.Error(), "$text requires")
+}
+
+func TestBuildFilter_Text_CombinedWithContainment(t *testing.T) {
+	db, drv := newTestDB(t,
+		[]string{"_id", "data", "created_at"},
+		nil)
+
+	_, err := DocFind(ctx, db, "articles", map[string]interface{}{
+		"status": "published",
+		"$text":  map[string]interface{}{"$search": "postgres"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	last := drv.lastCapture()
+	// Containment clause comes first.
+	assertContains(t, last.query, "data @> $1::jsonb")
+	// Then $text fires with $2/$3/$4.
+	assertContains(t, last.query, "to_tsvector($2, data::text)")
+	assertContains(t, last.query, "plainto_tsquery($3, $4)")
+}
