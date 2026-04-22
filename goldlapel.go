@@ -742,7 +742,7 @@ func (gl *GoldLapel) DashboardPort() int {
 
 // DashboardToken returns the dashboard token this instance provisioned for
 // the proxy subprocess. Returns "" when the proxy was launched externally
-// (in that case ddl.go falls back to env / ~/.goldlapel/dashboard_token).
+// (in that case ddl.go falls back to env / ~/.goldlapel/dashboard-token).
 func (gl *GoldLapel) DashboardToken() string {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()

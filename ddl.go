@@ -15,7 +15,7 @@ package goldlapel
 //   - (gl *GoldLapel).dashboardToken is populated when the wrapper spawned the
 //     proxy (happy path).
 //   - For externally-launched proxies, tokenFromEnvOrFile() reads
-//     GOLDLAPEL_DASHBOARD_TOKEN env or ~/.goldlapel/dashboard_token.
+//     GOLDLAPEL_DASHBOARD_TOKEN env or ~/.goldlapel/dashboard-token.
 
 import (
 	"bytes"
@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -57,7 +56,7 @@ func TokenFromEnvOrFile() string {
 	if err != nil {
 		return ""
 	}
-	path := filepath.Join(home, ".goldlapel", "dashboard_token")
+	path := filepath.Join(home, ".goldlapel", "dashboard-token")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -154,7 +153,7 @@ func (gl *GoldLapel) FetchDDL(ctx context.Context, family, name string) (*DdlEnt
 			return nil, fmt.Errorf(
 				"Gold Lapel dashboard rejected the DDL request (403). " +
 					"The dashboard token is missing or incorrect — check " +
-					"GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard_token.",
+					"GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard-token.",
 			)
 		}
 		errMsg := e.Error
@@ -190,17 +189,9 @@ func (gl *GoldLapel) streamPatterns(ctx context.Context, stream string) (map[str
 	return entry.QueryPatterns, nil
 }
 
-var numberedPlaceholder = regexp.MustCompile(`\$\d+`)
-
-// pgToPgx keeps $1/$2... placeholders intact — database/sql with lib/pq uses
-// PostgreSQL's numbered-placeholder style natively, so no translation is
-// needed. Exported as a no-op for clarity; if a future Go driver ever needs
-// ? placeholders, swap it out here.
-func pgToPgx(sql string) string {
-	return sql
-}
-
 // requireStreamPattern returns the SQL for the given pattern key or an error.
+// database/sql with lib/pq uses PostgreSQL's numbered-placeholder style
+// natively, so the proxy's $1/$2 patterns pass through verbatim.
 func requireStreamPattern(qp map[string]string, key, fn string) (string, error) {
 	if qp == nil {
 		return "", fmt.Errorf(
@@ -213,10 +204,5 @@ func requireStreamPattern(qp map[string]string, key, fn string) (string, error) 
 	if !ok {
 		return "", fmt.Errorf("DDL API response missing pattern '%s' for %s", key, fn)
 	}
-	return pgToPgx(sql), nil
+	return sql, nil
 }
-
-// _ references numberedPlaceholder so go vet doesn't flag unused import
-// paths if a future refactor drops regexp usage in favor of a hand-rolled
-// scanner. Kept here because it's still useful for diagnostics.
-var _ = numberedPlaceholder
