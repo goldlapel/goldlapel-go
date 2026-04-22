@@ -171,37 +171,35 @@ func TestGeodist_RejectsBadTable(t *testing.T) {
 	}
 }
 
+// Stream validation tests: identifier validation runs before the DDL fetch,
+// so we can pass a nil *GoldLapel — the function returns the validation
+// error before dereferencing gl.
 func TestStreamAdd_RejectsBadStream(t *testing.T) {
-	db, _ := newTestDB(t, nil, nil)
-	if _, err := StreamAdd(context.Background(), db, badIdent, "{}"); err == nil {
+	if _, err := StreamAdd(context.Background(), nil, badIdent, "{}"); err == nil {
 		t.Fatal("expected error for malicious stream")
 	}
 }
 
 func TestStreamCreateGroup_RejectsBadStream(t *testing.T) {
-	db, _ := newTestDB(t, nil, nil)
-	if err := StreamCreateGroup(context.Background(), db, badIdent, "g"); err == nil {
+	if err := StreamCreateGroup(context.Background(), nil, badIdent, "g"); err == nil {
 		t.Fatal("expected error for malicious stream")
 	}
 }
 
 func TestStreamRead_RejectsBadStream(t *testing.T) {
-	db, _ := newTestDB(t, nil, nil)
-	if _, err := StreamRead(context.Background(), db, badIdent, "g", "c", 1); err == nil {
+	if _, err := StreamRead(context.Background(), nil, badIdent, "g", "c", 1); err == nil {
 		t.Fatal("expected error for malicious stream")
 	}
 }
 
 func TestStreamAck_RejectsBadStream(t *testing.T) {
-	db, _ := newTestDB(t, nil, nil)
-	if _, err := StreamAck(context.Background(), db, badIdent, "g", 1); err == nil {
+	if _, err := StreamAck(context.Background(), nil, badIdent, "g", 1); err == nil {
 		t.Fatal("expected error for malicious stream")
 	}
 }
 
 func TestStreamClaim_RejectsBadStream(t *testing.T) {
-	db, _ := newTestDB(t, nil, nil)
-	if _, err := StreamClaim(context.Background(), db, badIdent, "g", "c", 60000); err == nil {
+	if _, err := StreamClaim(context.Background(), nil, badIdent, "g", "c", 60000); err == nil {
 		t.Fatal("expected error for malicious stream")
 	}
 }

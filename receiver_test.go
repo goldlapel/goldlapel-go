@@ -260,30 +260,39 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 		t.Fatalf("Script: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.StreamAdd(ctx, "s", `{"x":1}`)
-	if err != ErrNotConnected {
-		t.Fatalf("StreamAdd: expected ErrNotConnected, got %v", err)
+	// Stream* now fetches DDL patterns before touching the connection; an
+	// unstarted instance raises a RuntimeError-equivalent ("No dashboard
+	// token / port") rather than ErrNotConnected. Accept either.
+	isStreamNotReady := func(name string, err error) {
+		if err == nil {
+			t.Fatalf("%s: expected an error, got nil", name)
+		}
+		msg := err.Error()
+		if err == ErrNotConnected {
+			return
+		}
+		if strings.Contains(msg, "No dashboard token") ||
+			strings.Contains(msg, "No dashboard port") ||
+			strings.Contains(msg, "dashboard not reachable") {
+			return
+		}
+		t.Fatalf("%s: expected ErrNotConnected or dashboard-not-ready error, got %v", name, err)
 	}
+
+	_, err = gl.StreamAdd(ctx, "s", `{"x":1}`)
+	isStreamNotReady("StreamAdd", err)
 
 	err = gl.StreamCreateGroup(ctx, "s", "g")
-	if err != ErrNotConnected {
-		t.Fatalf("StreamCreateGroup: expected ErrNotConnected, got %v", err)
-	}
+	isStreamNotReady("StreamCreateGroup", err)
 
 	_, err = gl.StreamRead(ctx, "s", "g", "c", 10)
-	if err != ErrNotConnected {
-		t.Fatalf("StreamRead: expected ErrNotConnected, got %v", err)
-	}
+	isStreamNotReady("StreamRead", err)
 
 	_, err = gl.StreamAck(ctx, "s", "g", 1)
-	if err != ErrNotConnected {
-		t.Fatalf("StreamAck: expected ErrNotConnected, got %v", err)
-	}
+	isStreamNotReady("StreamAck", err)
 
 	_, err = gl.StreamClaim(ctx, "s", "g", "c", 1000)
-	if err != ErrNotConnected {
-		t.Fatalf("StreamClaim: expected ErrNotConnected, got %v", err)
-	}
+	isStreamNotReady("StreamClaim", err)
 
 	err = gl.PercolateAdd(ctx, "p", "q1", "test query")
 	if err != ErrNotConnected {

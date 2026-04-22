@@ -26,6 +26,7 @@ package goldlapel
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -365,6 +366,9 @@ type GoldLapel struct {
 	tx            *sql.Tx // non-nil only for GoldLapel instances returned by InTx
 	silent        bool    // when true, printBanner is a no-op
 	mu            sync.Mutex
+	// DDL API state — see ddl.go.
+	dashboardToken string   // provisioned on spawn; cleared on Stop
+	ddlCache       sync.Map // per-instance cache keyed on "family:name" → *DdlEntry
 }
 
 // Start spawns the Gold Lapel proxy against the given upstream, waits for it
@@ -442,6 +446,18 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	gl.cmd.Env = os.Environ()
 	if os.Getenv("GOLDLAPEL_CLIENT") == "" {
 		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_CLIENT=go")
+	}
+	// Provision a session-scoped dashboard token so ddl.go can authenticate
+	// against /api/ddl/*. Pre-set env wins.
+	if t := os.Getenv("GOLDLAPEL_DASHBOARD_TOKEN"); t != "" {
+		gl.dashboardToken = t
+	} else {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Errorf("generate dashboard token: %w", err)
+		}
+		gl.dashboardToken = hex.EncodeToString(buf)
+		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_DASHBOARD_TOKEN="+gl.dashboardToken)
 	}
 
 	stderrPipe, err := gl.cmd.StderrPipe()
@@ -565,6 +581,14 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 	if gl.tx != nil {
 		return nil
 	}
+
+	// Drop cached DDL patterns — they're tied to the proxy we're tearing
+	// down. sync.Map has no clear, so walk + delete.
+	gl.ddlCache.Range(func(k, _ any) bool {
+		gl.ddlCache.Delete(k)
+		return true
+	})
+	gl.dashboardToken = ""
 
 	// Unstarted / already-stopped: nothing to do.
 	//
@@ -708,6 +732,23 @@ func (gl *GoldLapel) DashboardURL() string {
 	return ""
 }
 
+// DashboardPort returns the dashboard port (proxy port + 1 by default). Used
+// by the DDL API client.
+func (gl *GoldLapel) DashboardPort() int {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	return gl.dashboardPort
+}
+
+// DashboardToken returns the dashboard token this instance provisioned for
+// the proxy subprocess. Returns "" when the proxy was launched externally
+// (in that case ddl.go falls back to env / ~/.goldlapel/dashboard_token).
+func (gl *GoldLapel) DashboardToken() string {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	return gl.dashboardToken
+}
+
 // DB returns the underlying *sql.DB connected to the proxy.
 // Returns nil if Start did not manage to open a pool (e.g. no driver
 // registered). Users can always sql.Open(..., gl.URL()) themselves.
@@ -752,6 +793,45 @@ func (gl *GoldLapel) resolveExec(opts []Option) (execQuerier, error) {
 		return nil, ErrNotConnected
 	}
 	return db, nil
+}
+
+// execQuerier is a convenience accessor that returns the active query
+// target: the scoped *sql.Tx (inside InTx), otherwise the pool *sql.DB.
+// Returns nil if the instance is stopped. Used by stream* to thread the DDL
+// API patterns through to the right connection.
+func (gl *GoldLapel) execQuerier() execQuerier {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	if gl.tx != nil {
+		return gl.tx
+	}
+	return gl.db
+}
+
+// requireExec returns the active query target or ErrNotConnected.
+// Thin wrapper over execQuerier() with a nil-check.
+func (gl *GoldLapel) requireExec() (execQuerier, error) {
+	q := gl.execQuerier()
+	if q == nil {
+		return nil, ErrNotConnected
+	}
+	return q, nil
+}
+
+// UseDB registers a caller-supplied *sql.DB with this instance so that
+// Stream*, Doc*, etc. methods resolve against it. Useful when the wrapper's
+// auto-opener couldn't connect (e.g. a driver requiring sslmode=disable that
+// isn't encoded in the default URL) and the caller opens their own pool.
+// Passing nil clears the registration.
+//
+// Ownership: once UseDB is called, the instance's Stop() WILL close the db
+// (same as the auto-opened pool). If you need to share the *sql.DB across
+// multiple GoldLapel instances or outlive the proxy, open a fresh pool per
+// instance or Close() manually before Stop.
+func (gl *GoldLapel) UseDB(db *sql.DB) {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+	gl.db = db
 }
 
 // InTx runs fn inside a database transaction. It begins a transaction on db,

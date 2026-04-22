@@ -530,111 +530,152 @@ type StreamMessage struct {
 }
 
 // StreamAdd adds a message to a stream. Like redis.xadd().
-func StreamAdd(ctx context.Context, q execQuerier, stream string, payload string) (int64, error) {
+//
+// The Stream* helpers need a *GoldLapel (not a bare execQuerier) because they
+// fetch canonical DDL + query patterns from the proxy's /api/ddl/* endpoint
+// on first call. Patterns are cached per-instance; subsequent calls reuse
+// the cache. Queries run against the GoldLapel's execQuerier (either its
+// internal *sql.DB or, inside InTx, the scoped *sql.Tx). Callers who opened
+// their own *sql.DB can register it via gl.UseDB(db) before calling.
+func StreamAdd(ctx context.Context, gl *GoldLapel, stream string, payload string) (int64, error) {
 	if err := validateIdentifier(stream); err != nil {
 		return 0, err
 	}
-	_, err := q.ExecContext(ctx,
-		"CREATE TABLE IF NOT EXISTS "+stream+" ("+
-			"id BIGSERIAL PRIMARY KEY, "+
-			"payload JSONB NOT NULL, "+
-			"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
-	if err != nil {
-		return 0, fmt.Errorf("create stream table: %w", err)
-	}
-
-	var id int64
-	err = q.QueryRowContext(ctx,
-		"INSERT INTO "+stream+" (payload) VALUES ($1::jsonb) RETURNING id",
-		payload).Scan(&id)
+	qp, err := gl.streamPatterns(ctx, stream)
 	if err != nil {
 		return 0, err
 	}
+	sql, err := requireStreamPattern(qp, "insert", "StreamAdd")
+	if err != nil {
+		return 0, err
+	}
+	// JSONB binding: cast at SQL site.
+	sql = strings.Replace(sql, "VALUES ($1)", "VALUES ($1::jsonb)", 1)
+	q, err := gl.requireExec()
+	if err != nil {
+		return 0, err
+	}
+	var id int64
+	var createdAt time.Time
+	if err := q.QueryRowContext(ctx, sql, payload).Scan(&id, &createdAt); err != nil {
+		return 0, err
+	}
+	_ = createdAt // matches canonical RETURNING; returned for symmetry
 	return id, nil
 }
 
 // StreamCreateGroup creates a consumer group for a stream. Like redis.xgroup_create().
-func StreamCreateGroup(ctx context.Context, q execQuerier, stream, group string) error {
+func StreamCreateGroup(ctx context.Context, gl *GoldLapel, stream, group string) error {
 	if err := validateIdentifier(stream); err != nil {
 		return err
 	}
-	_, err := q.ExecContext(ctx,
-		"CREATE TABLE IF NOT EXISTS "+stream+"_groups ("+
-			"group_name TEXT NOT NULL, "+
-			"consumer TEXT NOT NULL DEFAULT '', "+
-			"message_id BIGINT NOT NULL, "+
-			"acked BOOLEAN NOT NULL DEFAULT FALSE, "+
-			"claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "+
-			"PRIMARY KEY (group_name, message_id))")
+	qp, err := gl.streamPatterns(ctx, stream)
 	if err != nil {
-		return fmt.Errorf("create consumer group table: %w", err)
+		return err
 	}
-
-	_, err = q.ExecContext(ctx,
-		"CREATE TABLE IF NOT EXISTS "+stream+"_cursors ("+
-			"group_name TEXT PRIMARY KEY, "+
-			"last_id BIGINT NOT NULL DEFAULT 0)")
+	sql, err := requireStreamPattern(qp, "create_group", "StreamCreateGroup")
 	if err != nil {
-		return fmt.Errorf("create cursor table: %w", err)
+		return err
 	}
-
-	_, err = q.ExecContext(ctx,
-		"INSERT INTO "+stream+"_cursors (group_name, last_id) VALUES ($1, 0) "+
-			"ON CONFLICT (group_name) DO NOTHING",
-		group)
+	q, eqErr := gl.requireExec()
+	if eqErr != nil {
+		return eqErr
+	}
+	_, err = q.ExecContext(ctx, sql, group)
 	return err
 }
 
 // StreamRead reads messages from a stream for a consumer group. Like redis.xreadgroup().
-func StreamRead(ctx context.Context, q execQuerier, stream, group, consumer string, count int) ([]StreamMessage, error) {
+func StreamRead(ctx context.Context, gl *GoldLapel, stream, group, consumer string, count int) ([]StreamMessage, error) {
 	if err := validateIdentifier(stream); err != nil {
 		return nil, err
 	}
-	rows, err := q.QueryContext(ctx,
-		"WITH cursor AS ("+
-			"SELECT last_id FROM "+stream+"_cursors WHERE group_name = $1 FOR UPDATE"+
-			"), new_msgs AS ("+
-			"SELECT id, payload, created_at FROM "+stream+
-			" WHERE id > (SELECT last_id FROM cursor)"+
-			" ORDER BY id LIMIT $2"+
-			"), updated_cursor AS ("+
-			"UPDATE "+stream+"_cursors SET last_id = COALESCE((SELECT MAX(id) FROM new_msgs), last_id)"+
-			" WHERE group_name = $3"+
-			"), inserted AS ("+
-			"INSERT INTO "+stream+"_groups (group_name, consumer, message_id)"+
-			" SELECT $4, $5, id FROM new_msgs"+
-			" ON CONFLICT (group_name, message_id) DO NOTHING"+
-			") SELECT id, payload, created_at FROM new_msgs ORDER BY id",
-		group, count, group, group, consumer)
+	qp, err := gl.streamPatterns(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	cursorSQL, err := requireStreamPattern(qp, "group_get_cursor", "StreamRead")
+	if err != nil {
+		return nil, err
+	}
+	readSQL, err := requireStreamPattern(qp, "read_since", "StreamRead")
+	if err != nil {
+		return nil, err
+	}
+	advanceSQL, err := requireStreamPattern(qp, "group_advance_cursor", "StreamRead")
+	if err != nil {
+		return nil, err
+	}
+	pendingSQL, err := requireStreamPattern(qp, "pending_insert", "StreamRead")
+	if err != nil {
+		return nil, err
+	}
 
+	q, eqErr := gl.requireExec()
+	if eqErr != nil {
+		return nil, eqErr
+	}
+	var lastID int64
+	if err := q.QueryRowContext(ctx, cursorSQL, group).Scan(&lastID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	rows, err := q.QueryContext(ctx, readSQL, lastID, count)
+	if err != nil {
+		return nil, err
+	}
 	var msgs []StreamMessage
 	for rows.Next() {
 		var m StreamMessage
 		if err := rows.Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(msgs) > 0 {
+		maxID := msgs[len(msgs)-1].ID
+		if _, err := q.ExecContext(ctx, advanceSQL, maxID, group); err != nil {
+			return nil, err
+		}
+		for _, m := range msgs {
+			if _, err := q.ExecContext(ctx, pendingSQL, m.ID, group, consumer); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return msgs, nil
 }
 
 // StreamAck acknowledges a message in a consumer group. Like redis.xack().
-func StreamAck(ctx context.Context, q execQuerier, stream, group string, messageID int64) (bool, error) {
+func StreamAck(ctx context.Context, gl *GoldLapel, stream, group string, messageID int64) (bool, error) {
 	if err := validateIdentifier(stream); err != nil {
 		return false, err
 	}
-	result, err := q.ExecContext(ctx,
-		"UPDATE "+stream+"_groups SET acked = TRUE "+
-			"WHERE group_name = $1 AND message_id = $2 AND acked = FALSE",
-		group, messageID)
+	qp, err := gl.streamPatterns(ctx, stream)
 	if err != nil {
 		return false, err
 	}
-
+	sqlStr, err := requireStreamPattern(qp, "ack", "StreamAck")
+	if err != nil {
+		return false, err
+	}
+	q, eqErr := gl.requireExec()
+	if eqErr != nil {
+		return false, eqErr
+	}
+	result, err := q.ExecContext(ctx, sqlStr, group, messageID)
+	if err != nil {
+		return false, err
+	}
 	n, err := result.RowsAffected()
 	if err != nil {
 		return false, err
@@ -643,33 +684,57 @@ func StreamAck(ctx context.Context, q execQuerier, stream, group string, message
 }
 
 // StreamClaim claims idle messages from other consumers. Like redis.xclaim().
-func StreamClaim(ctx context.Context, q execQuerier, stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
+func StreamClaim(ctx context.Context, gl *GoldLapel, stream, group, consumer string, minIdleMs int64) ([]StreamMessage, error) {
 	if err := validateIdentifier(stream); err != nil {
 		return nil, err
 	}
-	rows, err := q.QueryContext(ctx,
-		"WITH claimed AS ("+
-			"UPDATE "+stream+"_groups SET consumer = $1, claimed_at = NOW()"+
-			" WHERE group_name = $2 AND acked = FALSE"+
-			" AND claimed_at < NOW() - ($3 || ' milliseconds')::interval"+
-			" RETURNING message_id"+
-			") SELECT s.id, s.payload, s.created_at FROM "+stream+" s"+
-			" INNER JOIN claimed c ON c.message_id = s.id ORDER BY s.id",
-		consumer, group, fmt.Sprintf("%d", minIdleMs))
+	qp, err := gl.streamPatterns(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	claimSQL, err := requireStreamPattern(qp, "claim", "StreamClaim")
+	if err != nil {
+		return nil, err
+	}
+	readByIDSQL, err := requireStreamPattern(qp, "read_by_id", "StreamClaim")
+	if err != nil {
+		return nil, err
+	}
+
+	q, eqErr := gl.requireExec()
+	if eqErr != nil {
+		return nil, eqErr
+	}
+	rows, err := q.QueryContext(ctx, claimSQL, consumer, group, minIdleMs)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	var msgs []StreamMessage
-	for rows.Next() {
+	for _, id := range ids {
 		var m StreamMessage
-		if err := rows.Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
+		if err := q.QueryRowContext(ctx, readByIDSQL, id).Scan(&m.ID, &m.Payload, &m.CreatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, rows.Err()
+	return msgs, nil
 }
 
 // Script executes Lua code on PostgreSQL via the pllua extension.

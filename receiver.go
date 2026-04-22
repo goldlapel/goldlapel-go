@@ -434,45 +434,38 @@ func (gl *GoldLapel) Script(ctx context.Context, luaCode string, args ...string)
 }
 
 // --- Stream ---
+//
+// Stream* delegate to the free functions in utils.go, which own the DDL
+// fetch + cache + query execution. The opts are accepted for symmetry with
+// other methods but are not currently honored — the stream helpers always
+// run against the instance's default execQuerier. (An explicit WithTx would
+// complicate the read flow's multi-statement transactional semantics; users
+// who need custom-tx streams can call utils.StreamX directly with their own
+// *GoldLapel-scoped transaction once InTx-returns support lands.)
 
 func (gl *GoldLapel) StreamAdd(ctx context.Context, stream string, payload string, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return StreamAdd(ctx, q, stream, payload)
+	_ = opts
+	return StreamAdd(ctx, gl, stream, payload)
 }
 
 func (gl *GoldLapel) StreamCreateGroup(ctx context.Context, stream, group string, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return StreamCreateGroup(ctx, q, stream, group)
+	_ = opts
+	return StreamCreateGroup(ctx, gl, stream, group)
 }
 
 func (gl *GoldLapel) StreamRead(ctx context.Context, stream, group, consumer string, count int, opts ...Option) ([]StreamMessage, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return StreamRead(ctx, q, stream, group, consumer, count)
+	_ = opts
+	return StreamRead(ctx, gl, stream, group, consumer, count)
 }
 
 func (gl *GoldLapel) StreamAck(ctx context.Context, stream, group string, messageID int64, opts ...Option) (bool, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return false, err
-	}
-	return StreamAck(ctx, q, stream, group, messageID)
+	_ = opts
+	return StreamAck(ctx, gl, stream, group, messageID)
 }
 
 func (gl *GoldLapel) StreamClaim(ctx context.Context, stream, group, consumer string, minIdleMs int64, opts ...Option) ([]StreamMessage, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return StreamClaim(ctx, q, stream, group, consumer, minIdleMs)
+	_ = opts
+	return StreamClaim(ctx, gl, stream, group, consumer, minIdleMs)
 }
 
 // --- Percolate ---
