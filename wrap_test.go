@@ -53,15 +53,6 @@ func (m *mockQuerier) queryCount() int {
 	return len(m.queries)
 }
 
-func (m *mockQuerier) lastQuery() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.queries) == 0 {
-		return ""
-	}
-	return m.queries[len(m.queries)-1]
-}
-
 type mockRows struct {
 	rows   [][]interface{}
 	fields []FieldDescription
