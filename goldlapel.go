@@ -261,6 +261,28 @@ func WithSilent(silent bool) Option {
 	})
 }
 
+// WithMesh opts the proxy into the mesh at startup. HQ enforces the license:
+// if the current plan doesn't cover mesh, the proxy continues running normally
+// without clustering (concierge, not bouncer) — Start does not fail.
+// Equivalent CLI flag: --mesh. Env var: GOLDLAPEL_MESH. TOML: [mesh] enabled.
+// Construction-time only.
+func WithMesh(mesh bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.mesh = mesh
+	})
+}
+
+// WithMeshTag sets the optional mesh tag. Instances sharing a tag cluster
+// together; when unset, mesh-enabled instances join the account's default
+// mesh. An empty string is normalised to no tag.
+// Equivalent CLI flag: --mesh-tag. Env var: GOLDLAPEL_MESH_TAG.
+// Construction-time only.
+func WithMeshTag(tag string) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.meshTag = tag
+	})
+}
+
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
 // Top-level concepts (proxy_port, dashboard_port, invalidation_port,
@@ -411,6 +433,8 @@ type GoldLapel struct {
 	db                  *sql.DB
 	tx                  *sql.Tx // non-nil only for GoldLapel instances returned by InTx
 	silent              bool    // when true, printBanner is a no-op
+	mesh                bool    // startup mesh intent (emits --mesh)
+	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
 	dashboardToken string   // provisioned on spawn; cleared on Stop
@@ -498,6 +522,12 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	}
 	if gl.configFile != "" {
 		args = append(args, "--config", gl.configFile)
+	}
+	if gl.mesh {
+		args = append(args, "--mesh")
+	}
+	if gl.meshTag != "" {
+		args = append(args, "--mesh-tag", gl.meshTag)
 	}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)

@@ -809,6 +809,52 @@ func TestWithClient_SetsTopLevelField(t *testing.T) {
 	}
 }
 
+// --- Mesh startup options ---
+
+func TestWithMesh_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.mesh {
+		t.Fatal("expected mesh=false by default")
+	}
+	if gl.meshTag != "" {
+		t.Fatalf("expected meshTag empty by default, got %q", gl.meshTag)
+	}
+}
+
+func TestWithMesh_SetsTopLevelField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithMesh(true), WithMeshTag("prod-east"))
+	if !gl.mesh {
+		t.Fatal("expected mesh=true")
+	}
+	if gl.meshTag != "prod-east" {
+		t.Fatalf("expected meshTag=prod-east, got %q", gl.meshTag)
+	}
+}
+
+func TestWithMesh_NotInConfigMap(t *testing.T) {
+	// mesh / mesh_tag are top-level canonical-surface options, not valid
+	// keys inside the structured config map.
+	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
+		WithConfig(map[string]interface{}{"mesh": true}))
+	if err == nil {
+		t.Fatal("expected Start to error when mesh is passed via WithConfig")
+	}
+	_, err = Start(context.Background(), "postgresql://localhost:5432/mydb",
+		WithConfig(map[string]interface{}{"mesh_tag": "prod"}))
+	if err == nil {
+		t.Fatal("expected Start to error when mesh_tag is passed via WithConfig")
+	}
+}
+
+func TestWithMesh_NotInConfigKeys(t *testing.T) {
+	keys := ConfigKeys()
+	for _, k := range keys {
+		if k == "mesh" || k == "mesh_tag" {
+			t.Fatalf("mesh/mesh_tag must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
 // --- toInt ---
 
 func TestToInt_ParsesTypes(t *testing.T) {
