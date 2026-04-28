@@ -69,6 +69,24 @@ fmt.Println(gl.DashboardURL())
 
 Full API reference, configuration, transactions, document store, search, upgrading from v0.1 (including the BIGSERIAL-to-UUID doc-table migration), and production deployment: https://goldlapel.com/docs/go
 
+## Uninstalling
+
+Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+
+```bash
+goldlapel clean
+```
+
+Then remove the import from your code, tidy the module, and clear any local state:
+
+```bash
+go mod tidy
+rm -rf ~/.goldlapel
+rm -f goldlapel.toml     # only if you wrote one
+```
+
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+
 ## License
 
 MIT. See `LICENSE`.
