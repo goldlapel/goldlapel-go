@@ -5,155 +5,18 @@ import (
 	"encoding/json"
 )
 
-// This file wires the package-level helper functions (DocInsert, Search,
-// Hset, etc.) onto *GoldLapel as receiver methods. Each method resolves
-// the query target (transaction override via WithTx, scoped transaction
-// from InTx, or the default *sql.DB opened at Start) and forwards.
-
-// --- Document store ---
-
-// DocCreateCollection explicitly creates a collection table. Pass unlogged=true
-// for an UNLOGGED table (higher throughput, not crash-safe). Collections are
-// auto-created on first insert, so this is only needed to preset unlogged or
-// to materialize the table without inserting.
-func (gl *GoldLapel) DocCreateCollection(ctx context.Context, collection string, unlogged bool, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocCreateCollection(ctx, q, collection, unlogged)
-}
-
-func (gl *GoldLapel) DocInsert(ctx context.Context, collection string, document interface{}, opts ...Option) (map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocInsert(ctx, q, collection, document)
-}
-
-func (gl *GoldLapel) DocInsertMany(ctx context.Context, collection string, documents []interface{}, opts ...Option) ([]map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocInsertMany(ctx, q, collection, documents)
-}
-
-// DocFind queries documents in a collection. Accepts DocSort/DocLimit/DocSkip
-// along with generic options such as WithTx for per-call transaction routing.
-func (gl *GoldLapel) DocFind(ctx context.Context, collection string, filter interface{}, opts ...Option) ([]map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocFind(ctx, q, collection, filter, opts...)
-}
-
-func (gl *GoldLapel) DocFindOne(ctx context.Context, collection string, filter interface{}, opts ...Option) (map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocFindOne(ctx, q, collection, filter)
-}
-
-func (gl *GoldLapel) DocUpdate(ctx context.Context, collection string, filter, update interface{}, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return DocUpdate(ctx, q, collection, filter, update)
-}
-
-func (gl *GoldLapel) DocUpdateOne(ctx context.Context, collection string, filter, update interface{}, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return DocUpdateOne(ctx, q, collection, filter, update)
-}
-
-func (gl *GoldLapel) DocDelete(ctx context.Context, collection string, filter interface{}, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return DocDelete(ctx, q, collection, filter)
-}
-
-func (gl *GoldLapel) DocDeleteOne(ctx context.Context, collection string, filter interface{}, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return DocDeleteOne(ctx, q, collection, filter)
-}
-
-func (gl *GoldLapel) DocCount(ctx context.Context, collection string, filter interface{}, opts ...Option) (int64, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return 0, err
-	}
-	return DocCount(ctx, q, collection, filter)
-}
-
-// DocFindOneAndUpdate atomically finds a single document matching filter,
-// merges update into data, and returns the updated document (nil if no match).
-func (gl *GoldLapel) DocFindOneAndUpdate(ctx context.Context, collection string, filter, update interface{}, opts ...Option) (map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocFindOneAndUpdate(ctx, q, collection, filter, update)
-}
-
-// DocFindOneAndDelete atomically finds a single document matching filter,
-// deletes it, and returns the deleted document (nil if no match).
-func (gl *GoldLapel) DocFindOneAndDelete(ctx context.Context, collection string, filter interface{}, opts ...Option) (map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocFindOneAndDelete(ctx, q, collection, filter)
-}
-
-// DocDistinct returns the distinct values of the given JSONB field across
-// documents matching filter.
-func (gl *GoldLapel) DocDistinct(ctx context.Context, collection, field string, filter interface{}, opts ...Option) ([]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocDistinct(ctx, q, collection, field, filter)
-}
-
-// DocFindCursor streams documents through a callback, fetching in batches.
-// Useful for large result sets. Callback returns (continue, error); returning
-// false halts cleanly.
-func (gl *GoldLapel) DocFindCursor(ctx context.Context, collection string, filter interface{}, callback func(doc map[string]interface{}) (bool, error), opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocFindCursor(ctx, q, collection, filter, callback, opts...)
-}
-
-func (gl *GoldLapel) DocCreateIndex(ctx context.Context, collection string, keys []string, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocCreateIndex(ctx, q, collection, keys)
-}
-
-func (gl *GoldLapel) DocAggregate(ctx context.Context, collection string, pipeline []map[string]interface{}, opts ...Option) ([]map[string]interface{}, error) {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return nil, err
-	}
-	return DocAggregate(ctx, q, collection, pipeline)
-}
+// This file wires the package-level helper functions (Search, Hset, etc.)
+// onto *GoldLapel as receiver methods. Each method resolves the query
+// target (transaction override via WithTx, scoped transaction from InTx,
+// or the default *sql.DB opened at Start) and forwards.
+//
+// Doc<Verb> and Stream<Verb> have moved off *GoldLapel — call them as
+// gl.Documents.<Verb>(...) and gl.Streams.<Verb>(...). See documents.go
+// and streams.go. This is a hard cut (no aliases): Phase 4 of
+// schema-to-core moves doc-store DDL ownership into the proxy, so the
+// nested namespaces are the only path that materializes the canonical
+// _goldlapel.doc_<name> tables. The old gl.DocX flat methods would have
+// run against user-named tables and silently bypassed proxy DDL.
 
 // --- Search ---
 
@@ -433,40 +296,9 @@ func (gl *GoldLapel) Script(ctx context.Context, luaCode string, args ...string)
 	return Script(ctx, q, luaCode, args...)
 }
 
-// --- Stream ---
+// --- Streams ---
 //
-// Stream* delegate to the free functions in utils.go, which own the DDL
-// fetch + cache + query execution. The opts are accepted for symmetry with
-// other methods but are not currently honored — the stream helpers always
-// run against the instance's default execQuerier. (An explicit WithTx would
-// complicate the read flow's multi-statement transactional semantics; users
-// who need custom-tx streams can call utils.StreamX directly with their own
-// *GoldLapel-scoped transaction once InTx-returns support lands.)
-
-func (gl *GoldLapel) StreamAdd(ctx context.Context, stream string, payload string, opts ...Option) (int64, error) {
-	_ = opts
-	return StreamAdd(ctx, gl, stream, payload)
-}
-
-func (gl *GoldLapel) StreamCreateGroup(ctx context.Context, stream, group string, opts ...Option) error {
-	_ = opts
-	return StreamCreateGroup(ctx, gl, stream, group)
-}
-
-func (gl *GoldLapel) StreamRead(ctx context.Context, stream, group, consumer string, count int, opts ...Option) ([]StreamMessage, error) {
-	_ = opts
-	return StreamRead(ctx, gl, stream, group, consumer, count)
-}
-
-func (gl *GoldLapel) StreamAck(ctx context.Context, stream, group string, messageID int64, opts ...Option) (bool, error) {
-	_ = opts
-	return StreamAck(ctx, gl, stream, group, messageID)
-}
-
-func (gl *GoldLapel) StreamClaim(ctx context.Context, stream, group, consumer string, minIdleMs int64, opts ...Option) ([]StreamMessage, error) {
-	_ = opts
-	return StreamClaim(ctx, gl, stream, group, consumer, minIdleMs)
-}
+// Stream<Verb> moved to gl.Streams.<Verb> — see streams.go.
 
 // --- Percolate ---
 
@@ -494,58 +326,5 @@ func (gl *GoldLapel) PercolateDelete(ctx context.Context, name, queryID string, 
 	return PercolateDelete(ctx, q, name, queryID)
 }
 
-// --- Operational Doc methods ---
-
-func (gl *GoldLapel) DocWatch(ctx context.Context, collection string, callback func(op, data string)) (chan error, error) {
-	q, err := gl.resolveExec(nil)
-	if err != nil {
-		return nil, err
-	}
-	gl.mu.Lock()
-	url := gl.proxyURL
-	gl.mu.Unlock()
-	if url == "" {
-		return nil, ErrNotConnected
-	}
-	return DocWatch(ctx, q, url, collection, callback)
-}
-
-func (gl *GoldLapel) DocUnwatch(ctx context.Context, collection string, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocUnwatch(ctx, q, collection)
-}
-
-func (gl *GoldLapel) DocCreateTtlIndex(ctx context.Context, collection string, ttlSeconds int, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocCreateTtlIndex(ctx, q, collection, ttlSeconds)
-}
-
-func (gl *GoldLapel) DocRemoveTtlIndex(ctx context.Context, collection string, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocRemoveTtlIndex(ctx, q, collection)
-}
-
-func (gl *GoldLapel) DocCreateCapped(ctx context.Context, collection string, maxDocs int, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocCreateCapped(ctx, q, collection, maxDocs)
-}
-
-func (gl *GoldLapel) DocRemoveCap(ctx context.Context, collection string, opts ...Option) error {
-	q, err := gl.resolveExec(opts)
-	if err != nil {
-		return err
-	}
-	return DocRemoveCap(ctx, q, collection)
-}
+// Operational Doc<Verb> methods (Watch/Unwatch/TTL/Capped) moved to
+// gl.Documents.<Verb> — see documents.go.

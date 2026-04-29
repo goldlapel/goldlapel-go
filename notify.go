@@ -27,10 +27,17 @@ func DocWatch(ctx context.Context, q execQuerier, listenConn, collection string,
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
 	}
+	return docWatchOn(ctx, q, listenConn, collection, collection, callback)
+}
 
-	channel := collection + "_changes"
-	funcName := collection + "_notify_changes"
-	triggerName := collection + "_watch_trigger"
+// docWatchOn installs the change-stream trigger against tableName and uses
+// nameBase (typically the user-supplied collection) for trigger / function /
+// notify-channel naming so the names stay readable and stable even when
+// tableName is the proxy-canonical (_goldlapel.doc_<name>).
+func docWatchOn(ctx context.Context, q execQuerier, listenConn, tableName, nameBase string, callback func(op, data string)) (chan error, error) {
+	channel := nameBase + "_changes"
+	funcName := nameBase + "_notify_changes"
+	triggerName := nameBase + "_watch_trigger"
 
 	createFunc := "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS trigger AS $$ " +
 		"BEGIN " +
@@ -52,7 +59,7 @@ func DocWatch(ctx context.Context, q execQuerier, listenConn, collection string,
 	// replace each other's triggers mid-flight and end up with a partially
 	// dropped one. GL targets PG14+ across the product, so this is safe.
 	createTrigger := "CREATE OR REPLACE TRIGGER " + triggerName +
-		" AFTER INSERT OR UPDATE OR DELETE ON " + collection +
+		" AFTER INSERT OR UPDATE OR DELETE ON " + tableName +
 		" FOR EACH ROW EXECUTE FUNCTION " + funcName + "()"
 	if _, err := q.ExecContext(ctx, createTrigger); err != nil {
 		return nil, fmt.Errorf("create watch trigger: %w", err)
@@ -95,11 +102,14 @@ func DocUnwatch(ctx context.Context, q execQuerier, collection string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
+	return docUnwatchOn(ctx, q, collection, collection)
+}
 
-	triggerName := collection + "_watch_trigger"
-	funcName := collection + "_notify_changes"
+func docUnwatchOn(ctx context.Context, q execQuerier, tableName, nameBase string) error {
+	triggerName := nameBase + "_watch_trigger"
+	funcName := nameBase + "_notify_changes"
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName
 	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop watch trigger: %w", err)
 	}

@@ -367,6 +367,7 @@ func buildForTest(upstream string, opts ...Option) *GoldLapel {
 		upstream:  upstream,
 		proxyPort: DefaultProxyPort,
 	}
+	gl.attachNamespaces()
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
