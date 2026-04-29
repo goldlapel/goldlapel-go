@@ -207,90 +207,89 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 		t.Fatalf("SubscribeAsync: expected ErrNotConnected, got %v", err)
 	}
 
-	err = gl.Enqueue(ctx, "q", map[string]interface{}{"x": 1})
-	if err != ErrNotConnected {
-		t.Fatalf("Enqueue: expected ErrNotConnected, got %v", err)
+	// Phase 5 helper namespaces (Counters / Zsets / Hashes / Queues / Geos)
+	// fetch DDL patterns before touching the connection — on an unstarted
+	// instance they raise a dashboard-not-ready error rather than
+	// ErrNotConnected. Accept either via the same helper that covers
+	// Streams below.
+	isStreamNotReady := func(name string, err error) {
+		if err == nil {
+			t.Fatalf("%s: expected an error, got nil", name)
+		}
+		if err == ErrNotConnected {
+			return
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "No dashboard token") ||
+			strings.Contains(msg, "No dashboard port") ||
+			strings.Contains(msg, "dashboard not reachable") {
+			return
+		}
+		t.Fatalf("%s: expected ErrNotConnected or dashboard-not-ready error, got %v", name, err)
 	}
 
-	_, err = gl.Dequeue(ctx, "q")
-	if err != ErrNotConnected {
-		t.Fatalf("Dequeue: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Counters.Incr(ctx, "counters", "k", 1)
+	isStreamNotReady("Counters.Incr", err)
 
-	_, err = gl.Incr(ctx, "counters", "k", 1)
-	if err != ErrNotConnected {
-		t.Fatalf("Incr: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Counters.Get(ctx, "counters", "k")
+	isStreamNotReady("Counters.Get", err)
 
-	_, err = gl.GetCounter(ctx, "counters", "k")
-	if err != ErrNotConnected {
-		t.Fatalf("GetCounter: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Counters.Set(ctx, "counters", "k", 1)
+	isStreamNotReady("Counters.Set", err)
 
-	err = gl.Hset(ctx, "h", "k", "f", "v")
-	if err != ErrNotConnected {
-		t.Fatalf("Hset: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Counters.Delete(ctx, "counters", "k")
+	isStreamNotReady("Counters.Delete", err)
 
-	_, err = gl.Hget(ctx, "h", "k", "f")
-	if err != ErrNotConnected {
-		t.Fatalf("Hget: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Counters.CountKeys(ctx, "counters")
+	isStreamNotReady("Counters.CountKeys", err)
 
-	_, err = gl.Hgetall(ctx, "h", "k")
-	if err != ErrNotConnected {
-		t.Fatalf("Hgetall: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Hashes.Set(ctx, "h", "k", "f", "v")
+	isStreamNotReady("Hashes.Set", err)
 
-	_, err = gl.Hdel(ctx, "h", "k", "f")
-	if err != ErrNotConnected {
-		t.Fatalf("Hdel: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Hashes.Get(ctx, "h", "k", "f")
+	isStreamNotReady("Hashes.Get", err)
 
-	err = gl.Zadd(ctx, "z", "m", 1.0)
-	if err != ErrNotConnected {
-		t.Fatalf("Zadd: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Hashes.GetAll(ctx, "h", "k")
+	isStreamNotReady("Hashes.GetAll", err)
 
-	_, err = gl.Zincrby(ctx, "z", "m", 1.0)
-	if err != ErrNotConnected {
-		t.Fatalf("Zincrby: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Hashes.Delete(ctx, "h", "k", "f")
+	isStreamNotReady("Hashes.Delete", err)
 
-	_, err = gl.Zrange(ctx, "z", 0, 10, false)
-	if err != ErrNotConnected {
-		t.Fatalf("Zrange: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Zsets.Add(ctx, "z", "k", "m", 1.0)
+	isStreamNotReady("Zsets.Add", err)
 
-	_, err = gl.Zrank(ctx, "z", "m", false)
-	if err != ErrNotConnected {
-		t.Fatalf("Zrank: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Zsets.IncrBy(ctx, "z", "k", "m", 1.0)
+	isStreamNotReady("Zsets.IncrBy", err)
 
-	_, err = gl.Zscore(ctx, "z", "m")
-	if err != ErrNotConnected {
-		t.Fatalf("Zscore: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Zsets.Range(ctx, "z", "k", 0, 10, false)
+	isStreamNotReady("Zsets.Range", err)
 
-	_, err = gl.Zrem(ctx, "z", "m")
-	if err != ErrNotConnected {
-		t.Fatalf("Zrem: expected ErrNotConnected, got %v", err)
-	}
+	_, _, err = gl.Zsets.Rank(ctx, "z", "k", "m", false)
+	isStreamNotReady("Zsets.Rank", err)
 
-	_, err = gl.Georadius(ctx, "g", "geom", 0, 0, 100, 10)
-	if err != ErrNotConnected {
-		t.Fatalf("Georadius: expected ErrNotConnected, got %v", err)
-	}
+	_, _, err = gl.Zsets.Score(ctx, "z", "k", "m")
+	isStreamNotReady("Zsets.Score", err)
 
-	err = gl.Geoadd(ctx, "g", "name", "geom", "place", 0, 0)
-	if err != ErrNotConnected {
-		t.Fatalf("Geoadd: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Zsets.Remove(ctx, "z", "k", "m")
+	isStreamNotReady("Zsets.Remove", err)
 
-	_, err = gl.Geodist(ctx, "g", "geom", "name", "a", "b")
-	if err != ErrNotConnected {
-		t.Fatalf("Geodist: expected ErrNotConnected, got %v", err)
-	}
+	_, err = gl.Queues.Enqueue(ctx, "q", map[string]interface{}{"x": 1})
+	isStreamNotReady("Queues.Enqueue", err)
+
+	_, err = gl.Queues.Claim(ctx, "q", 30000)
+	isStreamNotReady("Queues.Claim", err)
+
+	_, err = gl.Queues.Ack(ctx, "q", 1)
+	isStreamNotReady("Queues.Ack", err)
+
+	_, err = gl.Geos.Radius(ctx, "g", 0, 0, 100, "m", 10)
+	isStreamNotReady("Geos.Radius", err)
+
+	_, err = gl.Geos.Add(ctx, "g", "place", 0, 0)
+	isStreamNotReady("Geos.Add", err)
+
+	_, _, err = gl.Geos.Dist(ctx, "g", "a", "b", "m")
+	isStreamNotReady("Geos.Dist", err)
 
 	_, err = gl.CountDistinct(ctx, "t", "c")
 	if err != ErrNotConnected {
@@ -305,23 +304,7 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 	// gl.Streams.* and gl.Documents.* now fetch DDL patterns before touching
 	// the connection; an unstarted instance raises a RuntimeError-equivalent
 	// ("No dashboard token / port") rather than ErrNotConnected. Accept
-	// either.
-	isStreamNotReady := func(name string, err error) {
-		if err == nil {
-			t.Fatalf("%s: expected an error, got nil", name)
-		}
-		msg := err.Error()
-		if err == ErrNotConnected {
-			return
-		}
-		if strings.Contains(msg, "No dashboard token") ||
-			strings.Contains(msg, "No dashboard port") ||
-			strings.Contains(msg, "dashboard not reachable") {
-			return
-		}
-		t.Fatalf("%s: expected ErrNotConnected or dashboard-not-ready error, got %v", name, err)
-	}
-
+	// either via the same isStreamNotReady helper defined above.
 	_, err = gl.Streams.Add(ctx, "s", `{"x":1}`)
 	isStreamNotReady("Streams.Add", err)
 
