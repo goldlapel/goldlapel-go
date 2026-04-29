@@ -28,65 +28,107 @@ func TestDB_NilAfterStop(t *testing.T) {
 
 // --- ErrNotConnected tests ---
 
-// When no database is connected, every receiver method must surface
-// ErrNotConnected rather than panicking on a nil pool.
-func TestReceiverMethods_ErrNotConnected(t *testing.T) {
+// docPatternsFor returns a pattern entry whose tables.main is set to
+// `collection` itself. Pre-populating gl.ddlCache with this entry makes
+// gl.Documents.* run against the user-supplied collection name (instead
+// of the proxy's canonical _goldlapel.doc_<name>), so test SQL assertions
+// that expect "INSERT INTO users" / "SELECT … FROM users" keep matching
+// without standing up a fake dashboard for every test.
+func docPatternsFor(collection string) *DdlEntry {
+	return &DdlEntry{
+		Tables: map[string]string{"main": collection},
+		// The doc-store family only consumes tables.main today; query
+		// patterns are reserved for future use.
+		QueryPatterns: map[string]string{},
+	}
+}
+
+// When the proxy never started, gl.Documents.* still tries to fetch DDL
+// patterns first — which fails with a "No dashboard token / port"
+// RuntimeError. We accept either ErrNotConnected (cache pre-populated +
+// resolveExec fails on nil db) or the dashboard-not-ready text.
+func isDocStoreNotReady(t *testing.T, name string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: expected an error, got nil", name)
+	}
+	if err == ErrNotConnected {
+		return
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "No dashboard token") ||
+		strings.Contains(msg, "No dashboard port") ||
+		strings.Contains(msg, "dashboard not reachable") {
+		return
+	}
+	t.Fatalf("%s: expected ErrNotConnected or dashboard-not-ready error, got %v", name, err)
+}
+
+// When no database is connected, every namespace method must surface
+// ErrNotConnected (or the dashboard-not-ready variant — see
+// isDocStoreNotReady) rather than panicking on a nil pool.
+func TestDocumentsNamespace_ErrNotConnected(t *testing.T) {
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
+	// Pre-populate the cache so the doc-store path skips its HTTP fetch
+	// and we exercise the actual ErrNotConnected branch — without this
+	// every assertion below would surface the dashboard-not-ready error
+	// instead of the connection error we want to verify.
+	gl.ddlCache.Store("doc_store:test", docPatternsFor("test"))
 	ctx := context.Background()
 
-	_, err := gl.DocInsert(ctx, "test", map[string]interface{}{"a": 1})
+	_, err := gl.Documents.Insert(ctx, "test", map[string]interface{}{"a": 1})
 	if err != ErrNotConnected {
-		t.Fatalf("DocInsert: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Insert: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocInsertMany(ctx, "test", []interface{}{map[string]interface{}{"a": 1}})
+	_, err = gl.Documents.InsertMany(ctx, "test", []interface{}{map[string]interface{}{"a": 1}})
 	if err != ErrNotConnected {
-		t.Fatalf("DocInsertMany: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.InsertMany: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocFind(ctx, "test", nil)
+	_, err = gl.Documents.Find(ctx, "test", nil)
 	if err != ErrNotConnected {
-		t.Fatalf("DocFind: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Find: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocFindOne(ctx, "test", nil)
+	_, err = gl.Documents.FindOne(ctx, "test", nil)
 	if err != ErrNotConnected {
-		t.Fatalf("DocFindOne: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.FindOne: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocUpdate(ctx, "test", map[string]interface{}{"a": 1}, map[string]interface{}{"a": 2})
+	_, err = gl.Documents.Update(ctx, "test", map[string]interface{}{"a": 1}, map[string]interface{}{"a": 2})
 	if err != ErrNotConnected {
-		t.Fatalf("DocUpdate: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Update: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocUpdateOne(ctx, "test", map[string]interface{}{"a": 1}, map[string]interface{}{"a": 2})
+	_, err = gl.Documents.UpdateOne(ctx, "test", map[string]interface{}{"a": 1}, map[string]interface{}{"a": 2})
 	if err != ErrNotConnected {
-		t.Fatalf("DocUpdateOne: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.UpdateOne: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocDelete(ctx, "test", map[string]interface{}{"a": 1})
+	_, err = gl.Documents.Delete(ctx, "test", map[string]interface{}{"a": 1})
 	if err != ErrNotConnected {
-		t.Fatalf("DocDelete: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Delete: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocDeleteOne(ctx, "test", map[string]interface{}{"a": 1})
+	_, err = gl.Documents.DeleteOne(ctx, "test", map[string]interface{}{"a": 1})
 	if err != ErrNotConnected {
-		t.Fatalf("DocDeleteOne: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.DeleteOne: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocCount(ctx, "test", nil)
+	_, err = gl.Documents.Count(ctx, "test", nil)
 	if err != ErrNotConnected {
-		t.Fatalf("DocCount: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Count: expected ErrNotConnected, got %v", err)
 	}
 
-	err = gl.DocCreateIndex(ctx, "test", []string{"a"})
+	err = gl.Documents.CreateIndex(ctx, "test", []string{"a"})
 	if err != ErrNotConnected {
-		t.Fatalf("DocCreateIndex: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.CreateIndex: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocAggregate(ctx, "test", nil)
+	_, err = gl.Documents.Aggregate(ctx, "test", nil)
 	if err != ErrNotConnected {
-		t.Fatalf("DocAggregate: expected ErrNotConnected, got %v", err)
+		t.Fatalf("Documents.Aggregate: expected ErrNotConnected, got %v", err)
 	}
 }
 
@@ -260,9 +302,10 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 		t.Fatalf("Script: expected ErrNotConnected, got %v", err)
 	}
 
-	// Stream* now fetches DDL patterns before touching the connection; an
-	// unstarted instance raises a RuntimeError-equivalent ("No dashboard
-	// token / port") rather than ErrNotConnected. Accept either.
+	// gl.Streams.* and gl.Documents.* now fetch DDL patterns before touching
+	// the connection; an unstarted instance raises a RuntimeError-equivalent
+	// ("No dashboard token / port") rather than ErrNotConnected. Accept
+	// either.
 	isStreamNotReady := func(name string, err error) {
 		if err == nil {
 			t.Fatalf("%s: expected an error, got nil", name)
@@ -279,20 +322,20 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 		t.Fatalf("%s: expected ErrNotConnected or dashboard-not-ready error, got %v", name, err)
 	}
 
-	_, err = gl.StreamAdd(ctx, "s", `{"x":1}`)
-	isStreamNotReady("StreamAdd", err)
+	_, err = gl.Streams.Add(ctx, "s", `{"x":1}`)
+	isStreamNotReady("Streams.Add", err)
 
-	err = gl.StreamCreateGroup(ctx, "s", "g")
-	isStreamNotReady("StreamCreateGroup", err)
+	err = gl.Streams.CreateGroup(ctx, "s", "g")
+	isStreamNotReady("Streams.CreateGroup", err)
 
-	_, err = gl.StreamRead(ctx, "s", "g", "c", 10)
-	isStreamNotReady("StreamRead", err)
+	_, err = gl.Streams.Read(ctx, "s", "g", "c", 10)
+	isStreamNotReady("Streams.Read", err)
 
-	_, err = gl.StreamAck(ctx, "s", "g", 1)
-	isStreamNotReady("StreamAck", err)
+	_, err = gl.Streams.Ack(ctx, "s", "g", 1)
+	isStreamNotReady("Streams.Ack", err)
 
-	_, err = gl.StreamClaim(ctx, "s", "g", "c", 1000)
-	isStreamNotReady("StreamClaim", err)
+	_, err = gl.Streams.Claim(ctx, "s", "g", "c", 1000)
+	isStreamNotReady("Streams.Claim", err)
 
 	err = gl.PercolateAdd(ctx, "p", "q1", "test query")
 	if err != ErrNotConnected {
@@ -309,35 +352,26 @@ func TestReceiverMethods_Utils_ErrNotConnected(t *testing.T) {
 		t.Fatalf("PercolateDelete: expected ErrNotConnected, got %v", err)
 	}
 
-	_, err = gl.DocWatch(ctx, "test", func(op, data string) {})
-	if err != ErrNotConnected {
-		t.Fatalf("DocWatch: expected ErrNotConnected, got %v", err)
-	}
+	// Documents.Watch/Unwatch fetches doc-store DDL first, then opens the
+	// LISTEN connection — so on an unstarted instance it surfaces the
+	// dashboard-not-ready error before reaching the URL check.
+	_, err = gl.Documents.Watch(ctx, "test", func(op, data string) {})
+	isDocStoreNotReady(t, "Documents.Watch", err)
 
-	err = gl.DocUnwatch(ctx, "test")
-	if err != ErrNotConnected {
-		t.Fatalf("DocUnwatch: expected ErrNotConnected, got %v", err)
-	}
+	err = gl.Documents.Unwatch(ctx, "test")
+	isDocStoreNotReady(t, "Documents.Unwatch", err)
 
-	err = gl.DocCreateTtlIndex(ctx, "test", 3600)
-	if err != ErrNotConnected {
-		t.Fatalf("DocCreateTtlIndex: expected ErrNotConnected, got %v", err)
-	}
+	err = gl.Documents.CreateTtlIndex(ctx, "test", 3600)
+	isDocStoreNotReady(t, "Documents.CreateTtlIndex", err)
 
-	err = gl.DocRemoveTtlIndex(ctx, "test")
-	if err != ErrNotConnected {
-		t.Fatalf("DocRemoveTtlIndex: expected ErrNotConnected, got %v", err)
-	}
+	err = gl.Documents.RemoveTtlIndex(ctx, "test")
+	isDocStoreNotReady(t, "Documents.RemoveTtlIndex", err)
 
-	err = gl.DocCreateCapped(ctx, "test", 100)
-	if err != ErrNotConnected {
-		t.Fatalf("DocCreateCapped: expected ErrNotConnected, got %v", err)
-	}
+	err = gl.Documents.CreateCapped(ctx, "test", 100)
+	isDocStoreNotReady(t, "Documents.CreateCapped", err)
 
-	err = gl.DocRemoveCap(ctx, "test")
-	if err != ErrNotConnected {
-		t.Fatalf("DocRemoveCap: expected ErrNotConnected, got %v", err)
-	}
+	err = gl.Documents.RemoveCap(ctx, "test")
+	isDocStoreNotReady(t, "Documents.RemoveCap", err)
 }
 
 func TestErrNotConnected_ErrorMessage(t *testing.T) {
@@ -368,15 +402,18 @@ func TestWithTx_OverridesPool(t *testing.T) {
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	// Set gl.db so resolveExec doesn't fall through to ErrNotConnected.
 	gl.db = db
+	// Pre-populate the doc-store DDL cache so the proxy round-trip is
+	// skipped — Documents.Insert resolves "users" → "users" and emits
+	// the same INSERT INTO users SQL the legacy gl.DocInsert did.
+	gl.ddlCache.Store("doc_store:users", docPatternsFor("users"))
 
 	ctx := context.Background()
-	if _, err := gl.DocInsert(ctx, "users", map[string]interface{}{"name": "alice"}, WithTx(tx)); err != nil {
-		t.Fatalf("DocInsert: %v", err)
+	if _, err := gl.Documents.Insert(ctx, "users", map[string]interface{}{"name": "alice"}, WithTx(tx)); err != nil {
+		t.Fatalf("Documents.Insert: %v", err)
 	}
 
-	// The DocInsert above should have fired through the transaction. Find
-	// the INSERT among the captures (earlier captures include any schema
-	// DDL DocInsert emits; we only assert the user-visible INSERT tag).
+	// The Documents.Insert above should have fired through the transaction.
+	// Find the INSERT among the captures.
 	captures := drv.allCaptures()
 	if len(captures) == 0 {
 		t.Fatal("expected at least one captured query")
@@ -394,9 +431,9 @@ func TestWithTx_OverridesPool(t *testing.T) {
 }
 
 // TestWithTx_NoOverrideRoutesThroughPool is the negative of
-// TestWithTx_OverridesPool — without WithTx, the DocInsert must hit the
-// pool, not any transaction. Guards against a regression where resolveExec
-// leaks tx state across calls.
+// TestWithTx_OverridesPool — without WithTx, the Documents.Insert must
+// hit the pool, not any transaction. Guards against a regression where
+// resolveExec leaks tx state across calls.
 func TestWithTx_NoOverrideRoutesThroughPool(t *testing.T) {
 	db, drv := newTestDB(t,
 		[]string{"_id", "data", "created_at"},
@@ -404,10 +441,11 @@ func TestWithTx_NoOverrideRoutesThroughPool(t *testing.T) {
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
+	gl.ddlCache.Store("doc_store:users", docPatternsFor("users"))
 
 	ctx := context.Background()
-	if _, err := gl.DocInsert(ctx, "users", map[string]interface{}{"name": "bob"}); err != nil {
-		t.Fatalf("DocInsert: %v", err)
+	if _, err := gl.Documents.Insert(ctx, "users", map[string]interface{}{"name": "bob"}); err != nil {
+		t.Fatalf("Documents.Insert: %v", err)
 	}
 
 	for _, c := range drv.allCaptures() {
@@ -498,20 +536,21 @@ func TestWithTx_HappyPathCommit(t *testing.T) {
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
+	gl.ddlCache.Store("doc_store:users", docPatternsFor("users"))
 
 	ctx := context.Background()
 
-	// Reset driver captures between the initial schema dance (if any)
-	// and the measurement we care about. DocInsert/DocUpdate emit a few
-	// CREATE TABLE IF NOT EXISTS statements the first time they touch a
-	// collection — we don't want those muddying the assertions.
+	// Reset driver captures between any prior setup and the measurement we
+	// care about — Documents.Insert/Update no longer emits its own CREATE
+	// TABLE (the proxy owns that), but resetting before the measurement
+	// keeps the assertions hermetic.
 	drv.reset()
 
 	err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
-		if _, err := scoped.DocInsert(ctx, "users", map[string]interface{}{"name": "alice"}); err != nil {
+		if _, err := scoped.Documents.Insert(ctx, "users", map[string]interface{}{"name": "alice"}); err != nil {
 			return err
 		}
-		if _, err := scoped.DocUpdate(ctx, "users",
+		if _, err := scoped.Documents.Update(ctx, "users",
 			map[string]interface{}{"name": "alice"},
 			map[string]interface{}{"name": "alice2"}); err != nil {
 			return err
@@ -659,7 +698,8 @@ func TestWithTxOnSearch(t *testing.T) {
 }
 
 // TestWithTxOnDocFind proves that WithTx is accepted alongside DocSort/
-// DocLimit/DocSkip on DocFind, which used to take `...DocFindOption` only.
+// DocLimit/DocSkip on Documents.Find, which used to take `...DocFindOption`
+// only.
 func TestWithTxOnDocFind(t *testing.T) {
 	db, _ := newTestDB(t,
 		[]string{"_id", "data", "created_at"},
@@ -673,22 +713,23 @@ func TestWithTxOnDocFind(t *testing.T) {
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
+	gl.ddlCache.Store("doc_store:users", docPatternsFor("users"))
 
 	ctx := context.Background()
 
-	// DocFind used to reject WithTx at compile time. Mixing doc options and
-	// WithTx in one call must now be accepted.
-	_, err = gl.DocFind(ctx, "users", nil,
+	// Documents.Find used to reject WithTx at compile time. Mixing doc
+	// options and WithTx in one call must now be accepted.
+	_, err = gl.Documents.Find(ctx, "users", nil,
 		DocSort(map[string]int{"name": 1}),
 		DocLimit(5),
 		WithTx(tx))
 	if err != nil {
-		t.Fatalf("DocFind with WithTx: %v", err)
+		t.Fatalf("Documents.Find with WithTx: %v", err)
 	}
 }
 
-// TestWithTxOnDocCreateIndex confirms DocCreateIndex (which previously took
-// `keys ...string`) now accepts WithTx as a trailing functional option.
+// TestWithTxOnDocCreateIndex confirms Documents.CreateIndex accepts WithTx
+// as a trailing functional option.
 func TestWithTxOnDocCreateIndex(t *testing.T) {
 	db, drv := newTestDB(t, nil, nil)
 
@@ -700,10 +741,11 @@ func TestWithTxOnDocCreateIndex(t *testing.T) {
 
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
+	gl.ddlCache.Store("doc_store:users", docPatternsFor("users"))
 
 	ctx := context.Background()
-	if err := gl.DocCreateIndex(ctx, "users", []string{"email"}, WithTx(tx)); err != nil {
-		t.Fatalf("DocCreateIndex with WithTx: %v", err)
+	if err := gl.Documents.CreateIndex(ctx, "users", []string{"email"}, WithTx(tx)); err != nil {
+		t.Fatalf("Documents.CreateIndex with WithTx: %v", err)
 	}
 
 	// Sanity: the statement actually ran.

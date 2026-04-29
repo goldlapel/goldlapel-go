@@ -218,7 +218,7 @@ func TestStreamRead_WrapsInTransaction(t *testing.T) {
 		},
 	}
 	db := newStreamMockDB(t, drv)
-	gl := &GoldLapel{db: db}
+	gl := &GoldLapel{db: db, ddlCache: &sync.Map{}}
 	gl.ddlCache.Store("stream:orders", streamPatternsFor("orders"))
 
 	msgs, err := StreamRead(context.Background(), gl, "orders", "workers", "c", 10)
@@ -271,7 +271,7 @@ func TestStreamRead_CommitsWhenGroupMissing(t *testing.T) {
 		},
 	}
 	db := newStreamMockDB(t, drv)
-	gl := &GoldLapel{db: db}
+	gl := &GoldLapel{db: db, ddlCache: &sync.Map{}}
 	gl.ddlCache.Store("stream:orders", streamPatternsFor("orders"))
 
 	msgs, err := StreamRead(context.Background(), gl, "orders", "workers", "c", 10)
@@ -304,7 +304,7 @@ func TestStreamRead_RollsBackOnError(t *testing.T) {
 		errAt: 3, // fail on the 3rd Exec/Query (=> during advance cursor UPDATE)
 	}
 	db := newStreamMockDB(t, drv)
-	gl := &GoldLapel{db: db}
+	gl := &GoldLapel{db: db, ddlCache: &sync.Map{}}
 	gl.ddlCache.Store("stream:orders", streamPatternsFor("orders"))
 
 	_, err := StreamRead(context.Background(), gl, "orders", "workers", "c", 10)
@@ -343,7 +343,7 @@ func TestStreamRead_HonoursScopedTx(t *testing.T) {
 	commitsBefore := drv.commits
 	drv.mu.Unlock()
 
-	gl := &GoldLapel{db: db, tx: tx}
+	gl := &GoldLapel{db: db, tx: tx, ddlCache: &sync.Map{}}
 	gl.ddlCache.Store("stream:orders", streamPatternsFor("orders"))
 
 	if _, err := StreamRead(ctx, gl, "orders", "workers", "c", 10); err != nil {
@@ -369,7 +369,7 @@ func TestStreamRead_HonoursScopedTx(t *testing.T) {
 
 // TestStreamRead_NoDBReturnsError guards the nil-db path.
 func TestStreamRead_NoDBReturnsError(t *testing.T) {
-	gl := &GoldLapel{}
+	gl := &GoldLapel{ddlCache: &sync.Map{}}
 	gl.ddlCache.Store("stream:orders", streamPatternsFor("orders"))
 	_, err := StreamRead(context.Background(), gl, "orders", "workers", "c", 10)
 	if err != ErrNotConnected {

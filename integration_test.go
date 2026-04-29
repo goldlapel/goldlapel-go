@@ -153,7 +153,7 @@ func TestIntegration_InTxCommits(t *testing.T) {
 	// rely on CREATE TABLE inside a transaction (mock driver would disagree,
 	// but real Postgres handles it fine).
 	err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
-		_, err := scoped.DocInsert(ctx, collection, map[string]interface{}{"name": "alice"})
+		_, err := scoped.Documents.Insert(ctx, collection, map[string]interface{}{"name": "alice"})
 		return err
 	})
 	if err != nil {
@@ -250,12 +250,12 @@ func TestIntegration_WithTxOverride(t *testing.T) {
 		t.Fatalf("insert in tx: %v", err)
 	}
 
-	// Now exercise WithTx on a goldlapel method: DocCount with WithTx(tx)
-	// must see the in-tx row count of 2.
-	countInTx, err := gl.DocCount(ctx, collection, nil, WithTx(tx))
+	// Now exercise WithTx on a goldlapel method: Documents.Count with
+	// WithTx(tx) must see the in-tx row count of 2.
+	countInTx, err := gl.Documents.Count(ctx, collection, nil, WithTx(tx))
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("DocCount WithTx: %v", err)
+		t.Fatalf("Documents.Count WithTx: %v", err)
 	}
 	if countInTx != 2 {
 		tx.Rollback()

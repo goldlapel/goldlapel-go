@@ -79,7 +79,14 @@ func DocInsert(ctx context.Context, q execQuerier, collection string, document i
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
 	}
+	return docInsertOn(ctx, q, collection, document)
+}
 
+// docInsertOn inserts into the resolved Postgres table name (no validation,
+// no ensureCollection). The table-name argument is trusted because it either
+// comes from validated user input + ensureCollection, or from the proxy's
+// canonical pattern table (e.g. _goldlapel.doc_<name>).
+func docInsertOn(ctx context.Context, q execQuerier, tableName string, document interface{}) (map[string]interface{}, error) {
 	data, err := json.Marshal(document)
 	if err != nil {
 		return nil, fmt.Errorf("marshal document: %w", err)
@@ -89,7 +96,7 @@ func DocInsert(ctx context.Context, q execQuerier, collection string, document i
 	var createdAt string
 	var rawData string
 	err = q.QueryRowContext(ctx,
-		"INSERT INTO "+collection+" (data) VALUES ($1::jsonb) RETURNING _id, data, created_at",
+		"INSERT INTO "+tableName+" (data) VALUES ($1::jsonb) RETURNING _id, data, created_at",
 		string(data)).Scan(&id, &rawData, &createdAt)
 	if err != nil {
 		return nil, err
@@ -115,7 +122,13 @@ func DocInsertMany(ctx context.Context, q execQuerier, collection string, docume
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return nil, err
 	}
+	return docInsertManyOn(ctx, q, collection, documents)
+}
 
+func docInsertManyOn(ctx context.Context, q execQuerier, tableName string, documents []interface{}) ([]map[string]interface{}, error) {
+	if len(documents) == 0 {
+		return nil, nil
+	}
 	placeholders := make([]string, len(documents))
 	args := make([]interface{}, len(documents))
 	for i, doc := range documents {
@@ -127,7 +140,7 @@ func DocInsertMany(ctx context.Context, q execQuerier, collection string, docume
 		args[i] = string(data)
 	}
 
-	query := "INSERT INTO " + collection + " (data) VALUES " +
+	query := "INSERT INTO " + tableName + " (data) VALUES " +
 		strings.Join(placeholders, ", ") +
 		" RETURNING _id, data, created_at"
 
@@ -145,13 +158,21 @@ func DocFind(ctx context.Context, q execQuerier, collection string, filter inter
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docFindOn(ctx, q, collection, filter, opts...)
+}
 
+// docFindOn runs the SELECT against a resolved Postgres table name. The
+// table-name argument is trusted: it either passed validateIdentifier on
+// the caller's path or is a canonical pattern returned by the proxy
+// (e.g. _goldlapel.doc_<name>). Used by both the public Doc* helpers and
+// the gl.Documents.* namespace.
+func docFindOn(ctx context.Context, q execQuerier, tableName string, filter interface{}, opts ...Option) ([]map[string]interface{}, error) {
 	o := &docFindOptions{limit: 100}
 	for _, opt := range opts {
 		opt.applyDoc(o)
 	}
 
-	query := "SELECT _id, data, created_at FROM " + collection
+	query := "SELECT _id, data, created_at FROM " + tableName
 	paramIdx := 1
 	var args []interface{}
 
@@ -196,8 +217,11 @@ func DocFindOne(ctx context.Context, q execQuerier, collection string, filter in
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docFindOneOn(ctx, q, collection, filter)
+}
 
-	query := "SELECT _id, data, created_at FROM " + collection
+func docFindOneOn(ctx context.Context, q execQuerier, tableName string, filter interface{}) (map[string]interface{}, error) {
+	query := "SELECT _id, data, created_at FROM " + tableName
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -232,13 +256,16 @@ func DocUpdate(ctx context.Context, q execQuerier, collection string, filter, up
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
+	return docUpdateOn(ctx, q, collection, filter, update)
+}
 
+func docUpdateOn(ctx context.Context, q execQuerier, tableName string, filter, update interface{}) (int64, error) {
 	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return 0, fmt.Errorf("marshal update: %w", err)
 	}
 
-	query := "UPDATE " + collection + " SET data = data || $1::jsonb"
+	query := "UPDATE " + tableName + " SET data = data || $1::jsonb"
 	args := []interface{}{string(updateJSON)}
 	paramIdx := 2
 
@@ -263,7 +290,10 @@ func DocUpdateOne(ctx context.Context, q execQuerier, collection string, filter,
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
+	return docUpdateOneOn(ctx, q, collection, filter, update)
+}
 
+func docUpdateOneOn(ctx context.Context, q execQuerier, tableName string, filter, update interface{}) (int64, error) {
 	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return 0, fmt.Errorf("marshal update: %w", err)
@@ -280,9 +310,9 @@ func DocUpdateOne(ctx context.Context, q execQuerier, collection string, filter,
 	}
 
 	query := "WITH target AS (" +
-		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
-		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
-		"FROM target WHERE " + collection + "._id = target._id"
+		"SELECT _id FROM " + tableName + cteWhere + " LIMIT 1" +
+		") UPDATE " + tableName + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
+		"FROM target WHERE " + tableName + "._id = target._id"
 
 	args := append(filterParams, string(updateJSON))
 	result, err := q.ExecContext(ctx, query, args...)
@@ -297,8 +327,11 @@ func DocDelete(ctx context.Context, q execQuerier, collection string, filter int
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
+	return docDeleteOn(ctx, q, collection, filter)
+}
 
-	query := "DELETE FROM " + collection
+func docDeleteOn(ctx context.Context, q execQuerier, tableName string, filter interface{}) (int64, error) {
+	query := "DELETE FROM " + tableName
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -322,7 +355,10 @@ func DocDeleteOne(ctx context.Context, q execQuerier, collection string, filter 
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
+	return docDeleteOneOn(ctx, q, collection, filter)
+}
 
+func docDeleteOneOn(ctx context.Context, q execQuerier, tableName string, filter interface{}) (int64, error) {
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
 	if err != nil {
 		return 0, err
@@ -334,8 +370,8 @@ func DocDeleteOne(ctx context.Context, q execQuerier, collection string, filter 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
-		") DELETE FROM " + collection + " USING target WHERE " + collection + "._id = target._id"
+		"SELECT _id FROM " + tableName + cteWhere + " LIMIT 1" +
+		") DELETE FROM " + tableName + " USING target WHERE " + tableName + "._id = target._id"
 	result, err := q.ExecContext(ctx, query, filterParams...)
 	if err != nil {
 		return 0, err
@@ -351,7 +387,10 @@ func DocFindOneAndUpdate(ctx context.Context, q execQuerier, collection string, 
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docFindOneAndUpdateOn(ctx, q, collection, filter, update)
+}
 
+func docFindOneAndUpdateOn(ctx context.Context, q execQuerier, tableName string, filter, update interface{}) (map[string]interface{}, error) {
 	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return nil, fmt.Errorf("marshal update: %w", err)
@@ -368,10 +407,10 @@ func DocFindOneAndUpdate(ctx context.Context, q execQuerier, collection string, 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
-		") UPDATE " + collection + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
-		"FROM target WHERE " + collection + "._id = target._id " +
-		"RETURNING " + collection + "._id, " + collection + ".data, " + collection + ".created_at"
+		"SELECT _id FROM " + tableName + cteWhere + " LIMIT 1" +
+		") UPDATE " + tableName + " SET data = data || $" + fmt.Sprintf("%d", nextParam) + "::jsonb " +
+		"FROM target WHERE " + tableName + "._id = target._id " +
+		"RETURNING " + tableName + "._id, " + tableName + ".data, " + tableName + ".created_at"
 
 	args := append(append([]interface{}{}, filterParams...), string(updateJSON))
 	rows, err := q.QueryContext(ctx, query, args...)
@@ -397,7 +436,10 @@ func DocFindOneAndDelete(ctx context.Context, q execQuerier, collection string, 
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docFindOneAndDeleteOn(ctx, q, collection, filter)
+}
 
+func docFindOneAndDeleteOn(ctx context.Context, q execQuerier, tableName string, filter interface{}) (map[string]interface{}, error) {
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
 	if err != nil {
 		return nil, err
@@ -409,9 +451,9 @@ func DocFindOneAndDelete(ctx context.Context, q execQuerier, collection string, 
 	}
 
 	query := "WITH target AS (" +
-		"SELECT _id FROM " + collection + cteWhere + " LIMIT 1" +
-		") DELETE FROM " + collection + " USING target WHERE " + collection + "._id = target._id " +
-		"RETURNING " + collection + "._id, " + collection + ".data, " + collection + ".created_at"
+		"SELECT _id FROM " + tableName + cteWhere + " LIMIT 1" +
+		") DELETE FROM " + tableName + " USING target WHERE " + tableName + "._id = target._id " +
+		"RETURNING " + tableName + "._id, " + tableName + ".data, " + tableName + ".created_at"
 
 	rows, err := q.QueryContext(ctx, query, filterParams...)
 	if err != nil {
@@ -435,12 +477,16 @@ func DocDistinct(ctx context.Context, q execQuerier, collection, field string, f
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docDistinctOn(ctx, q, collection, field, filter)
+}
+
+func docDistinctOn(ctx context.Context, q execQuerier, tableName, field string, filter interface{}) ([]interface{}, error) {
 	fieldExpr, err := fieldPath(field)
 	if err != nil {
 		return nil, err
 	}
 
-	query := "SELECT DISTINCT " + fieldExpr + " FROM " + collection
+	query := "SELECT DISTINCT " + fieldExpr + " FROM " + tableName
 	var args []interface{}
 
 	whereParts := []string{fieldExpr + " IS NOT NULL"}
@@ -490,13 +536,20 @@ func DocFindCursor(ctx context.Context, q execQuerier, collection string, filter
 	if callback == nil {
 		return fmt.Errorf("callback must not be nil")
 	}
+	return docFindCursorOn(ctx, q, collection, filter, callback, opts...)
+}
+
+func docFindCursorOn(ctx context.Context, q execQuerier, tableName string, filter interface{}, callback func(doc map[string]interface{}) (bool, error), opts ...Option) error {
+	if callback == nil {
+		return fmt.Errorf("callback must not be nil")
+	}
 
 	o := &docFindOptions{limit: 0}
 	for _, opt := range opts {
 		opt.applyDoc(o)
 	}
 
-	query := "SELECT _id, data, created_at FROM " + collection
+	query := "SELECT _id, data, created_at FROM " + tableName
 	paramIdx := 1
 	var args []interface{}
 
@@ -556,8 +609,11 @@ func DocCount(ctx context.Context, q execQuerier, collection string, filter inte
 	if err := validateIdentifier(collection); err != nil {
 		return 0, err
 	}
+	return docCountOn(ctx, q, collection, filter)
+}
 
-	query := "SELECT COUNT(*) FROM " + collection
+func docCountOn(ctx context.Context, q execQuerier, tableName string, filter interface{}) (int64, error) {
+	query := "SELECT COUNT(*) FROM " + tableName
 	var args []interface{}
 
 	whereClause, filterParams, _, err := buildFilter(filter, 1)
@@ -590,11 +646,24 @@ func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys 
 			return fmt.Errorf("invalid index key: %w", err)
 		}
 	}
+	return docCreateIndexOn(ctx, q, collection, collection, keys)
+}
+
+// docCreateIndexOn builds the index against tableName but uses indexNameBase
+// for the generated index name. The wrapper keeps the index name short and
+// human-readable (the user-supplied collection) even when tableName is the
+// schema-qualified canonical (_goldlapel.doc_<name>).
+func docCreateIndexOn(ctx context.Context, q execQuerier, tableName, indexNameBase string, keys []string) error {
+	for _, key := range keys {
+		if err := validateIdentifier(key); err != nil {
+			return fmt.Errorf("invalid index key: %w", err)
+		}
+	}
 
 	var indexExpr, indexName string
 	if len(keys) == 0 {
 		indexExpr = "(data jsonb_path_ops)"
-		indexName = collection + "_data_gin"
+		indexName = indexNameBase + "_data_gin"
 	} else {
 		parts := make([]string, len(keys))
 		nameParts := make([]string, len(keys))
@@ -603,11 +672,11 @@ func DocCreateIndex(ctx context.Context, q execQuerier, collection string, keys 
 			nameParts[i] = key
 		}
 		indexExpr = "(" + strings.Join(parts, ", ") + ")"
-		indexName = collection + "_" + strings.Join(nameParts, "_") + "_idx"
+		indexName = indexNameBase + "_" + strings.Join(nameParts, "_") + "_idx"
 	}
 
 	query := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING GIN %s",
-		indexName, collection, indexExpr)
+		indexName, tableName, indexExpr)
 	_, err := q.ExecContext(ctx, query)
 	return err
 }
@@ -654,6 +723,15 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 	if err := validateIdentifier(collection); err != nil {
 		return nil, err
 	}
+	return docAggregateOn(ctx, q, collection, pipeline, nil)
+}
+
+// docAggregateOn runs the aggregation against the resolved Postgres table
+// name. lookupTables maps user-collection names from $lookup.from to their
+// resolved Postgres tables (e.g. "orders" → "_goldlapel.doc_orders"); when
+// nil or missing, the from-collection name is used verbatim — preserving
+// the legacy DocAggregate behaviour for callers that own their own tables.
+func docAggregateOn(ctx context.Context, q execQuerier, tableName string, pipeline []map[string]interface{}, lookupTables map[string]string) ([]map[string]interface{}, error) {
 	if len(pipeline) == 0 {
 		return nil, nil
 	}
@@ -881,7 +959,7 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 		selectParts = append(selectParts, "_id", "data", "created_at")
 	}
 
-	query := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + collection
+	query := "SELECT " + strings.Join(selectParts, ", ") + " FROM " + tableName
 
 	if hasUnwind {
 		query += fmt.Sprintf(" CROSS JOIN jsonb_array_elements_text(data->'%s') AS %s", unwindField, unwindField)
@@ -916,6 +994,19 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 			return nil, fmt.Errorf("$lookup: invalid 'as' field: %w", err)
 		}
 
+		// Resolve the "from" collection to a real Postgres table. When the
+		// gl.Documents.Aggregate() namespace path is in use, lookupTables
+		// will map "orders" → "_goldlapel.doc_orders". The aliased name
+		// inside the subquery still uses the user-supplied collection so
+		// the JSONB field-path projections (data, foreignField) stay
+		// readable.
+		fromTable := fromColl
+		if lookupTables != nil {
+			if resolved, ok := lookupTables[fromColl]; ok && resolved != "" {
+				fromTable = resolved
+			}
+		}
+
 		localExpr, err := fieldPath(localField)
 		if err != nil {
 			return nil, fmt.Errorf("$lookup: invalid localField: %w", err)
@@ -926,9 +1017,18 @@ func DocAggregate(ctx context.Context, q execQuerier, collection string, pipelin
 		}
 		foreignExpr = strings.Replace(foreignExpr, "data", fromColl+".data", 1)
 
+		// Add `AS fromColl` only when the resolved Postgres table differs
+		// from the user-facing collection name — avoids spurious `FROM x AS x`
+		// in existing tests' SQL assertions while still letting the namespace
+		// path target the canonical _goldlapel.doc_<name> table.
+		fromClause := fromTable
+		if fromTable != fromColl {
+			fromClause = fromTable + " AS " + fromColl
+		}
+
 		subquery := fmt.Sprintf(
 			"(SELECT COALESCE(json_agg(%s.data), '[]'::json) FROM %s WHERE %s = %s) AS %s",
-			fromColl, fromColl, foreignExpr, localExpr, asField)
+			fromColl, fromClause, foreignExpr, localExpr, asField)
 
 		query = strings.Replace(query, "SELECT ", "SELECT "+subquery+", ", 1)
 	}
@@ -1493,9 +1593,20 @@ func DocCreateTtlIndex(ctx context.Context, q execQuerier, collection string, tt
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return err
 	}
+	return docCreateTtlIndexOn(ctx, q, collection, collection, ttlSeconds)
+}
 
-	funcName := collection + "_ttl_cleanup"
-	triggerName := collection + "_ttl_trigger"
+// docCreateTtlIndexOn installs the TTL trigger against tableName and names
+// the function/trigger after nameBase (the user-supplied collection). The
+// proxy-resolved table may be schema-qualified (_goldlapel.doc_<name>) but
+// we still use the short collection for trigger naming so the names stay
+// stable across the canonical / public-schema variants.
+func docCreateTtlIndexOn(ctx context.Context, q execQuerier, tableName, nameBase string, ttlSeconds int) error {
+	if ttlSeconds <= 0 {
+		return fmt.Errorf("ttlSeconds must be positive, got %d", ttlSeconds)
+	}
+	funcName := nameBase + "_ttl_cleanup"
+	triggerName := nameBase + "_ttl_trigger"
 
 	createFunc := fmt.Sprintf(
 		"CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $$ "+
@@ -1504,18 +1615,18 @@ func DocCreateTtlIndex(ctx context.Context, q execQuerier, collection string, tt
 			"RETURN NEW; "+
 			"END; "+
 			"$$ LANGUAGE plpgsql",
-		funcName, collection, ttlSeconds)
+		funcName, tableName, ttlSeconds)
 	if _, err := q.ExecContext(ctx, createFunc); err != nil {
 		return fmt.Errorf("create ttl function: %w", err)
 	}
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName
 	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop existing ttl trigger: %w", err)
 	}
 
 	createTrigger := "CREATE TRIGGER " + triggerName +
-		" AFTER INSERT ON " + collection +
+		" AFTER INSERT ON " + tableName +
 		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
 	if _, err := q.ExecContext(ctx, createTrigger); err != nil {
 		return fmt.Errorf("create ttl trigger: %w", err)
@@ -1529,11 +1640,14 @@ func DocRemoveTtlIndex(ctx context.Context, q execQuerier, collection string) er
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
+	return docRemoveTtlIndexOn(ctx, q, collection, collection)
+}
 
-	triggerName := collection + "_ttl_trigger"
-	funcName := collection + "_ttl_cleanup"
+func docRemoveTtlIndexOn(ctx context.Context, q execQuerier, tableName, nameBase string) error {
+	triggerName := nameBase + "_ttl_trigger"
+	funcName := nameBase + "_ttl_cleanup"
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName
 	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop ttl trigger: %w", err)
 	}
@@ -1557,9 +1671,15 @@ func DocCreateCapped(ctx context.Context, q execQuerier, collection string, maxD
 	if err := ensureCollection(ctx, q, collection); err != nil {
 		return err
 	}
+	return docCreateCappedOn(ctx, q, collection, collection, maxDocs)
+}
 
-	funcName := collection + "_cap_enforce"
-	triggerName := collection + "_cap_trigger"
+func docCreateCappedOn(ctx context.Context, q execQuerier, tableName, nameBase string, maxDocs int) error {
+	if maxDocs <= 0 {
+		return fmt.Errorf("maxDocs must be positive, got %d", maxDocs)
+	}
+	funcName := nameBase + "_cap_enforce"
+	triggerName := nameBase + "_cap_trigger"
 
 	// UUIDs don't sort by insert order, so keep the N most recent rows using
 	// created_at. Ties on created_at fall back to _id for determinism.
@@ -1570,18 +1690,18 @@ func DocCreateCapped(ctx context.Context, q execQuerier, collection string, maxD
 			"RETURN NULL; "+
 			"END; "+
 			"$$ LANGUAGE plpgsql",
-		funcName, collection, collection, maxDocs)
+		funcName, tableName, tableName, maxDocs)
 	if _, err := q.ExecContext(ctx, createFunc); err != nil {
 		return fmt.Errorf("create cap function: %w", err)
 	}
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName
 	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop existing cap trigger: %w", err)
 	}
 
 	createTrigger := "CREATE TRIGGER " + triggerName +
-		" AFTER INSERT ON " + collection +
+		" AFTER INSERT ON " + tableName +
 		" FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()"
 	if _, err := q.ExecContext(ctx, createTrigger); err != nil {
 		return fmt.Errorf("create cap trigger: %w", err)
@@ -1595,11 +1715,14 @@ func DocRemoveCap(ctx context.Context, q execQuerier, collection string) error {
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
+	return docRemoveCapOn(ctx, q, collection, collection)
+}
 
-	triggerName := collection + "_cap_trigger"
-	funcName := collection + "_cap_enforce"
+func docRemoveCapOn(ctx context.Context, q execQuerier, tableName, nameBase string) error {
+	triggerName := nameBase + "_cap_trigger"
+	funcName := nameBase + "_cap_enforce"
 
-	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection
+	dropTrigger := "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName
 	if _, err := q.ExecContext(ctx, dropTrigger); err != nil {
 		return fmt.Errorf("drop cap trigger: %w", err)
 	}

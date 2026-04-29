@@ -27,11 +27,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 var supportedVersions = map[string]string{
-	"stream": "v1",
+	"stream":    "v1",
+	"doc_store": "v1",
 }
 
 // DdlEntry holds the canonical table names and query patterns for a helper.
@@ -95,12 +97,46 @@ var ddlPost httpPoster = func(ctx context.Context, url, token string, body []byt
 	return resp.StatusCode, b, nil
 }
 
+// DDLOption customises a single FetchPatterns call. Currently only the
+// per-family `options` map is supported (e.g. doc_store accepts
+// {"unlogged": true}). Used by the documents namespace to forward
+// `unlogged` through to the proxy at create time.
+type DDLOption func(*ddlCallOptions)
+
+type ddlCallOptions struct {
+	options map[string]interface{}
+}
+
+// WithDDLOptions attaches a per-family options map to a FetchPatterns call.
+// The map is forwarded as `options` in the JSON body posted to
+// /api/ddl/<family>/create. Values are family-specific (doc_store: unlogged).
+//
+// Options only take effect on the call that materializes the helper table:
+// once the table exists, subsequent CREATE-IF-NOT-EXISTS calls silently
+// ignore the options on the proxy side — the wrapper does not migrate
+// existing tables.
+func WithDDLOptions(options map[string]interface{}) DDLOption {
+	return func(o *ddlCallOptions) {
+		o.options = options
+	}
+}
+
 // FetchPatterns fetches (and caches per-instance) the canonical {tables,
 // query_patterns} for a helper on a specific GoldLapel instance.
-func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string) (*DdlEntry, error) {
+//
+// Per-family creation options can be forwarded via WithDDLOptions(...). They
+// are sent on every call (since the cache is per-(family, name)), but the
+// proxy only honours them on first CREATE — see WithDDLOptions docs.
+func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string, opts ...DDLOption) (*DdlEntry, error) {
+	gl.ensureDdlCache()
 	key := family + ":" + name
 	if cached, ok := gl.ddlCache.Load(key); ok {
 		return cached.(*DdlEntry), nil
+	}
+
+	co := ddlCallOptions{}
+	for _, opt := range opts {
+		opt(&co)
 	}
 
 	token := gl.dashboardToken
@@ -123,10 +159,14 @@ func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string) (*D
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/api/ddl/%s/create", port, family)
-	reqBody, _ := json.Marshal(map[string]string{
+	bodyMap := map[string]interface{}{
 		"name":           name,
 		"schema_version": SupportedVersion(family),
-	})
+	}
+	if co.options != nil {
+		bodyMap["options"] = co.options
+	}
+	reqBody, _ := json.Marshal(bodyMap)
 
 	status, respBody, err := ddlPost(ctx, url, token, reqBody)
 	if err != nil {
@@ -179,8 +219,20 @@ func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string) (*D
 	return actual.(*DdlEntry), nil
 }
 
-// StreamPatterns is a typed convenience for callers that only want the
-// query_patterns map.
+// ensureDdlCache lazily initialises gl.ddlCache. The cache is normally
+// attached by attachNamespaces (called from Start, InTx, and buildForTest),
+// but this guard makes FetchPatterns robust against direct GoldLapel literal
+// construction in test code that pre-dates the namespace rollout.
+func (gl *GoldLapel) ensureDdlCache() {
+	gl.mu.Lock()
+	if gl.ddlCache == nil {
+		gl.ddlCache = &sync.Map{}
+	}
+	gl.mu.Unlock()
+}
+
+// streamPatterns is a typed convenience for callers that only want the
+// query_patterns map for the stream family.
 func (gl *GoldLapel) streamPatterns(ctx context.Context, stream string) (map[string]string, error) {
 	entry, err := gl.FetchPatterns(ctx, "stream", stream)
 	if err != nil {
@@ -196,7 +248,7 @@ func requireStreamPattern(qp map[string]string, key, fn string) (string, error) 
 	if qp == nil {
 		return "", fmt.Errorf(
 			"%s requires DDL patterns from the proxy — call via "+
-				"gl.%s(...) rather than the goldlapel.%s module function directly.",
+				"gl.Streams.%s(...) rather than the goldlapel.%s module function directly.",
 			fn, fn, fn,
 		)
 	}

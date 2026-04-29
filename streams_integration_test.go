@@ -44,7 +44,7 @@ func TestIntegrationStreams_PrefixedTable(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("gl_go_int_stream_%d", time.Now().UnixNano())
 
-	if _, err := gl.StreamAdd(ctx, name, `{"type":"click"}`); err != nil {
+	if _, err := gl.Streams.Add(ctx, name, `{"type":"click"}`); err != nil {
 		t.Fatalf("StreamAdd: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestIntegrationStreams_SchemaMetaRow(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("gl_go_int_meta_%d", time.Now().UnixNano())
 
-	if _, err := gl.StreamAdd(ctx, name, `{"type":"click"}`); err != nil {
+	if _, err := gl.Streams.Add(ctx, name, `{"type":"click"}`); err != nil {
 		t.Fatalf("StreamAdd: %v", err)
 	}
 
@@ -117,17 +117,17 @@ func TestIntegrationStreams_DDL_HTTPCallHappensOnce(t *testing.T) {
 	}
 	defer func() { ddlPost = origPost }()
 
-	if _, err := gl.StreamAdd(ctx, name, `{"i":1}`); err != nil {
+	if _, err := gl.Streams.Add(ctx, name, `{"i":1}`); err != nil {
 		t.Fatalf("StreamAdd 1: %v", err)
 	}
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("want 1 DDL POST, got %d", calls)
 	}
 
-	if _, err := gl.StreamAdd(ctx, name, `{"i":2}`); err != nil {
+	if _, err := gl.Streams.Add(ctx, name, `{"i":2}`); err != nil {
 		t.Fatalf("StreamAdd 2: %v", err)
 	}
-	if _, err := gl.StreamAdd(ctx, name, `{"i":3}`); err != nil {
+	if _, err := gl.Streams.Add(ctx, name, `{"i":3}`); err != nil {
 		t.Fatalf("StreamAdd 3: %v", err)
 	}
 	if atomic.LoadInt32(&calls) != 1 {
@@ -141,14 +141,14 @@ func TestIntegrationStreams_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("gl_go_int_rt_%d", time.Now().UnixNano())
 
-	if err := gl.StreamCreateGroup(ctx, name, "workers"); err != nil {
+	if err := gl.Streams.CreateGroup(ctx, name, "workers"); err != nil {
 		t.Fatalf("StreamCreateGroup: %v", err)
 	}
-	id1, err := gl.StreamAdd(ctx, name, `{"i":1}`)
+	id1, err := gl.Streams.Add(ctx, name, `{"i":1}`)
 	if err != nil {
 		t.Fatalf("StreamAdd 1: %v", err)
 	}
-	id2, err := gl.StreamAdd(ctx, name, `{"i":2}`)
+	id2, err := gl.Streams.Add(ctx, name, `{"i":2}`)
 	if err != nil {
 		t.Fatalf("StreamAdd 2: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestIntegrationStreams_RoundTrip(t *testing.T) {
 		t.Errorf("id2 (%d) should be > id1 (%d)", id2, id1)
 	}
 
-	msgs, err := gl.StreamRead(ctx, name, "workers", "c", 10)
+	msgs, err := gl.Streams.Read(ctx, name, "workers", "c", 10)
 	if err != nil {
 		t.Fatalf("StreamRead: %v", err)
 	}
@@ -165,11 +165,11 @@ func TestIntegrationStreams_RoundTrip(t *testing.T) {
 	}
 
 	// Ack the first; second ack should return false.
-	ok, err := gl.StreamAck(ctx, name, "workers", id1)
+	ok, err := gl.Streams.Ack(ctx, name, "workers", id1)
 	if err != nil || !ok {
 		t.Fatalf("first ack: ok=%v err=%v", ok, err)
 	}
-	ok, err = gl.StreamAck(ctx, name, "workers", id1)
+	ok, err = gl.Streams.Ack(ctx, name, "workers", id1)
 	if err != nil {
 		t.Fatalf("second ack err: %v", err)
 	}
@@ -192,12 +192,12 @@ func TestIntegrationStreams_ConcurrentReadNoDoubleClaim(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("gl_go_int_concurrent_%d", time.Now().UnixNano())
 
-	if err := gl.StreamCreateGroup(ctx, name, "workers"); err != nil {
+	if err := gl.Streams.CreateGroup(ctx, name, "workers"); err != nil {
 		t.Fatalf("StreamCreateGroup: %v", err)
 	}
 	const N = 40
 	for i := 0; i < N; i++ {
-		if _, err := gl.StreamAdd(ctx, name, fmt.Sprintf(`{"i":%d}`, i)); err != nil {
+		if _, err := gl.Streams.Add(ctx, name, fmt.Sprintf(`{"i":%d}`, i)); err != nil {
 			t.Fatalf("StreamAdd %d: %v", i, err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestIntegrationStreams_ConcurrentReadNoDoubleClaim(t *testing.T) {
 			<-start
 			var out []int64
 			for {
-				batch, err := gl.StreamRead(ctx, name, "workers", consumer, 4)
+				batch, err := gl.Streams.Read(ctx, name, "workers", consumer, 4)
 				if err != nil {
 					ch <- result{nil, err}
 					return

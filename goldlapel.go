@@ -303,7 +303,7 @@ func WithConfig(config map[string]interface{}) Option {
 // WithTx directs a single wrapper method call at a specific transaction.
 // Pass as the last argument to any receiver method:
 //
-//	gl.DocInsert(ctx, "events", doc, goldlapel.WithTx(tx))
+//	gl.Documents.Insert(ctx, "events", doc, goldlapel.WithTx(tx))
 //
 // Per-call only; ignored if passed to Start.
 func WithTx(tx *sql.Tx) Option {
@@ -437,8 +437,31 @@ type GoldLapel struct {
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
-	dashboardToken string   // provisioned on spawn; cleared on Stop
-	ddlCache       sync.Map // per-instance cache keyed on "family:name" → *DdlEntry
+	dashboardToken string     // provisioned on spawn; cleared on Stop
+	ddlCache       *sync.Map  // per-instance cache keyed on "family:name" → *DdlEntry; shared with InTx scoped instances
+
+	// Nested namespaces — see documents.go and streams.go. These are the
+	// canonical schema-to-core sub-API instances. Each holds a back-
+	// reference to this client for shared state (license, dashboard token,
+	// db, DDL pattern cache). Other namespaces (cache, search, queues,
+	// counters, hashes, zsets, geo, auth, …) stay flat for now and migrate
+	// to nested form one-at-a-time as their own schema-to-core phase fires.
+	Documents *Documents
+	Streams   *Streams
+}
+
+// attachNamespaces wires the nested sub-API instances onto gl and lazily
+// initialises the per-instance DDL cache. Called from Start (production
+// path), from InTx (scoped path — but with the parent's cache pointer
+// passed in), and from test harnesses so gl.Documents / gl.Streams /
+// gl.ddlCache are non-nil in every code path that sees a constructed
+// *GoldLapel.
+func (gl *GoldLapel) attachNamespaces() {
+	if gl.ddlCache == nil {
+		gl.ddlCache = &sync.Map{}
+	}
+	gl.Documents = &Documents{gl: gl}
+	gl.Streams = &Streams{gl: gl}
 }
 
 // Start spawns the Gold Lapel proxy against the given upstream, waits for it
@@ -453,6 +476,7 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 		upstream:  upstream,
 		proxyPort: DefaultProxyPort,
 	}
+	gl.attachNamespaces()
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
@@ -977,7 +1001,17 @@ func (gl *GoldLapel) InTx(ctx context.Context, db *sql.DB, fn func(*GoldLapel) e
 		done:             gl.done,
 		db:               gl.db,
 		tx:               tx,
+		// Inherit the dashboard token so DDL fetches inside the tx work
+		// the same as on the parent — without this, gl.Documents.Insert
+		// inside InTx would fall back to env/file lookup.
+		dashboardToken: gl.dashboardToken,
+		// Share the parent's DDL pattern cache so a hit on the parent
+		// (e.g. test pre-population, or a prior call this session)
+		// is also a hit inside InTx — without this, the scoped instance
+		// would always miss and re-POST to the dashboard.
+		ddlCache: gl.ddlCache,
 	}
+	scoped.attachNamespaces()
 	gl.mu.Unlock()
 
 	defer func() {
