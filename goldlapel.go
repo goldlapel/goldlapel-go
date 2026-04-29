@@ -210,7 +210,7 @@ func WithLogLevel(level string) Option {
 	})
 }
 
-// WithMode sets the proxy operating mode (e.g. "waiter", "bellhop"). Passed
+// WithMode sets the proxy operating mode (e.g. "waiter", "consideration"). Passed
 // as --mode. Construction-time only.
 func WithMode(mode string) Option {
 	return startOnly(func(gl *GoldLapel) {
