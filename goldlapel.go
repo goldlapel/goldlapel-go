@@ -138,34 +138,34 @@ type DocFindOption = Option
 // startOnly is an Option that only affects construction.
 type startOnly func(*GoldLapel)
 
-func (f startOnly) applyStart(gl *GoldLapel)  { f(gl) }
-func (f startOnly) applyCall(*callOptions)    {}
+func (f startOnly) applyStart(gl *GoldLapel)   { f(gl) }
+func (f startOnly) applyCall(*callOptions)     {}
 func (f startOnly) applySearch(*searchOptions) {}
 func (f startOnly) applyDoc(*docFindOptions)   {}
 
 // callOnly is an Option that only affects a single method call.
 type callOnly func(*callOptions)
 
-func (f callOnly) applyStart(*GoldLapel)       {}
-func (f callOnly) applyCall(o *callOptions)    { f(o) }
-func (f callOnly) applySearch(*searchOptions)  {}
-func (f callOnly) applyDoc(*docFindOptions)    {}
+func (f callOnly) applyStart(*GoldLapel)      {}
+func (f callOnly) applyCall(o *callOptions)   { f(o) }
+func (f callOnly) applySearch(*searchOptions) {}
+func (f callOnly) applyDoc(*docFindOptions)   {}
 
 // searchOnly is an Option that only affects search-specific options.
 type searchOnly func(*searchOptions)
 
-func (f searchOnly) applyStart(*GoldLapel)       {}
-func (f searchOnly) applyCall(*callOptions)      {}
+func (f searchOnly) applyStart(*GoldLapel)        {}
+func (f searchOnly) applyCall(*callOptions)       {}
 func (f searchOnly) applySearch(o *searchOptions) { f(o) }
-func (f searchOnly) applyDoc(*docFindOptions)    {}
+func (f searchOnly) applyDoc(*docFindOptions)     {}
 
 // docOnly is an Option that only affects DocFind-specific options.
 type docOnly func(*docFindOptions)
 
-func (f docOnly) applyStart(*GoldLapel)       {}
-func (f docOnly) applyCall(*callOptions)      {}
-func (f docOnly) applySearch(*searchOptions)  {}
-func (f docOnly) applyDoc(o *docFindOptions)  { f(o) }
+func (f docOnly) applyStart(*GoldLapel)      {}
+func (f docOnly) applyCall(*callOptions)     {}
+func (f docOnly) applySearch(*searchOptions) {}
+func (f docOnly) applyDoc(o *docFindOptions) { f(o) }
 
 // callOptions collects per-call overrides. Currently only a transaction
 // target, but this is the hook for future per-call options.
@@ -437,17 +437,21 @@ type GoldLapel struct {
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
-	dashboardToken string     // provisioned on spawn; cleared on Stop
-	ddlCache       *sync.Map  // per-instance cache keyed on "family:name" → *DdlEntry; shared with InTx scoped instances
+	dashboardToken string    // provisioned on spawn; cleared on Stop
+	ddlCache       *sync.Map // per-instance cache keyed on "family:name" → *DdlEntry; shared with InTx scoped instances
 
-	// Nested namespaces — see documents.go and streams.go. These are the
-	// canonical schema-to-core sub-API instances. Each holds a back-
-	// reference to this client for shared state (license, dashboard token,
-	// db, DDL pattern cache). Other namespaces (cache, search, queues,
-	// counters, hashes, zsets, geo, auth, …) stay flat for now and migrate
-	// to nested form one-at-a-time as their own schema-to-core phase fires.
+	// Nested namespaces — schema-to-core sub-API instances. Each holds a
+	// back-reference to this client for shared state (license, dashboard
+	// token, db, DDL pattern cache). Phase 4 = Documents + Streams; Phase 5
+	// = Counters / Zsets / Hashes / Queues / Geos. Remaining flat namespaces
+	// (cache, search, percolate, pubsub) migrate in their own phases.
 	Documents *Documents
 	Streams   *Streams
+	Counters  *Counters
+	Zsets     *Zsets
+	Hashes    *Hashes
+	Queues    *Queues
+	Geos      *Geos
 }
 
 // attachNamespaces wires the nested sub-API instances onto gl and lazily
@@ -462,6 +466,11 @@ func (gl *GoldLapel) attachNamespaces() {
 	}
 	gl.Documents = &Documents{gl: gl}
 	gl.Streams = &Streams{gl: gl}
+	gl.Counters = &Counters{gl: gl}
+	gl.Zsets = &Zsets{gl: gl}
+	gl.Hashes = &Hashes{gl: gl}
+	gl.Queues = &Queues{gl: gl}
+	gl.Geos = &Geos{gl: gl}
 }
 
 // Start spawns the Gold Lapel proxy against the given upstream, waits for it

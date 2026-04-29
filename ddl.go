@@ -34,6 +34,15 @@ import (
 var supportedVersions = map[string]string{
 	"stream":    "v1",
 	"doc_store": "v1",
+	// Phase 5 Redis-compat families. Every helper namespace pins its schema
+	// at the wrapper layer so a wrapper/proxy version drift surfaces with
+	// an actionable 409 from /api/ddl/<family>/create rather than executing
+	// a query against the wrong table shape.
+	"counter": "v1",
+	"zset":    "v1",
+	"hash":    "v1",
+	"queue":   "v1",
+	"geo":     "v1",
 }
 
 // DdlEntry holds the canonical table names and query patterns for a helper.
@@ -176,8 +185,8 @@ func (gl *GoldLapel) FetchPatterns(ctx context.Context, family, name string, opt
 	if status != http.StatusOK {
 		// Try to unpack an error envelope.
 		var e struct {
-			Error    string `json:"error"`
-			Detail   string `json:"detail"`
+			Error     string `json:"error"`
+			Detail    string `json:"detail"`
 			Canonical string `json:"canonical,omitempty"`
 			Requested string `json:"requested,omitempty"`
 		}
