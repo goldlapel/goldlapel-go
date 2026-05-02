@@ -39,6 +39,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -60,6 +61,9 @@ var (
 	// We use regex instead of net/url to preserve percent-encoded characters.
 	withPortRe    = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$`)
 	withoutPortRe = regexp.MustCompile(`^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$`)
+	// Pre-existing application_name in a query string — match against either
+	// `?application_name=` or `&application_name=`.
+	appNameRe = regexp.MustCompile(`[?&]application_name=`)
 
 	// validConfigKeys enumerates the tuning knobs still accepted inside the
 	// structured `config` map. Top-level concepts (proxy_port, dashboard_port,
@@ -1169,18 +1173,66 @@ func toInt(v interface{}) (int, error) {
 
 // --- URL rewriting ---
 
+// WrapperVersion returns the Go wrapper's installed version, used to build the
+// application_name marker on PG connections. Read from runtime/debug build
+// info (Go modules expose this for tagged versions); falls back to "0.0.0" for
+// dev builds and tagged-development scenarios.
+func WrapperVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		// Look for our own module record. info.Main is the binary's main module
+		// when built as a binary; for library consumers we walk Deps.
+		if info.Main.Path == "github.com/goldlapel/goldlapel-go" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return strings.TrimPrefix(info.Main.Version, "v")
+		}
+		for _, dep := range info.Deps {
+			if dep == nil {
+				continue
+			}
+			if dep.Path == "github.com/goldlapel/goldlapel-go" && dep.Version != "" && dep.Version != "(devel)" {
+				return strings.TrimPrefix(dep.Version, "v")
+			}
+		}
+	}
+	return "0.0.0"
+}
+
+// ApplicationNameMarker returns the application_name string the wrapper sets
+// on PG connections so the proxy can classify wrapper-vs-raw traffic and
+// gate L2 result cache (the wrapper has its own L1; raw clients don't).
+func ApplicationNameMarker() string {
+	return "goldlapel:go:" + WrapperVersion()
+}
+
+// injectApplicationName appends application_name=goldlapel:go:<version> to
+// the URL unless one is already present (or PGAPPNAME is set in the env).
+// Idempotent and override-respecting.
+func injectApplicationName(url string) string {
+	if appNameRe.MatchString(url) {
+		return url
+	}
+	if v := os.Getenv("PGAPPNAME"); v != "" {
+		return url
+	}
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	return url + sep + "application_name=" + ApplicationNameMarker()
+}
+
 // MakeProxyURL rewrites an upstream connection string to point at the local proxy.
 func MakeProxyURL(upstream string, port int) string {
 	portStr := fmt.Sprintf("%d", port)
 
 	if m := withPortRe.FindStringSubmatch(upstream); m != nil {
-		return m[1] + "localhost:" + portStr + m[4]
+		return injectApplicationName(m[1] + "localhost:" + portStr + m[4])
 	}
 
 	if m := withoutPortRe.FindStringSubmatch(upstream); m != nil {
-		return m[1] + "localhost:" + portStr + m[3]
+		return injectApplicationName(m[1] + "localhost:" + portStr + m[3])
 	}
 
+	// Bare-host form skips the marker — atypical caller path.
 	if !strings.Contains(upstream, "://") && strings.Contains(upstream, ":") {
 		return "localhost:" + portStr
 	}

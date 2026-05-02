@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -222,40 +223,74 @@ func TestFindBinaryNotFoundError(t *testing.T) {
 }
 
 // --- MakeProxyURL tests ---
+//
+// The wrapper appends `application_name=goldlapel:go:<version>` to every
+// rewritten URL so the proxy can classify wrapper-vs-raw traffic and skip
+// L2 result cache for wrappers (they have their own L1). PGAPPNAME is
+// cleared in each test so the marker is applied deterministically.
+
+// appNameSuffix returns the query fragment the wrapper appends to every URL.
+func appNameSuffix() string {
+	return "application_name=" + ApplicationNameMarker()
+}
+
+// withClearedPGAppName runs fn with PGAPPNAME unset, restoring it on exit.
+func withClearedPGAppName(t *testing.T, fn func()) {
+	t.Helper()
+	orig, had := os.LookupEnv("PGAPPNAME")
+	os.Unsetenv("PGAPPNAME")
+	defer func() {
+		if had {
+			os.Setenv("PGAPPNAME", orig)
+		} else {
+			os.Unsetenv("PGAPPNAME")
+		}
+	}()
+	fn()
+}
 
 func TestMakeProxyURLPostgresqlWithPort(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 7932)
-	want := "postgresql://user:pass@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 7932)
+		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLPostgresWithPort(t *testing.T) {
-	got := MakeProxyURL("postgres://user:pass@remote.aws.com:5432/mydb", 7932)
-	want := "postgres://user:pass@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgres://user:pass@remote.aws.com:5432/mydb", 7932)
+		want := "postgres://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLWithoutPort(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@host.aws.com/mydb", 7932)
-	want := "postgresql://user:pass@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@host.aws.com/mydb", 7932)
+		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLWithoutPortOrPath(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@host.aws.com", 7932)
-	want := "postgresql://user:pass@localhost:7932"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@host.aws.com", 7932)
+		want := "postgresql://user:pass@localhost:7932?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLBareHostPort(t *testing.T) {
+	// Bare-host form skips the marker — atypical caller path.
 	got := MakeProxyURL("dbhost:5432", 7932)
 	want := "localhost:7932"
 	if got != want {
@@ -272,66 +307,145 @@ func TestMakeProxyURLBareHost(t *testing.T) {
 }
 
 func TestMakeProxyURLPreservesQueryParams(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@remote:5432/mydb?sslmode=require", 7932)
-	want := "postgresql://user:pass@localhost:7932/mydb?sslmode=require"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@remote:5432/mydb?sslmode=require", 7932)
+		want := "postgresql://user:pass@localhost:7932/mydb?sslmode=require&" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLPreservesPercentEncoded(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:p%40ss@remote:5432/mydb", 7932)
-	want := "postgresql://user:p%40ss@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:p%40ss@remote:5432/mydb", 7932)
+		want := "postgresql://user:p%40ss@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLWithoutUserinfo(t *testing.T) {
-	got := MakeProxyURL("postgresql://dbhost:5432/mydb", 7932)
-	want := "postgresql://localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://dbhost:5432/mydb", 7932)
+		want := "postgresql://localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLLiteralAtInPasswordWithPort(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb", 7932)
-	want := "postgresql://user:p@ss@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb", 7932)
+		want := "postgresql://user:p@ss@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLLiteralAtInPasswordWithoutPort(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:p@ss@host/mydb", 7932)
-	want := "postgresql://user:p@ss@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:p@ss@host/mydb", 7932)
+		want := "postgresql://user:p@ss@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLLiteralAtWithQueryParams(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue", 7932)
-	want := "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue", 7932)
+		want := "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLLocalhostStaysLocalhost(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@localhost:5432/mydb", 7932)
-	want := "postgresql://user:pass@localhost:7932/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@localhost:5432/mydb", 7932)
+		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func TestMakeProxyURLCustomPort(t *testing.T) {
-	got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 9000)
-	want := "postgresql://user:pass@localhost:9000/mydb"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	withClearedPGAppName(t, func() {
+		got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 9000)
+		want := "postgresql://user:pass@localhost:9000/mydb?" + appNameSuffix()
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+}
+
+// --- ApplicationNameMarker tests ---
+//
+// L2-router architecture: wrappers identify themselves to the proxy via PG
+// `application_name` so the proxy can gate L2 result cache (wrappers have
+// L1; raw clients don't).
+
+func TestApplicationNameMarkerHasGoldlapelGoShape(t *testing.T) {
+	m := ApplicationNameMarker()
+	matched, _ := regexp.MatchString(`^goldlapel:go:.+$`, m)
+	if !matched {
+		t.Fatalf("marker has wrong shape: %q", m)
+	}
+}
+
+func TestApplicationNameMarkerAppendedWhenNoExistingQuery(t *testing.T) {
+	withClearedPGAppName(t, func() {
+		out := MakeProxyURL("postgresql://localhost:5432/mydb", 7932)
+		if !strings.Contains(out, "?application_name=goldlapel:go:") {
+			t.Fatalf("expected marker in: %q", out)
+		}
+	})
+}
+
+func TestApplicationNameMarkerAppendedWithExistingQuery(t *testing.T) {
+	withClearedPGAppName(t, func() {
+		out := MakeProxyURL("postgresql://localhost:5432/mydb?sslmode=require", 7932)
+		if !strings.Contains(out, "sslmode=require") {
+			t.Fatalf("existing query lost: %q", out)
+		}
+		if !strings.Contains(out, "&application_name=goldlapel:go:") {
+			t.Fatalf("expected marker appended after existing query: %q", out)
+		}
+	})
+}
+
+func TestApplicationNameMarkerRespectsUserUrlOverride(t *testing.T) {
+	withClearedPGAppName(t, func() {
+		out := MakeProxyURL("postgresql://localhost:5432/mydb?application_name=my-app", 7932)
+		if !strings.Contains(out, "application_name=my-app") {
+			t.Fatalf("user override lost: %q", out)
+		}
+		if strings.Contains(out, "goldlapel:go") {
+			t.Fatalf("wrapper clobbered user-set application_name: %q", out)
+		}
+	})
+}
+
+func TestApplicationNameMarkerRespectsPGAppNameEnv(t *testing.T) {
+	orig, had := os.LookupEnv("PGAPPNAME")
+	os.Setenv("PGAPPNAME", "my-app")
+	defer func() {
+		if had {
+			os.Setenv("PGAPPNAME", orig)
+		} else {
+			os.Unsetenv("PGAPPNAME")
+		}
+	}()
+	out := MakeProxyURL("postgresql://localhost:5432/mydb", 7932)
+	if strings.Contains(out, "application_name=") {
+		t.Fatalf("PGAPPNAME set; wrapper still injected marker: %q", out)
 	}
 }
 
