@@ -1,21 +1,45 @@
 package goldlapel
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 const (
 	ddlSentinel             = "__ddl__"
 	DefaultInvalidationPort = 7934
+
+	// --- L1 telemetry tuning ---
+	//
+	// Demand-driven model (2026-05-02): the wrapper has NO background timer.
+	// Cache counters increment on cache ops (free); state-change events are
+	// emitted synchronously when a relevant counter crosses a threshold;
+	// snapshot replies are sent only when the proxy asks via ?:<request>.
+	//
+	// Eviction-rate sliding window. cache_full fires when ≥ evictRateHigh
+	// of the last evictRateWindow cache writes (puts) caused an eviction;
+	// cache_recovered fires when the rate falls back below evictRateLow.
+	// With a 32k-entry default capacity, a steady-state high eviction rate
+	// means the working set exceeds the cache — actionable signal for the
+	// dashboard.
+	evictRateWindow = 200
+	evictRateHigh   = 0.5 // 50% of recent puts evicted → cache_full
+	evictRateLow    = 0.1 // ≤ 10% → cache_recovered
 )
 
 var (
@@ -56,9 +80,63 @@ type NativeCache struct {
 	invConn      net.Conn
 	reconnectN   int
 
+	// Counters bumped on the cache hot path. statsHits / statsMisses /
+	// statsInvalidations are read concurrently by external callers
+	// (StatsHits()/etc.) and must use atomics to avoid a race with
+	// ongoing puts/gets that read other fields under nc.mu. statsEvictions
+	// is a peer counter — same access pattern, same atomic treatment.
+	// The eviction-rate sliding window is a multi-field structure that
+	// is read+mutated together, so it stays under nc.mu.
 	statsHits          int64
 	statsMisses        int64
 	statsInvalidations int64
+	statsEvictions     int64
+
+	// --- L1 telemetry (2026-05-03) ---
+
+	// Stable wrapper identity for the lifetime of the process. Lets the
+	// proxy aggregate per-wrapper stats across reconnects.
+	wrapperID      string
+	wrapperLang    string
+	wrapperVersion string
+
+	// Opt-out switch: GOLDLAPEL_REPORT_STATS=false (or ReportStats=false
+	// in goldlapel.Start options) suppresses every emit path. The cache
+	// continues to function (invalidation thread still runs; only
+	// telemetry output is suppressed).
+	reportStats bool
+
+	// Send-side serialization. The recv goroutine emits R: replies and
+	// the cache-op caller goroutines emit S: events; without serialization
+	// concurrent conn.Write() calls could interleave bytes. sendMu
+	// guards every line write to invConn.
+	sendMu sync.Mutex
+
+	// sendFunc is a test seam: when non-nil, telemetry lines are routed
+	// to it instead of the live socket. Production code leaves it nil
+	// and writes go to invConn under sendMu. Tests inject an
+	// appendingFunc to capture emissions deterministically.
+	sendFunc func(string) error
+
+	// Eviction-rate sliding window — bounded ring of length evictRateWindow,
+	// 1 = put caused an eviction, 0 = put inserted without eviction.
+	// O(1) amortised: append until full, then overwrite oldest.
+	recentEvictions    []int
+	recentEvictionsIdx int
+
+	// Latched "cache is full" flag. Hysteresis: only flips on transition,
+	// so a sustained-bad rate emits exactly one cache_full, not one per
+	// put. cache_recovered flips it back when the rate falls below
+	// evictRateLow.
+	stateCacheFull bool
+
+	// Signal-handler goroutine state. signalCancel terminates the goroutine
+	// when the cache is reset / invalidation stops; the goroutine emits
+	// wrapper_disconnected on SIGINT/SIGTERM. signalOnce ensures we install
+	// the handler exactly once per cache instance, regardless of how many
+	// times ConnectInvalidation is called.
+	signalCancel context.CancelFunc
+	signalOnce   sync.Once
 }
 
 var (
@@ -95,13 +173,100 @@ func newNativeCache() *NativeCache {
 	if s := os.Getenv("GOLDLAPEL_NATIVE_CACHE"); strings.EqualFold(s, "false") {
 		enabled = false
 	}
-	return &NativeCache{
-		cache:       make(map[string]*cacheEntry),
-		tableIndex:  make(map[string]map[string]bool),
-		accessOrder: make(map[string]uint64),
-		maxEntries:  maxEntries,
-		enabled:     enabled,
+	// Telemetry opt-out (env). The Options-layer ReportStats override is
+	// applied after construction via SetReportStats; this default honours
+	// the env var when no option was passed.
+	reportStats := true
+	if s := os.Getenv("GOLDLAPEL_REPORT_STATS"); strings.EqualFold(s, "false") {
+		reportStats = false
 	}
+	return &NativeCache{
+		cache:          make(map[string]*cacheEntry),
+		tableIndex:     make(map[string]map[string]bool),
+		accessOrder:    make(map[string]uint64),
+		maxEntries:     maxEntries,
+		enabled:        enabled,
+		wrapperID:      newWrapperID(),
+		wrapperLang:    "go",
+		wrapperVersion: telemetryVersion(),
+		reportStats:    reportStats,
+	}
+}
+
+// newWrapperID returns a fresh UUID v4 string for use as the stable
+// wrapper identity. Hand-rolled from crypto/rand to avoid pulling in
+// google/uuid as a dependency (the wrapper's go.mod intentionally
+// minimises external deps). RFC 4122 §4.4 layout: byte 6 high nibble
+// 0x40 (version), byte 8 high two bits 0x80 (variant 1).
+func newWrapperID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand should never fail on supported platforms; on
+		// the off-chance it does, time-mix something so two wrappers
+		// in the same process don't share an empty ID.
+		ts := time.Now().UnixNano()
+		for i := 0; i < 8; i++ {
+			b[i] = byte(ts >> (i * 8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 1 (RFC 4122)
+	hexStr := hex.EncodeToString(b[:])
+	return hexStr[0:8] + "-" + hexStr[8:12] + "-" + hexStr[12:16] + "-" + hexStr[16:20] + "-" + hexStr[20:32]
+}
+
+// telemetryVersion returns the wrapper version string for the snapshot
+// `version` field. Mirrors WrapperVersion()'s debug.ReadBuildInfo() lookup
+// but maps the dev fallback ("0.0.0" in WrapperVersion, used to keep the
+// application_name marker non-empty) to the more honest "unknown" — the
+// telemetry doc explicitly calls this out: "fall back to unknown".
+//
+// debug.ReadBuildInfo() yields a real version only when the wrapper is
+// imported as a tagged module by a downstream consumer. In local dev
+// (working tree, `go test ./...`) info.Main.Version is "(devel)" and
+// info.Deps doesn't include this module, so we fall through to "unknown".
+func telemetryVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Path == "github.com/goldlapel/goldlapel-go" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return strings.TrimPrefix(info.Main.Version, "v")
+		}
+		for _, dep := range info.Deps {
+			if dep == nil {
+				continue
+			}
+			if dep.Path == "github.com/goldlapel/goldlapel-go" && dep.Version != "" && dep.Version != "(devel)" {
+				return strings.TrimPrefix(dep.Version, "v")
+			}
+		}
+	}
+	return "unknown"
+}
+
+// SetReportStats overrides the GOLDLAPEL_REPORT_STATS env-derived default.
+// Wired through goldlapel.Start's WithReportStats option so library users
+// can disable telemetry programmatically without touching the environment.
+// Safe to call before or after ConnectInvalidation; the new value takes
+// effect on the next emit.
+func (nc *NativeCache) SetReportStats(enabled bool) {
+	nc.mu.Lock()
+	nc.reportStats = enabled
+	nc.mu.Unlock()
+}
+
+// ReportStatsEnabled reports whether telemetry emissions are currently
+// enabled. Exposed for tests; callers shouldn't need to gate on this in
+// production code.
+func (nc *NativeCache) ReportStatsEnabled() bool {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return nc.reportStats
+}
+
+// WrapperID returns the stable UUID v4 identifier this cache uses in
+// telemetry snapshots. Generated once at construction and stable for the
+// process lifetime.
+func (nc *NativeCache) WrapperID() string {
+	return nc.wrapperID
 }
 
 func (nc *NativeCache) Connected() bool {
@@ -127,6 +292,12 @@ func (nc *NativeCache) StatsMisses() int64 {
 // StatsInvalidations returns the number of cache invalidations.
 func (nc *NativeCache) StatsInvalidations() int64 {
 	return atomic.LoadInt64(&nc.statsInvalidations)
+}
+
+// StatsEvictions returns the number of cache evictions (entries removed
+// from the LRU because the cache reached its capacity).
+func (nc *NativeCache) StatsEvictions() int64 {
+	return atomic.LoadInt64(&nc.statsEvictions)
 }
 
 func (nc *NativeCache) Size() int {
@@ -161,14 +332,16 @@ func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fie
 		return
 	}
 	nc.mu.Lock()
-	defer nc.mu.Unlock()
 	if !nc.invConnected {
+		nc.mu.Unlock()
 		return
 	}
 	key := makeKey(sql, args)
 	tables := extractTables(sql)
+	evicted := 0
 	if _, exists := nc.cache[key]; !exists && len(nc.cache) >= nc.maxEntries {
 		nc.evictOne()
+		evicted = 1
 	}
 	nc.cache[key] = &cacheEntry{Rows: rows, Fields: fields, Tables: tables}
 	nc.counter++
@@ -179,6 +352,13 @@ func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fie
 		}
 		nc.tableIndex[table][key] = true
 	}
+	nc.recordEvictionLocked(evicted)
+	nc.mu.Unlock()
+	// Eviction-rate threshold check happens outside the lock — emit may
+	// take sendMu and we don't want to nest locks (the recv goroutine
+	// can hold sendMu while attempting a write that blocks on a slow
+	// peer; nesting it under nc.mu would freeze every cache op).
+	nc.maybeEmitEvictionRateStateChange()
 }
 
 func (nc *NativeCache) InvalidateTable(table string) {
@@ -232,6 +412,14 @@ func (nc *NativeCache) ConnectInvalidation(port int) {
 	nc.reconnectN = 0
 	nc.mu.Unlock()
 
+	// Install the SIGINT/SIGTERM listener once per cache — emits a final
+	// wrapper_disconnected on graceful shutdown. signalOnce makes
+	// ConnectInvalidation safe to call after a Stop/Connect cycle (the
+	// handler from the previous cycle was cancelled in StopInvalidation;
+	// we won't re-register, but a fresh cache from ResetNativeCache gets
+	// its own handler).
+	nc.installSignalHandler()
+
 	go nc.invalidationLoop()
 }
 
@@ -244,13 +432,18 @@ func (nc *NativeCache) StopInvalidation() {
 	close(nc.invStop)
 	nc.invRunning = false
 	nc.invConnected = false
-	// Close the active connection to unblock any pending Read call
+	nc.mu.Unlock()
+	// Clear invConn under sendMu so a concurrent emitter on a cache-op
+	// goroutine can't grab the FD reference between us nilling it and
+	// closing it.
+	nc.sendMu.Lock()
 	conn := nc.invConn
 	nc.invConn = nil
-	nc.mu.Unlock()
+	nc.sendMu.Unlock()
 	if conn != nil {
 		conn.Close()
 	}
+	nc.stopSignalHandler()
 }
 
 func (nc *NativeCache) invalidationLoop() {
@@ -283,17 +476,41 @@ func (nc *NativeCache) invalidationLoop() {
 
 		nc.mu.Lock()
 		nc.invConnected = true
-		nc.invConn = conn
 		nc.reconnectN = 0
 		nc.mu.Unlock()
+		// invConn is read under sendMu in sendLine and cleared under sendMu
+		// in StopInvalidation / the post-read cleanup below; assign it
+		// under sendMu too so the write/read pair synchronizes (the race
+		// detector tolerates the previous layout because tests don't
+		// observe simultaneous set+read, but the data race is still
+		// real if a future caller emits before invalidationLoop has
+		// finished setting up).
+		nc.sendMu.Lock()
+		nc.invConn = conn
+		nc.sendMu.Unlock()
+
+		// Emit wrapper_connected synchronously on the loop goroutine.
+		// invConn is set above under sendMu so sendLine writes to the
+		// live FD; the L1 telemetry pattern guarantees this is the
+		// first line on the wire after a successful connect.
+		nc.emitStateChange("wrapper_connected")
 
 		nc.readInvalidations(conn)
 
-		nc.mu.Lock()
-		// Clear invConn only if it hasn't been cleared by StopInvalidation
+		// Clear the socket reference under sendMu so any concurrent
+		// emitter on a cache-op goroutine doesn't write to the FD we're
+		// about to close. The Python wrapper has the same dance — without
+		// it, sendLine could observe a non-nil conn, the loop closes it,
+		// and the subsequent Write() lands on a closed FD (best-case a
+		// swallowed error, worst-case a panic on platforms that map
+		// closed FDs aggressively).
+		nc.sendMu.Lock()
 		if nc.invConn == conn {
 			nc.invConn = nil
 		}
+		nc.sendMu.Unlock()
+
+		nc.mu.Lock()
 		wasConnected := nc.invConnected
 		nc.invConnected = false
 		nc.mu.Unlock()
@@ -340,6 +557,9 @@ func (nc *NativeCache) readInvalidations(conn net.Conn) {
 }
 
 func (nc *NativeCache) processSignal(line string) {
+	// Backwards/forwards-compat: unknown prefixes are silently ignored.
+	// The proxy may add new request types over time; older wrappers
+	// must not crash on them.
 	if strings.HasPrefix(line, "I:") {
 		table := strings.TrimSpace(line[2:])
 		if table == "*" {
@@ -347,8 +567,25 @@ func (nc *NativeCache) processSignal(line string) {
 		} else {
 			nc.InvalidateTable(table)
 		}
+		return
 	}
-	// P: keepalive — ignore
+	if strings.HasPrefix(line, "?:") {
+		nc.processRequest(line[2:])
+		return
+	}
+	// P: keepalive, C: config, anything else — ignored.
+}
+
+// processRequest handles ?:<request> from the proxy. Today the only
+// recognised body is "snapshot" (or empty, treated as snapshot). The
+// proxy may extend this with new request types; unrecognised bodies are
+// silently dropped — only the proxy that issued the request is waiting
+// on a reply, so the contract is local to each request type.
+func (nc *NativeCache) processRequest(raw string) {
+	body := strings.TrimSpace(raw)
+	if body == "" || body == "snapshot" {
+		nc.emitResponse()
+	}
 }
 
 func (nc *NativeCache) scheduleReconnect() {
@@ -391,6 +628,217 @@ func (nc *NativeCache) evictOne() {
 				}
 			}
 		}
+	}
+	atomic.AddInt64(&nc.statsEvictions, 1)
+}
+
+// --- L1 telemetry: sliding window + snapshot + emission ---
+
+// recordEvictionLocked appends a put outcome (1 evicted, 0 inserted) to
+// the sliding window. Caller must hold nc.mu. Bounded ring of length
+// evictRateWindow; once at capacity it overwrites the oldest entry in
+// O(1). The window's purpose is to detect a sustained imbalance between
+// the working set and cache capacity.
+func (nc *NativeCache) recordEvictionLocked(evicted int) {
+	if len(nc.recentEvictions) < evictRateWindow {
+		nc.recentEvictions = append(nc.recentEvictions, evicted)
+		return
+	}
+	nc.recentEvictions[nc.recentEvictionsIdx] = evicted
+	nc.recentEvictionsIdx = (nc.recentEvictionsIdx + 1) % evictRateWindow
+}
+
+// snapshot is the JSON shape the proxy aggregates per-tick. The proxy
+// parses these structurally; field names + types must match the
+// canonical pattern across all wrapper languages exactly. The State
+// field is populated only on S: emissions.
+type snapshot struct {
+	WrapperID          string `json:"wrapper_id"`
+	Lang               string `json:"lang"`
+	Version            string `json:"version"`
+	Hits               int64  `json:"hits"`
+	Misses             int64  `json:"misses"`
+	Evictions          int64  `json:"evictions"`
+	Invalidations      int64  `json:"invalidations"`
+	CurrentSizeEntries int    `json:"current_size_entries"`
+	CapacityEntries    int    `json:"capacity_entries"`
+	TsMs               int64  `json:"ts_ms"`
+	State              string `json:"state,omitempty"`
+}
+
+// buildSnapshot reads counters + size in a single critical section so
+// the snapshot is internally consistent (no torn reads where, e.g., hits
+// and misses straddle a concurrent get()). The proxy computes deltas
+// across ticks; we just expose the raw counters.
+func (nc *NativeCache) buildSnapshot() snapshot {
+	nc.mu.Lock()
+	size := len(nc.cache)
+	nc.mu.Unlock()
+	return snapshot{
+		WrapperID:          nc.wrapperID,
+		Lang:               nc.wrapperLang,
+		Version:            nc.wrapperVersion,
+		Hits:               atomic.LoadInt64(&nc.statsHits),
+		Misses:             atomic.LoadInt64(&nc.statsMisses),
+		Evictions:          atomic.LoadInt64(&nc.statsEvictions),
+		Invalidations:      atomic.LoadInt64(&nc.statsInvalidations),
+		CurrentSizeEntries: size,
+		CapacityEntries:    nc.maxEntries,
+	}
+}
+
+// sendLine serialises a line write under sendMu. Best-effort: socket
+// errors are swallowed (the recv loop will detect the broken connection
+// on its next iteration and reconnect). The sendFunc test seam shortcuts
+// the socket entirely so unit tests can capture emissions deterministically.
+func (nc *NativeCache) sendLine(line string) {
+	nc.mu.Lock()
+	enabled := nc.reportStats
+	sf := nc.sendFunc
+	nc.mu.Unlock()
+	if !enabled {
+		return
+	}
+	if sf != nil {
+		_ = sf(line)
+		return
+	}
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	nc.sendMu.Lock()
+	conn := nc.invConn
+	if conn == nil {
+		nc.sendMu.Unlock()
+		return
+	}
+	_, _ = conn.Write([]byte(line))
+	nc.sendMu.Unlock()
+}
+
+// emitStateChange sends S:<json> with the current snapshot annotated
+// with the supplied state name + a fresh ts_ms. No-op when reportStats
+// is disabled.
+func (nc *NativeCache) emitStateChange(state string) {
+	if !nc.ReportStatsEnabled() {
+		return
+	}
+	snap := nc.buildSnapshot()
+	snap.State = state
+	snap.TsMs = time.Now().UnixMilli()
+	body, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	nc.sendLine("S:" + string(body))
+}
+
+// emitResponse sends R:<json> in reply to a ?:<request>. Same shape as
+// S: but without the state field.
+func (nc *NativeCache) emitResponse() {
+	if !nc.ReportStatsEnabled() {
+		return
+	}
+	snap := nc.buildSnapshot()
+	snap.TsMs = time.Now().UnixMilli()
+	body, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	nc.sendLine("R:" + string(body))
+}
+
+// maybeEmitEvictionRateStateChange checks the eviction-rate sliding
+// window and emits a state change when the latched flag should flip.
+// Hysteresis: rates above evictRateHigh trip cache_full; rates below
+// evictRateLow trip cache_recovered; rates between leave the latched
+// state unchanged (no flapping near the boundary). A warmup gate
+// requires a full window of samples before any emission — a single
+// eviction in 3 puts is noise, not signal.
+func (nc *NativeCache) maybeEmitEvictionRateStateChange() {
+	var emit string
+	nc.mu.Lock()
+	n := len(nc.recentEvictions)
+	if n < evictRateWindow {
+		nc.mu.Unlock()
+		return
+	}
+	sum := 0
+	for _, v := range nc.recentEvictions {
+		sum += v
+	}
+	rate := float64(sum) / float64(n)
+	if !nc.stateCacheFull && rate >= evictRateHigh {
+		nc.stateCacheFull = true
+		emit = "cache_full"
+	} else if nc.stateCacheFull && rate <= evictRateLow {
+		nc.stateCacheFull = false
+		emit = "cache_recovered"
+	}
+	nc.mu.Unlock()
+	if emit != "" {
+		nc.emitStateChange(emit)
+	}
+}
+
+// EmitWrapperDisconnected emits a final wrapper_disconnected snapshot
+// before shutdown. Best-effort — the socket may already be torn down,
+// in which case sendLine swallows the write error and the proxy will
+// time the wrapper out anyway.
+func (nc *NativeCache) EmitWrapperDisconnected() {
+	nc.emitStateChange("wrapper_disconnected")
+}
+
+// installSignalHandler arranges for EmitWrapperDisconnected() to fire
+// on SIGINT/SIGTERM. Polite-citizen design: we register an additional
+// listener via signal.Notify, NOT signal.Reset — if the user installed
+// their own handlers (or a framework like cobra/cli did), ours runs in
+// parallel without preventing theirs from observing the signal. After
+// emitting, the goroutine exits without calling os.Exit() so the rest
+// of the process's shutdown sequence (defer chains, parent
+// signal.Notify listeners) runs to completion.
+//
+// Idempotent via signalOnce — repeated ConnectInvalidation calls don't
+// stack handlers. Cancellation via signalCancel terminates the goroutine
+// when the cache is reset / invalidation stops.
+func (nc *NativeCache) installSignalHandler() {
+	nc.signalOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		nc.mu.Lock()
+		nc.signalCancel = cancel
+		nc.mu.Unlock()
+
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+
+		go func() {
+			// signal.Stop is the documented way to detach our listener
+			// from the signal source so the runtime stops trying to
+			// deliver to a goroutine that's about to exit. Don't
+			// close(ch) afterwards — signal.Stop drains pending
+			// deliveries; closing the channel would race the runtime.
+			defer signal.Stop(ch)
+			select {
+			case <-ch:
+				nc.EmitWrapperDisconnected()
+			case <-ctx.Done():
+				return
+			}
+		}()
+	})
+}
+
+// stopSignalHandler cancels the signal-handling goroutine if one is
+// running. Called from StopInvalidation so a cache that was started
+// then stopped doesn't leak the goroutine. Safe to call when no
+// handler was installed (signalCancel is nil).
+func (nc *NativeCache) stopSignalHandler() {
+	nc.mu.Lock()
+	cancel := nc.signalCancel
+	nc.signalCancel = nil
+	nc.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

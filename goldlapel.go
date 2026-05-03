@@ -265,6 +265,23 @@ func WithSilent(silent bool) Option {
 	})
 }
 
+// WithReportStats toggles L1 telemetry emission to the proxy. When true
+// (the default), the wrapper's local cache emits state-change events
+// (wrapper_connected, wrapper_disconnected, cache_full, cache_recovered)
+// and replies to ?:snapshot requests on the existing invalidation socket
+// — single-digit lines per minute under stable load. When false, every
+// emission path is a no-op; the cache continues to function (invalidation
+// continues to deliver write notifications), only telemetry output is
+// suppressed.
+//
+// Equivalent env var: GOLDLAPEL_REPORT_STATS=false. Construction-time only.
+func WithReportStats(enabled bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.reportStats = enabled
+		gl.reportStatsSet = true
+	})
+}
+
 // WithMesh opts the proxy into the mesh at startup. HQ enforces the license:
 // if the current plan doesn't cover mesh, the proxy continues running normally
 // without clustering (concierge, not bouncer) — Start does not fail.
@@ -439,6 +456,9 @@ type GoldLapel struct {
 	silent              bool    // when true, printBanner is a no-op
 	mesh                bool    // startup mesh intent (emits --mesh)
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
+	reportStats         bool    // L1 telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
+	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
+
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
 	dashboardToken string    // provisioned on spawn; cleared on Stop
@@ -508,6 +528,14 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 
 	if err := gl.spawn(ctx); err != nil {
 		return nil, err
+	}
+	// Push the WithReportStats override down to the singleton cache so a
+	// subsequent Wrap() call emits (or stays silent) per the user's
+	// preference. We only stamp the cache when the option was explicitly
+	// passed — otherwise the cache's own GOLDLAPEL_REPORT_STATS env-var
+	// default takes effect at construction time.
+	if gl.reportStatsSet {
+		GetNativeCache().SetReportStats(gl.reportStats)
 	}
 	registerStartedInstance(gl)
 	return gl, nil
