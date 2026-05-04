@@ -304,6 +304,19 @@ func WithMeshTag(tag string) Option {
 	})
 }
 
+// WithEnableL2ForWrappers opts the wrapper into the proxy's L2 (shared
+// result cache) layer. Default behaviour (option not provided): false —
+// the wrapper relies on its own per-process L1, which is sufficient for
+// most deployments. Pass true for fleet customers (multi-pod, frequent
+// restarts, mesh) where L2 still adds value as a shared cache across
+// short-lived wrapper processes.
+// Equivalent CLI flag: --enable-l2-for-wrappers. Construction-time only.
+func WithEnableL2ForWrappers(enable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.enableL2ForWrappers = enable
+	})
+}
+
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
 // Top-level concepts (proxy_port, dashboard_port, invalidation_port,
@@ -458,6 +471,7 @@ type GoldLapel struct {
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
 	reportStats         bool    // L1 telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
 	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
+	enableL2ForWrappers bool    // when true, emit --enable-l2-for-wrappers so the wrapper participates in L2
 
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
@@ -593,6 +607,9 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	}
 	if gl.meshTag != "" {
 		args = append(args, "--mesh-tag", gl.meshTag)
+	}
+	if gl.enableL2ForWrappers {
+		args = append(args, "--enable-l2-for-wrappers")
 	}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)

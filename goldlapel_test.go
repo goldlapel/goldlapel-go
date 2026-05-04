@@ -970,6 +970,41 @@ func TestWithMesh_NotInConfigKeys(t *testing.T) {
 	}
 }
 
+// --- WithEnableL2ForWrappers ---
+
+func TestWithEnableL2ForWrappers_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.enableL2ForWrappers {
+		t.Fatal("expected enableL2ForWrappers=false by default")
+	}
+}
+
+func TestWithEnableL2ForWrappers_SetsTopLevelField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableL2ForWrappers(true))
+	if !gl.enableL2ForWrappers {
+		t.Fatal("expected enableL2ForWrappers=true")
+	}
+}
+
+func TestWithEnableL2ForWrappers_FalseLeavesFieldOff(t *testing.T) {
+	// Explicit opt-out must not flip the field on, matching WithSilent(false).
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableL2ForWrappers(false))
+	if gl.enableL2ForWrappers {
+		t.Fatal("expected WithEnableL2ForWrappers(false) to leave enableL2ForWrappers=false")
+	}
+}
+
+func TestWithEnableL2ForWrappers_NotInConfigKeys(t *testing.T) {
+	// enable_l2_for_wrappers is a top-level option, not a tuning knob in
+	// the structured config map.
+	keys := ConfigKeys()
+	for _, k := range keys {
+		if k == "enable_l2_for_wrappers" {
+			t.Fatalf("enable_l2_for_wrappers must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
 // --- toInt ---
 
 func TestToInt_ParsesTypes(t *testing.T) {
