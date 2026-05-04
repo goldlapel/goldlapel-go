@@ -580,3 +580,35 @@ func anyMatch(lines []string, pred func(string) bool) bool {
 	}
 	return false
 }
+
+// --- Disable L1 ---
+
+func TestTelemetry_SnapshotL1DisabledOmittedByDefault(t *testing.T) {
+	// l1_disabled is JSON-omitted when false so older proxies / HQ
+	// consumers that don't know the field don't see noise on the wire.
+	cache, _, _ := makeTelemetryCache(t, 16)
+	snap := cache.buildSnapshot()
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), `"l1_disabled"`) {
+		t.Errorf("l1_disabled must be omitted when false, got %s", body)
+	}
+}
+
+func TestTelemetry_SnapshotL1DisabledTrueWhenSet(t *testing.T) {
+	cache, _, _ := makeTelemetryCache(t, 16)
+	cache.SetDisableL1(true)
+	snap := cache.buildSnapshot()
+	if !snap.L1Disabled {
+		t.Fatal("expected snapshot.L1Disabled=true after SetDisableL1(true)")
+	}
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"l1_disabled":true`) {
+		t.Errorf("expected l1_disabled:true in snapshot JSON, got %s", body)
+	}
+}

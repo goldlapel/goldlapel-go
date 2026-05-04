@@ -72,6 +72,14 @@ type NativeCache struct {
 	counter      uint64
 	maxEntries   int
 	enabled      bool
+	// disabled is the explicit WithDisableL1 toggle — orthogonal to
+	// `enabled` (which is the GOLDLAPEL_NATIVE_CACHE env-var kill-switch)
+	// and to maxEntries. When true, Get always returns nil (incrementing
+	// misses, never hits, never evictions) and Put is a silent no-op.
+	// The invalidation goroutine continues to run so telemetry signal
+	// flow (wrapper_connected / snapshot replies) keeps working — Manor
+	// and the dashboard still need to see the wrapper even when L1 is off.
+	disabled     bool
 	mu           sync.Mutex
 	invConnected bool
 	invStop      chan struct{}
@@ -262,6 +270,26 @@ func (nc *NativeCache) ReportStatsEnabled() bool {
 	return nc.reportStats
 }
 
+// SetDisableL1 toggles the explicit L1 no-op pass-through. Wired through
+// goldlapel.Start's WithDisableL1 option so library users can disable L1
+// without losing their tuned cache size (passing WithConfig("result_cache_size", 0)
+// would force them to). Safe to call before or after ConnectInvalidation;
+// the new value takes effect on the next Get/Put.
+func (nc *NativeCache) SetDisableL1(disable bool) {
+	nc.mu.Lock()
+	nc.disabled = disable
+	nc.mu.Unlock()
+}
+
+// DisableL1 reports whether L1 is currently in no-op pass-through mode.
+// Exposed primarily for tests; production callers shouldn't need to gate
+// on this — Get/Put already short-circuit internally.
+func (nc *NativeCache) DisableL1() bool {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return nc.disabled
+}
+
 // WrapperID returns the stable UUID v4 identifier this cache uses in
 // telemetry snapshots. Generated once at construction and stable for the
 // process lifetime.
@@ -311,10 +339,19 @@ func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
 		return nil
 	}
 	nc.mu.Lock()
-	defer nc.mu.Unlock()
 	if !nc.invConnected {
+		nc.mu.Unlock()
 		return nil
 	}
+	// disabled L1: tick misses (callers measure miss rate), never hit.
+	// Skip the key-build + cache lookup entirely — no point. Hits and
+	// evictions stay at zero by definition; only misses move.
+	if nc.disabled {
+		nc.mu.Unlock()
+		atomic.AddInt64(&nc.statsMisses, 1)
+		return nil
+	}
+	defer nc.mu.Unlock()
 	key := makeKey(sql, args)
 	entry, ok := nc.cache[key]
 	if ok {
@@ -333,6 +370,12 @@ func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fie
 	}
 	nc.mu.Lock()
 	if !nc.invConnected {
+		nc.mu.Unlock()
+		return
+	}
+	// disabled L1: silent no-op. Don't touch cache state, don't touch
+	// the eviction-rate window, don't bump counters — the layer is off.
+	if nc.disabled {
 		nc.mu.Unlock()
 		return
 	}
@@ -651,7 +694,10 @@ func (nc *NativeCache) recordEvictionLocked(evicted int) {
 // snapshot is the JSON shape the proxy aggregates per-tick. The proxy
 // parses these structurally; field names + types must match the
 // canonical pattern across all wrapper languages exactly. The State
-// field is populated only on S: emissions.
+// field is populated only on S: emissions. L1Disabled is surfaced only
+// when the wrapper has explicit WithDisableL1(true) — older proxies
+// that don't know the field will simply ignore it; HQ/Manor consumers
+// that do know it can render the wrapper's L1 state correctly.
 type snapshot struct {
 	WrapperID          string `json:"wrapper_id"`
 	Lang               string `json:"lang"`
@@ -664,6 +710,7 @@ type snapshot struct {
 	CapacityEntries    int    `json:"capacity_entries"`
 	TsMs               int64  `json:"ts_ms"`
 	State              string `json:"state,omitempty"`
+	L1Disabled         bool   `json:"l1_disabled,omitempty"`
 }
 
 // buildSnapshot reads counters + size in a single critical section so
@@ -673,6 +720,7 @@ type snapshot struct {
 func (nc *NativeCache) buildSnapshot() snapshot {
 	nc.mu.Lock()
 	size := len(nc.cache)
+	disabled := nc.disabled
 	nc.mu.Unlock()
 	return snapshot{
 		WrapperID:          nc.wrapperID,
@@ -684,6 +732,7 @@ func (nc *NativeCache) buildSnapshot() snapshot {
 		Invalidations:      atomic.LoadInt64(&nc.statsInvalidations),
 		CurrentSizeEntries: size,
 		CapacityEntries:    nc.maxEntries,
+		L1Disabled:         disabled,
 	}
 }
 

@@ -1005,6 +1005,52 @@ func TestWithEnableL2ForWrappers_NotInConfigKeys(t *testing.T) {
 	}
 }
 
+// --- WithDisableL1 ---
+
+func TestWithDisableL1_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.disableL1 {
+		t.Fatal("expected disableL1=false by default")
+	}
+	if gl.disableL1Set {
+		t.Fatal("expected disableL1Set=false when option not provided")
+	}
+}
+
+func TestWithDisableL1_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableL1(true))
+	if !gl.disableL1 {
+		t.Fatal("expected disableL1=true")
+	}
+	if !gl.disableL1Set {
+		t.Fatal("expected disableL1Set=true after WithDisableL1")
+	}
+}
+
+func TestWithDisableL1_FalseStillStampsCache(t *testing.T) {
+	// Explicit WithDisableL1(false) must mark disableL1Set so Start
+	// pushes the value down to the cache (re-enabling L1 if a previous
+	// run had disabled it on the singleton).
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableL1(false))
+	if gl.disableL1 {
+		t.Fatal("expected disableL1=false")
+	}
+	if !gl.disableL1Set {
+		t.Fatal("expected disableL1Set=true even with explicit WithDisableL1(false)")
+	}
+}
+
+func TestWithDisableL1_NotInConfigKeys(t *testing.T) {
+	// disable_l1 is a top-level option, not a tuning knob in the
+	// structured config map (mirroring WithSilent/WithMesh/etc.).
+	keys := ConfigKeys()
+	for _, k := range keys {
+		if k == "disable_l1" {
+			t.Fatalf("disable_l1 must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
 // --- toInt ---
 
 func TestToInt_ParsesTypes(t *testing.T) {

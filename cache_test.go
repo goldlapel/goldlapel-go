@@ -710,3 +710,79 @@ func TestResetNativeCache_ClearsInstance(t *testing.T) {
 		t.Fatal("expected different instances after reset")
 	}
 }
+
+// --- Disable L1 ---
+
+func TestDisableL1_DefaultIsFalse(t *testing.T) {
+	cache := makeTestCache(t, 100, true, true)
+	if cache.DisableL1() {
+		t.Fatal("expected DisableL1=false by default")
+	}
+}
+
+func TestDisableL1_GetReturnsMissAndTicksMisses(t *testing.T) {
+	cache := makeTestCache(t, 100, true, true)
+	cache.SetDisableL1(true)
+	// Even after a Put (which is a no-op below), Get must miss.
+	cache.Put("SELECT 1", nil, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil); entry != nil {
+		t.Fatal("expected nil on Get when L1 is disabled")
+	}
+	if cache.StatsMisses() != 1 {
+		t.Fatalf("expected 1 miss, got %d", cache.StatsMisses())
+	}
+	if cache.StatsHits() != 0 {
+		t.Fatalf("expected 0 hits when L1 disabled, got %d", cache.StatsHits())
+	}
+}
+
+func TestDisableL1_PutIsNoOp(t *testing.T) {
+	cache := makeTestCache(t, 100, true, true)
+	cache.SetDisableL1(true)
+	for i := 0; i < 10; i++ {
+		cache.Put("SELECT * FROM orders", nil, []int{i}, nil)
+	}
+	if cache.Size() != 0 {
+		t.Fatalf("expected cache to remain empty when L1 disabled, got size %d", cache.Size())
+	}
+	if cache.StatsEvictions() != 0 {
+		t.Fatalf("expected 0 evictions when L1 disabled, got %d", cache.StatsEvictions())
+	}
+}
+
+func TestDisableL1_HitsAndEvictionsStayZero(t *testing.T) {
+	// Even with capacity = 1 and many writes, no evictions should fire.
+	cache := makeTestCache(t, 1, true, true)
+	cache.SetDisableL1(true)
+	for i := 0; i < 50; i++ {
+		cache.Put("SELECT * FROM t", []interface{}{i}, []int{i}, nil)
+		cache.Get("SELECT * FROM t", []interface{}{i})
+	}
+	if cache.StatsHits() != 0 {
+		t.Fatalf("expected 0 hits, got %d", cache.StatsHits())
+	}
+	if cache.StatsEvictions() != 0 {
+		t.Fatalf("expected 0 evictions, got %d", cache.StatsEvictions())
+	}
+	if cache.StatsMisses() != 50 {
+		t.Fatalf("expected 50 misses, got %d", cache.StatsMisses())
+	}
+}
+
+func TestDisableL1_ToggleBackOnRestoresCacheBehavior(t *testing.T) {
+	cache := makeTestCache(t, 100, true, true)
+	cache.SetDisableL1(true)
+	cache.Put("SELECT 1", nil, []int{1}, nil)
+	if cache.Get("SELECT 1", nil) != nil {
+		t.Fatal("expected miss while disabled")
+	}
+	// Re-enable: a fresh Put + Get should now produce a hit.
+	cache.SetDisableL1(false)
+	cache.Put("SELECT 1", nil, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil); entry == nil {
+		t.Fatal("expected hit after re-enabling L1")
+	}
+	if cache.StatsHits() != 1 {
+		t.Fatalf("expected 1 hit after re-enable, got %d", cache.StatsHits())
+	}
+}

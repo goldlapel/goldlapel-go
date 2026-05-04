@@ -317,6 +317,24 @@ func WithEnableL2ForWrappers(enable bool) Option {
 	})
 }
 
+// WithDisableL1 disables the wrapper's per-process L1 cache without
+// touching its tuned size. When true, NativeCache.Get always misses
+// (ticking the misses counter) and NativeCache.Put is a silent no-op;
+// hits and evictions stay at zero. The invalidation goroutine continues
+// to run so telemetry signal flow (wrapper_connected, snapshot replies)
+// keeps working — Manor and the dashboard still see the wrapper even
+// when L1 is off. Default (option omitted): false.
+//
+// Orthogonal to WithConfig("result_cache_size", 0): customers who want
+// to toggle L1 off/on without losing their tuned cache size should use
+// this option. Construction-time only.
+func WithDisableL1(disable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.disableL1 = disable
+		gl.disableL1Set = true
+	})
+}
+
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
 // Top-level concepts (proxy_port, dashboard_port, invalidation_port,
@@ -472,6 +490,8 @@ type GoldLapel struct {
 	reportStats         bool    // L1 telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
 	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
 	enableL2ForWrappers bool    // when true, emit --enable-l2-for-wrappers so the wrapper participates in L2
+	disableL1           bool    // when true, the wrapper's L1 NativeCache acts as a no-op pass-through
+	disableL1Set        bool    // true once WithDisableL1 was applied, so we know to push the value down to the cache singleton
 
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
@@ -550,6 +570,13 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 	// default takes effect at construction time.
 	if gl.reportStatsSet {
 		GetNativeCache().SetReportStats(gl.reportStats)
+	}
+	// Push WithDisableL1 down to the singleton cache so any subsequent
+	// Wrap() call observes the no-op pass-through behaviour. Same
+	// pattern as reportStats — only stamp when explicitly set so the
+	// cache's default (false) stands when the option wasn't passed.
+	if gl.disableL1Set {
+		GetNativeCache().SetDisableL1(gl.disableL1)
 	}
 	registerStartedInstance(gl)
 	return gl, nil
