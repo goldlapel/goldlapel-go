@@ -965,9 +965,16 @@ func detectWrite(sql string) string {
 		}
 		return bareTable(tokens[2])
 	case "SELECT":
+		// Re-tokenize from a literal-stripped form so that bare words like
+		// `INTO` or `FROM` inside `'...'` / `"..."` don't trigger the
+		// SELECT-INTO DDL classifier (e.g.
+		// `SELECT 'INSERT INTO orders' FROM audit_log`,
+		// `SELECT * FROM "into_table"`).
+		scanTokens := strings.Fields(stripStringLiterals(trimmed))
 		sawInto := false
 		intoTarget := ""
-		for _, tok := range tokens[1:] {
+		for i := 1; i < len(scanTokens); i++ {
+			tok := scanTokens[i]
 			upper := strings.ToUpper(tok)
 			if upper == "INTO" && !sawInto {
 				sawInto = true

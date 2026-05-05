@@ -195,6 +195,49 @@ func TestDetectWrite_CopyWithColumns(t *testing.T) {
 	}
 }
 
+// Regression: SELECT with `INTO` inside a string literal must not be
+// classified as SELECT-INTO DDL. The pre-fix tokenizer split on whitespace
+// only, so a literal like `'INSERT INTO orders'` smuggled the bare word
+// INTO into the scan and tripped the DDL sentinel, forcing a full cache
+// invalidation on a plain read.
+func TestDetectWrite_SelectIntoInSingleQuoteIsNotDDL(t *testing.T) {
+	if got := detectWrite("SELECT 'INSERT INTO orders;' FROM audit_log"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestDetectWrite_SelectIntoInDoubleQuotedIdentIsNotDDL(t *testing.T) {
+	if got := detectWrite(`SELECT * FROM "into_table"`); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestDetectWrite_SelectIntoInLikePatternIsNotDDL(t *testing.T) {
+	if got := detectWrite("SELECT message FROM logs WHERE message LIKE '%INTO%'"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestDetectWrite_SelectIntoInDoubledQuoteEscapeIsNotDDL(t *testing.T) {
+	if got := detectWrite("SELECT 'It''s INTO trouble' FROM notes"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+// Regression guard: a real `SELECT ... INTO new_table FROM ...` DDL form
+// MUST still be classified as DDL after the literal-stripping refactor.
+func TestDetectWrite_RealSelectIntoStillDDL(t *testing.T) {
+	if got := detectWrite("SELECT * INTO new_table FROM source"); got != ddlSentinel {
+		t.Fatalf("got %q, want ddlSentinel", got)
+	}
+}
+
+func TestDetectWrite_RealSelectIntoTempStillDDL(t *testing.T) {
+	if got := detectWrite("SELECT id INTO TEMP scratch FROM source"); got != ddlSentinel {
+		t.Fatalf("got %q, want ddlSentinel", got)
+	}
+}
+
 // --- extractTables ---
 
 func TestExtractTables_SimpleFrom(t *testing.T) {

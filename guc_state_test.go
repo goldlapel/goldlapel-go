@@ -354,6 +354,56 @@ func TestConnectionGucState_OverwriteUnsafeValueChangesHash(t *testing.T) {
 	}
 }
 
+// --- stripStringLiterals ---
+
+func TestStripStringLiterals_BlanksSingleQuotedBody(t *testing.T) {
+	got := stripStringLiterals("SELECT 'INSERT INTO orders' FROM logs")
+	want := "SELECT '                  ' FROM logs"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if len(got) != len("SELECT 'INSERT INTO orders' FROM logs") {
+		t.Fatal("length must be preserved")
+	}
+}
+
+func TestStripStringLiterals_BlanksDoubleQuotedBody(t *testing.T) {
+	got := stripStringLiterals(`SELECT * FROM "into_table"`)
+	want := `SELECT * FROM "          "`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestStripStringLiterals_HandlesDoubledQuoteEscape(t *testing.T) {
+	// Both delimiters of the escape pair are blanked; the scanner stays
+	// inside the literal until the real closing quote. Body length 13.
+	got := stripStringLiterals("SELECT 'it''s INTO ok' FROM x")
+	want := "SELECT '             ' FROM x"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if len(got) != len("SELECT 'it''s INTO ok' FROM x") {
+		t.Fatal("length must be preserved")
+	}
+}
+
+func TestStripStringLiterals_LeavesUnquotedTextAlone(t *testing.T) {
+	got := stripStringLiterals("SELECT * INTO new_table FROM source")
+	if got != "SELECT * INTO new_table FROM source" {
+		t.Fatalf("got %q, want passthrough", got)
+	}
+}
+
+func TestStripStringLiterals_EmptyAndShort(t *testing.T) {
+	if got := stripStringLiterals(""); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+	if got := stripStringLiterals("''"); got != "''" {
+		t.Fatalf("empty literal: got %q, want %q", got, "''")
+	}
+}
+
 // --- SplitStatements ---
 
 func TestSplitStatements_SimpleTwoStatements(t *testing.T) {

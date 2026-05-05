@@ -85,6 +85,47 @@ func IsUnsafeGUC(name string) bool {
 	return unsafeGUCShortList[lower]
 }
 
+// stripStringLiterals replaces the contents of `'...'` and `"..."` string
+// literals with spaces, preserving overall length so byte positions line up
+// with the original. PG's doubled-quote `”` / `""` escapes are handled the
+// same way as in SplitStatements (both delimiters blanked, scanner stays
+// inside the literal). Used by detectWrite's SELECT branch so that bare
+// words like `INTO` inside a literal (e.g.
+// `SELECT 'INSERT INTO orders' FROM audit_log`) don't trip the SELECT-INTO
+// DDL classifier.
+func stripStringLiterals(sql string) string {
+	if len(sql) == 0 {
+		return sql
+	}
+	out := []byte(sql)
+	var quote byte // 0 when not in a quoted literal
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+		if quote != 0 {
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					// Doubled-quote escape: blank both, stay inside literal.
+					out[i] = ' '
+					out[i+1] = ' '
+					i += 2
+					continue
+				}
+				// Closing quote: leave the delimiter, drop the literal body.
+				quote = 0
+			} else {
+				out[i] = ' '
+			}
+		} else {
+			if c == '\'' || c == '"' {
+				quote = c
+			}
+		}
+		i++
+	}
+	return string(out)
+}
+
 // SplitStatements splits a SQL string on top-level ';' characters,
 // respecting single- and double-quoted string literals. Returns each
 // segment with surrounding whitespace trimmed; empty segments are dropped.
