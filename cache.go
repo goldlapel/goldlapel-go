@@ -1086,7 +1086,7 @@ func detectWriteMulti(sql string) (tables []string, sentinelHit bool) {
 // real reads.
 //
 // Transaction-control keywords are also matched here as defence in depth;
-// the Query/QueryRow paths already short-circuit isTxStart/isTxEnd before
+// the Query/QueryRow paths already short-circuit containsTxControl before
 // reaching the cache write step, but a future refactor that moves the put
 // site shouldn't reintroduce the bug.
 var sessionStateCommands = map[string]struct{}{
@@ -1140,4 +1140,56 @@ func isTxStart(sql string) bool {
 
 func isTxEnd(sql string) bool {
 	return txEndRe.MatchString(sql)
+}
+
+// containsTxControl returns true if any top-level segment of sql is a
+// transaction-control statement (BEGIN / START TRANSACTION / COMMIT /
+// ROLLBACK / END). Used by Query / QueryRow to decide whether to bypass
+// the read-cache path for a body that touches transaction boundaries.
+//
+// Fast path: bodies with no ';' check the single statement directly.
+func containsTxControl(sql string) bool {
+	if !strings.ContainsRune(sql, ';') {
+		return isTxStart(sql) || isTxEnd(sql)
+	}
+	for _, seg := range SplitStatements(sql) {
+		if isTxStart(seg) || isTxEnd(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyTxState walks every top-level segment of a possibly multi-statement
+// SQL body and returns the final tx-flag state implied by the body.
+//
+// Single-token check (the legacy isTxStart / isTxEnd) only inspects the
+// first segment, so a body like `BEGIN; INSERT INTO orders VALUES (1); COMMIT`
+// flipped inTransaction=true based on BEGIN even though the server ends the
+// statement out-of-tx. The wrapper would then bypass the cache forever
+// (until a fresh BEGIN/COMMIT cycle re-set the flag). applyTxState walks
+// every segment so the final wrapper-side flag matches the server state at
+// the end of the wire message.
+//
+// Fast path: bodies with no ';' skip SplitStatements and check the single
+// statement directly.
+func applyTxState(sql string, current bool) bool {
+	if !strings.ContainsRune(sql, ';') {
+		if isTxStart(sql) {
+			return true
+		}
+		if isTxEnd(sql) {
+			return false
+		}
+		return current
+	}
+	state := current
+	for _, seg := range SplitStatements(sql) {
+		if isTxStart(seg) {
+			state = true
+		} else if isTxEnd(seg) {
+			state = false
+		}
+	}
+	return state
 }

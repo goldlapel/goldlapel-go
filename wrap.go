@@ -140,8 +140,8 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 
 	// Multi-statement-aware write detection runs before any short-circuit
 	// — a body like `BEGIN; INSERT INTO orders VALUES (1); COMMIT` must
-	// still invalidate orders even though its first token (BEGIN) flips
-	// the tx-tracking flag. detectWriteMulti walks every top-level segment.
+	// still invalidate orders. detectWriteMulti walks every top-level
+	// segment.
 	writeTables, ddlHit := detectWriteMulti(sql)
 	if ddlHit {
 		cc.cache.InvalidateAll()
@@ -151,18 +151,14 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		}
 	}
 
-	// Transaction tracking — first-token-only, matching the existing
-	// txStartRe / txEndRe regexes. Multi-statement bodies that mix
-	// BEGIN/COMMIT (e.g. `BEGIN; INSERT; COMMIT`) can leave the
-	// inTransaction flag in a state that doesn't perfectly mirror the
-	// wire — pre-existing quirk, out of scope for this fix. The
-	// write-invalidation above is the load-bearing part for cache safety.
-	if isTxStart(sql) {
-		cc.inTransaction = true
-		return cc.real.Query(ctx, sql, args...)
-	}
-	if isTxEnd(sql) {
-		cc.inTransaction = false
+	// Transaction tracking — multi-statement-aware. applyTxState walks
+	// every top-level segment so a body like
+	// `BEGIN; INSERT INTO orders VALUES (1); COMMIT` ends with
+	// inTransaction=false to mirror the server, instead of the legacy
+	// first-token-only check that flipped it true based on BEGIN and
+	// left the cache bypassed forever until the next BEGIN/COMMIT cycle.
+	if containsTxControl(sql) {
+		cc.inTransaction = applyTxState(sql, cc.inTransaction)
 		return cc.real.Query(ctx, sql, args...)
 	}
 
@@ -250,13 +246,10 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		}
 	}
 
-	// Transaction tracking
-	if isTxStart(sql) {
-		cc.inTransaction = true
-		return cc.real.QueryRow(ctx, sql, args...)
-	}
-	if isTxEnd(sql) {
-		cc.inTransaction = false
+	// Transaction tracking — multi-statement-aware. See Query() for the
+	// full rationale.
+	if containsTxControl(sql) {
+		cc.inTransaction = applyTxState(sql, cc.inTransaction)
 		return cc.real.QueryRow(ctx, sql, args...)
 	}
 
@@ -324,12 +317,9 @@ func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{})
 		}
 	}
 
-	// Transaction tracking
-	if isTxStart(sql) {
-		cc.inTransaction = true
-	} else if isTxEnd(sql) {
-		cc.inTransaction = false
-	}
+	// Transaction tracking — multi-statement-aware. See Query() for the
+	// full rationale.
+	cc.inTransaction = applyTxState(sql, cc.inTransaction)
 
 	return cc.real.Exec(ctx, sql, args...)
 }

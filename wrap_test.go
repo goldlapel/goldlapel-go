@@ -1067,3 +1067,154 @@ func TestSessionStateCommand_EmptyResultSelectStillCaches(t *testing.T) {
 		t.Fatalf("expected zero-row SELECT to still cache, size=%d", cc.cache.Size())
 	}
 }
+
+// --- Bug 3: tx-flag bookkeeping for multi-statement BEGIN/COMMIT bodies ---
+
+// `BEGIN; INSERT...; COMMIT` previously flipped inTransaction=true based
+// on the first token (BEGIN) and never flipped it back, leaving the
+// wrapper bypassing the cache forever despite the server being out-of-tx.
+// applyTxState now walks every segment so the final wrapper flag mirrors
+// the wire.
+func TestTxFlag_BeginInsertCommitEndsOutOfTxViaExec(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after BEGIN/INSERT/COMMIT body")
+	}
+}
+
+func TestTxFlag_BeginInsertCommitEndsOutOfTxViaQuery(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Query(ctx, "BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after BEGIN/INSERT/COMMIT via Query")
+	}
+}
+
+func TestTxFlag_BeginInsertCommitEndsOutOfTxViaQueryRow(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.QueryRow(ctx, "BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after BEGIN/INSERT/COMMIT via QueryRow")
+	}
+}
+
+// `BEGIN; INSERT...` (no COMMIT) leaves the wrapper in-tx, matching the
+// server.
+func TestTxFlag_BeginInsertNoCommitEndsInTx(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN; INSERT INTO orders VALUES (1)")
+	if !cc.inTransaction {
+		t.Fatal("expected inTransaction=true after BEGIN/INSERT (no COMMIT)")
+	}
+}
+
+// `INSERT...; COMMIT` from in-tx state must end out-of-tx. Pre-fix
+// first-token check missed the trailing COMMIT entirely (first token was
+// INSERT) and left the flag stale.
+func TestTxFlag_InsertCommitFromInTxEndsOutOfTx(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN")
+	if !cc.inTransaction {
+		t.Fatal("setup: expected inTransaction=true after BEGIN")
+	}
+	cc.Exec(ctx, "INSERT INTO orders VALUES (1); COMMIT")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after INSERT/COMMIT body")
+	}
+}
+
+// `BEGIN; ROLLBACK` ends out-of-tx (server-side rollback closes the tx).
+func TestTxFlag_BeginRollbackEndsOutOfTx(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN; ROLLBACK")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after BEGIN/ROLLBACK")
+	}
+}
+
+// Cache-correctness consequence of the fix: after `BEGIN; INSERT; COMMIT`,
+// the wrapper must resume serving cached SELECTs (state mirrors the
+// post-COMMIT server). Pre-fix, inTransaction stayed true and every
+// subsequent SELECT bypassed the cache.
+func TestTxFlag_PostCommitSelectHitsCache(t *testing.T) {
+	cc, mock := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Exec(ctx, "BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+	if cc.inTransaction {
+		t.Fatal("setup: expected inTransaction=false after multi-statement body")
+	}
+
+	// First SELECT — cache miss, should populate.
+	cc.Query(ctx, "SELECT * FROM users")
+	if mock.queryCount() != 2 {
+		t.Fatalf("expected 2 backend queries (one for the BEGIN/INSERT/COMMIT body, one for the SELECT miss), got %d", mock.queryCount())
+	}
+
+	// Second SELECT — cache hit. Pre-fix, inTransaction=true would force a
+	// bypass and the count would tick to 3.
+	cc.Query(ctx, "SELECT * FROM users")
+	if mock.queryCount() != 2 {
+		t.Fatalf("expected cache hit after multi-statement tx body, but backend queryCount=%d", mock.queryCount())
+	}
+}
+
+// --- applyTxState / containsTxControl direct ---
+
+func TestApplyTxState_BeginCommitMirrorsServer(t *testing.T) {
+	if applyTxState("BEGIN; INSERT INTO t VALUES (1); COMMIT", false) != false {
+		t.Fatal("expected final state false after BEGIN...COMMIT")
+	}
+	if applyTxState("BEGIN; SELECT 1", false) != true {
+		t.Fatal("expected final state true after BEGIN...(no commit)")
+	}
+	if applyTxState("INSERT INTO t VALUES (1); COMMIT", true) != false {
+		t.Fatal("expected final state false after ...COMMIT")
+	}
+	if applyTxState("BEGIN; ROLLBACK", false) != false {
+		t.Fatal("expected final state false after BEGIN; ROLLBACK")
+	}
+}
+
+func TestApplyTxState_PassthroughOnNoTxControl(t *testing.T) {
+	if applyTxState("SELECT 1", true) != true {
+		t.Fatal("expected current state preserved on plain SELECT")
+	}
+	if applyTxState("INSERT INTO t VALUES (1)", false) != false {
+		t.Fatal("expected current state preserved on plain INSERT")
+	}
+}
+
+func TestApplyTxState_StartTransactionRecognised(t *testing.T) {
+	if applyTxState("START TRANSACTION", false) != true {
+		t.Fatal("expected START TRANSACTION to start tx")
+	}
+	if applyTxState("START TRANSACTION; SELECT 1; END", false) != false {
+		t.Fatal("expected END to close tx")
+	}
+}
+
+func TestContainsTxControl_DetectsEmbeddedBeginAndCommit(t *testing.T) {
+	if !containsTxControl("BEGIN") {
+		t.Fatal("BEGIN should be detected")
+	}
+	if !containsTxControl("INSERT INTO t VALUES (1); COMMIT") {
+		t.Fatal("trailing COMMIT should be detected")
+	}
+	if !containsTxControl("SET app.tenant='x'; BEGIN; INSERT INTO t VALUES (1)") {
+		t.Fatal("embedded BEGIN should be detected")
+	}
+	if containsTxControl("SELECT * FROM users") {
+		t.Fatal("plain SELECT should not be tx-control")
+	}
+	if containsTxControl("INSERT INTO t VALUES (1); UPDATE u SET x = 1") {
+		t.Fatal("plain DML chain should not be tx-control")
+	}
+}
