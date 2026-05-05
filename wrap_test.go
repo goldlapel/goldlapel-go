@@ -1166,6 +1166,36 @@ func TestTxFlag_PostCommitSelectHitsCache(t *testing.T) {
 	}
 }
 
+// Wrapper-level: the canonical SAVEPOINT pattern. `BEGIN; SAVEPOINT s;
+// SELECT 1; RELEASE s; SELECT 2; COMMIT` ends out-of-tx (because of
+// COMMIT), and intervening SAVEPOINT/RELEASE must not influence the
+// final flag. If RELEASE were misclassified as a tx-end, the wrapper
+// would briefly drop out-of-tx mid-body — but the more dangerous case is
+// a body of just `BEGIN; ...; RELEASE s; SELECT x` where the wrapper
+// would think the tx ended at RELEASE while the server still has the
+// outer tx open. This guards both halves.
+func TestTxFlag_BeginSavepointReleaseCommitEndsOutOfTx(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2; COMMIT")
+	if cc.inTransaction {
+		t.Fatal("expected inTransaction=false after BEGIN; SAVEPOINT; ...; RELEASE; ...; COMMIT")
+	}
+}
+
+// Wrapper-level: a body of `BEGIN; SAVEPOINT s; SELECT 1; RELEASE s`
+// (no COMMIT) must leave the wrapper in-tx, matching the server. The
+// trailing RELEASE must NOT be misclassified as a tx-end — the outer
+// transaction is still open.
+func TestTxFlag_ReleaseDoesNotEndOuterTx(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Exec(ctx, "BEGIN; SAVEPOINT s; SELECT 1; RELEASE s")
+	if !cc.inTransaction {
+		t.Fatal("expected inTransaction=true after BEGIN/SAVEPOINT/RELEASE (outer tx still open server-side)")
+	}
+}
+
 // --- applyTxState / containsTxControl direct ---
 
 func TestApplyTxState_BeginCommitMirrorsServer(t *testing.T) {
@@ -1216,5 +1246,69 @@ func TestContainsTxControl_DetectsEmbeddedBeginAndCommit(t *testing.T) {
 	}
 	if containsTxControl("INSERT INTO t VALUES (1); UPDATE u SET x = 1") {
 		t.Fatal("plain DML chain should not be tx-control")
+	}
+}
+
+// SAVEPOINT and RELEASE SAVEPOINT are intra-transaction markers and must
+// not flip the wrapper-side tx flag. RELEASE in particular is the
+// dangerous one: if classified as a tx-end, the wrapper would believe it
+// was out-of-tx while the server's outer transaction is still open,
+// causing stale cache reads against uncommitted writes. SAVEPOINT
+// classified as a tx-start would mask the server-side "no transaction in
+// progress" error by silently flipping the wrapper into in-tx state.
+func TestApplyTxState_SavepointAndReleaseAreNoChange(t *testing.T) {
+	// In-tx → SAVEPOINT/RELEASE leave us in-tx.
+	if applyTxState("SAVEPOINT s", true) != true {
+		t.Fatal("SAVEPOINT must not flip in-tx → out-of-tx")
+	}
+	if applyTxState("RELEASE SAVEPOINT s", true) != true {
+		t.Fatal("RELEASE SAVEPOINT must not flip in-tx → out-of-tx (outer tx still open)")
+	}
+	if applyTxState("RELEASE s", true) != true {
+		t.Fatal("RELEASE (short form) must not flip in-tx → out-of-tx")
+	}
+	// Out-of-tx → SAVEPOINT/RELEASE leave us out-of-tx (server would error,
+	// but the wrapper must not paper over that by flipping state).
+	if applyTxState("SAVEPOINT s", false) != false {
+		t.Fatal("SAVEPOINT outside a tx must not silently flip wrapper into in-tx")
+	}
+	if applyTxState("RELEASE SAVEPOINT s", false) != false {
+		t.Fatal("RELEASE outside a tx must remain out-of-tx")
+	}
+}
+
+// End-to-end multi-statement classifier check for the canonical pattern:
+// BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2; COMMIT — ends
+// out-of-tx because of COMMIT. SAVEPOINT and RELEASE in the middle must
+// not influence the final flag.
+func TestApplyTxState_BeginSavepointReleaseCommit(t *testing.T) {
+	body := "BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2; COMMIT"
+	if applyTxState(body, false) != false {
+		t.Fatalf("expected final state false (COMMIT) for %q", body)
+	}
+	// And without the trailing COMMIT, the BEGIN should leave us in-tx
+	// regardless of the intervening SAVEPOINT/RELEASE.
+	open := "BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2"
+	if applyTxState(open, false) != true {
+		t.Fatalf("expected final state true (BEGIN, no COMMIT) for %q", open)
+	}
+}
+
+func TestContainsTxControl_SavepointAndReleaseAlone(t *testing.T) {
+	// SAVEPOINT and RELEASE on their own are not tx-boundaries — Query/
+	// QueryRow must not bypass the read-cache path solely because the
+	// body contains them.
+	if containsTxControl("SAVEPOINT s") {
+		t.Fatal("SAVEPOINT alone should not be tx-control")
+	}
+	if containsTxControl("RELEASE SAVEPOINT s") {
+		t.Fatal("RELEASE SAVEPOINT alone should not be tx-control")
+	}
+	if containsTxControl("SAVEPOINT s; SELECT 1; RELEASE s") {
+		t.Fatal("SAVEPOINT/RELEASE without BEGIN/COMMIT should not be tx-control")
+	}
+	// But a BEGIN/COMMIT pair around them still is.
+	if !containsTxControl("BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; COMMIT") {
+		t.Fatal("BEGIN/COMMIT around SAVEPOINT/RELEASE should still be tx-control")
 	}
 }

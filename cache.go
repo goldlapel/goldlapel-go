@@ -1171,6 +1171,15 @@ func containsTxControl(sql string) bool {
 // every segment so the final wrapper-side flag matches the server state at
 // the end of the wire message.
 //
+// Only top-level boundaries flip state: BEGIN / START TRANSACTION → true,
+// COMMIT / ROLLBACK / END → false. SAVEPOINT and RELEASE SAVEPOINT are
+// intra-transaction markers and intentionally do NOT change the flag —
+// `RELEASE SAVEPOINT s` does not end the outer transaction, and treating
+// it as a tx-end would leave the wrapper out-of-tx while the server
+// remained in-tx, causing stale cache reads. SAVEPOINT outside a tx is a
+// server-side error; classifying it as a tx-start would mask that error
+// by silently flipping the wrapper into in-tx state.
+//
 // Fast path: bodies with no ';' skip SplitStatements and check the single
 // statement directly.
 func applyTxState(sql string, current bool) bool {
