@@ -138,7 +138,25 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	// case, so the overhead per call is a couple of string-prefix checks.
 	cc.ensureGucState().ObserveSQL(sql)
 
-	// Transaction tracking
+	// Multi-statement-aware write detection runs before any short-circuit
+	// — a body like `BEGIN; INSERT INTO orders VALUES (1); COMMIT` must
+	// still invalidate orders even though its first token (BEGIN) flips
+	// the tx-tracking flag. detectWriteMulti walks every top-level segment.
+	writeTables, ddlHit := detectWriteMulti(sql)
+	if ddlHit {
+		cc.cache.InvalidateAll()
+	} else {
+		for _, t := range writeTables {
+			cc.cache.InvalidateTable(t)
+		}
+	}
+
+	// Transaction tracking — first-token-only, matching the existing
+	// txStartRe / txEndRe regexes. Multi-statement bodies that mix
+	// BEGIN/COMMIT (e.g. `BEGIN; INSERT; COMMIT`) can leave the
+	// inTransaction flag in a state that doesn't perfectly mirror the
+	// wire — pre-existing quirk, out of scope for this fix. The
+	// write-invalidation above is the load-bearing part for cache safety.
 	if isTxStart(sql) {
 		cc.inTransaction = true
 		return cc.real.Query(ctx, sql, args...)
@@ -148,14 +166,9 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		return cc.real.Query(ctx, sql, args...)
 	}
 
-	// Write detection + self-invalidation
-	writeTable := detectWrite(sql)
-	if writeTable != "" {
-		if writeTable == ddlSentinel {
-			cc.cache.InvalidateAll()
-		} else {
-			cc.cache.InvalidateTable(writeTable)
-		}
+	// If write detection consumed the body, no further cache work is
+	// possible — the response is a write tag, not a row stream.
+	if ddlHit || len(writeTables) > 0 {
 		return cc.real.Query(ctx, sql, args...)
 	}
 
@@ -209,8 +222,15 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		}
 	}
 
-	// Cache the result under the current per-connection state hash.
-	cc.cache.Put(sql, args, stateHash, collected, fields)
+	// Cache the result under the current per-connection state hash —
+	// unless this was a session-state command (SET / RESET / LISTEN /
+	// NOTIFY / etc.) routed through Query. Those return zero rows but
+	// the truthy-tail Put would still bloat the LRU with empty entries
+	// that can never serve a real read. See
+	// docs/todos/wrapper-cache-set-responses.md.
+	if !isSessionStateCommand(sql) {
+		cc.cache.Put(sql, args, stateHash, collected, fields)
+	}
 
 	return &cachedRows{rows: collected, fields: fields, pos: -1}, nil
 }
@@ -218,6 +238,17 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 // QueryRow intercepts single-row queries.
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
 	cc.ensureGucState().ObserveSQL(sql)
+
+	// Multi-statement-aware write detection runs ahead of any short-circuit
+	// — see Query() for the full rationale.
+	writeTables, ddlHit := detectWriteMulti(sql)
+	if ddlHit {
+		cc.cache.InvalidateAll()
+	} else {
+		for _, t := range writeTables {
+			cc.cache.InvalidateTable(t)
+		}
+	}
 
 	// Transaction tracking
 	if isTxStart(sql) {
@@ -229,14 +260,9 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		return cc.real.QueryRow(ctx, sql, args...)
 	}
 
-	// Write detection
-	writeTable := detectWrite(sql)
-	if writeTable != "" {
-		if writeTable == ddlSentinel {
-			cc.cache.InvalidateAll()
-		} else {
-			cc.cache.InvalidateTable(writeTable)
-		}
+	// If write detection fired, dispatch to the real backend — there is
+	// no row stream to cache.
+	if ddlHit || len(writeTables) > 0 {
 		return cc.real.QueryRow(ctx, sql, args...)
 	}
 
@@ -287,24 +313,22 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
 	cc.ensureGucState().ObserveSQL(sql)
 
+	// Multi-statement-aware write detection — runs ahead of tx tracking
+	// so a `BEGIN; INSERT INTO t ...; COMMIT` body still invalidates t.
+	writeTables, ddlHit := detectWriteMulti(sql)
+	if ddlHit {
+		cc.cache.InvalidateAll()
+	} else {
+		for _, t := range writeTables {
+			cc.cache.InvalidateTable(t)
+		}
+	}
+
 	// Transaction tracking
 	if isTxStart(sql) {
 		cc.inTransaction = true
-		return cc.real.Exec(ctx, sql, args...)
-	}
-	if isTxEnd(sql) {
+	} else if isTxEnd(sql) {
 		cc.inTransaction = false
-		return cc.real.Exec(ctx, sql, args...)
-	}
-
-	// Write detection + self-invalidation
-	writeTable := detectWrite(sql)
-	if writeTable != "" {
-		if writeTable == ddlSentinel {
-			cc.cache.InvalidateAll()
-		} else {
-			cc.cache.InvalidateTable(writeTable)
-		}
 	}
 
 	return cc.real.Exec(ctx, sql, args...)

@@ -804,3 +804,205 @@ func TestDisableNativeCache_ToggleBackOnRestoresCacheBehavior(t *testing.T) {
 		t.Fatalf("expected 1 hit after re-enable, got %d", cache.StatsHits())
 	}
 }
+
+// --- detectWriteMulti (multi-statement write detection) ---
+
+func TestDetectWriteMulti_SingleStatementInsert(t *testing.T) {
+	tables, ddl := detectWriteMulti("INSERT INTO orders VALUES (1)")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders], got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_SingleStatementSelect(t *testing.T) {
+	tables, ddl := detectWriteMulti("SELECT * FROM orders")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 0 {
+		t.Fatalf("expected no tables, got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_SingleStatementDDL(t *testing.T) {
+	tables, ddl := detectWriteMulti("CREATE TABLE foo (id int)")
+	if !ddl {
+		t.Fatal("expected DDL hit")
+	}
+	if tables != nil {
+		t.Fatalf("expected nil tables, got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_SetThenInsert(t *testing.T) {
+	// The exact gap from the spec: SET first, INSERT second — must
+	// surface the INSERT for invalidation.
+	tables, ddl := detectWriteMulti("SET app.tenant = 'x'; INSERT INTO orders VALUES (1)")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders], got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_SetInsertSelect(t *testing.T) {
+	tables, ddl := detectWriteMulti("SET app.tenant = 'x'; INSERT INTO orders VALUES (1); SELECT 1")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders], got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_BeginInsertCommit(t *testing.T) {
+	tables, ddl := detectWriteMulti("BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders], got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_MultipleDistinctTables(t *testing.T) {
+	tables, ddl := detectWriteMulti("INSERT INTO a VALUES (1); UPDATE b SET x = 1; DELETE FROM c WHERE id = 1")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	got := map[string]bool{}
+	for _, tab := range tables {
+		got[tab] = true
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if !got[want] {
+			t.Fatalf("expected %s in %v", want, tables)
+		}
+	}
+	if len(tables) != 3 {
+		t.Fatalf("expected 3 distinct tables, got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_DedupesSameTable(t *testing.T) {
+	tables, _ := detectWriteMulti("INSERT INTO orders VALUES (1); UPDATE orders SET x = 1")
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders] (deduped), got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_DDLShortCircuits(t *testing.T) {
+	// DDL anywhere in the body forces a full invalidation; the table
+	// list is irrelevant in that case.
+	_, ddl := detectWriteMulti("INSERT INTO orders VALUES (1); CREATE TABLE foo (id int)")
+	if !ddl {
+		t.Fatal("expected DDL hit when any segment is DDL")
+	}
+}
+
+func TestDetectWriteMulti_QuotedSemicolonDoesNotSplit(t *testing.T) {
+	// SplitStatements respects quoted literals — a ';' inside a string
+	// must not split the statement.
+	tables, ddl := detectWriteMulti("INSERT INTO orders VALUES ('a;b')")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 1 || tables[0] != "orders" {
+		t.Fatalf("expected [orders], got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_AllSetsNoWrites(t *testing.T) {
+	tables, ddl := detectWriteMulti("SET app.user = '1'; SET app.tenant = 'x'")
+	if ddl {
+		t.Fatal("expected no DDL hit")
+	}
+	if len(tables) != 0 {
+		t.Fatalf("expected no tables, got %v", tables)
+	}
+}
+
+func TestDetectWriteMulti_EmptyAndWhitespace(t *testing.T) {
+	if tables, ddl := detectWriteMulti(""); ddl || len(tables) != 0 {
+		t.Fatalf("expected empty result for empty SQL, got tables=%v ddl=%v", tables, ddl)
+	}
+	if tables, ddl := detectWriteMulti("   "); ddl || len(tables) != 0 {
+		t.Fatalf("expected empty result for whitespace SQL, got tables=%v ddl=%v", tables, ddl)
+	}
+	if tables, ddl := detectWriteMulti(";;;"); ddl || len(tables) != 0 {
+		t.Fatalf("expected empty result for semicolons-only SQL, got tables=%v ddl=%v", tables, ddl)
+	}
+}
+
+// --- isSessionStateCommand ---
+
+func TestIsSessionStateCommand_SetReset(t *testing.T) {
+	for _, sql := range []string{
+		"SET app.user_id = '42'",
+		"set timezone TO 'UTC'",
+		"  SET LOCAL app.tenant = 'x'",
+		"RESET app.user_id",
+		"RESET ALL",
+	} {
+		if !isSessionStateCommand(sql) {
+			t.Fatalf("expected true for %q", sql)
+		}
+	}
+}
+
+func TestIsSessionStateCommand_NotificationCommands(t *testing.T) {
+	for _, sql := range []string{
+		"LISTEN my_channel",
+		"UNLISTEN my_channel",
+		"NOTIFY my_channel, 'payload'",
+	} {
+		if !isSessionStateCommand(sql) {
+			t.Fatalf("expected true for %q", sql)
+		}
+	}
+}
+
+func TestIsSessionStateCommand_TransactionControl(t *testing.T) {
+	for _, sql := range []string{
+		"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT x",
+		"RELEASE x", "START TRANSACTION", "END", "ABORT",
+	} {
+		if !isSessionStateCommand(sql) {
+			t.Fatalf("expected true for %q", sql)
+		}
+	}
+}
+
+func TestIsSessionStateCommand_Selects(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT 1",
+		"SELECT * FROM orders",
+		"INSERT INTO orders VALUES (1)",
+		"UPDATE orders SET x = 1",
+		"DELETE FROM orders",
+		"WITH x AS (SELECT 1) SELECT * FROM x",
+	} {
+		if isSessionStateCommand(sql) {
+			t.Fatalf("expected false for %q", sql)
+		}
+	}
+}
+
+func TestIsSessionStateCommand_EmptyAndWhitespace(t *testing.T) {
+	if isSessionStateCommand("") {
+		t.Fatal("expected false for empty")
+	}
+	if isSessionStateCommand("   ") {
+		t.Fatal("expected false for whitespace-only")
+	}
+}
+
+func TestIsSessionStateCommand_TrailingSemicolon(t *testing.T) {
+	if !isSessionStateCommand("SET app.x = '1';") {
+		t.Fatal("expected true for SET with trailing ;")
+	}
+}

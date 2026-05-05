@@ -1028,6 +1028,93 @@ func bareTable(raw string) string {
 	return strings.ToLower(table)
 }
 
+// detectWriteMulti runs detectWrite across every top-level segment of a
+// possibly multi-statement SQL body. Returns the union of write tables
+// (deduplicated) plus a sentinelHit flag set when any segment was DDL or
+// CTE-with-INSERT/UPDATE/DELETE.
+//
+// This is the gap fixed by docs/todos/wrapper-multistatement-write-detection.md
+// — single-statement detectWrite() looks at only the first token, so a body
+// like `SET app.tenant='x'; INSERT INTO orders VALUES (1)` previously fell
+// through to the read path and the INSERT never invalidated the orders cache.
+//
+// Fast path: when the SQL contains no ';' the splitter would return a
+// single-element slice anyway, so we short-circuit directly to detectWrite
+// and avoid the allocation.
+func detectWriteMulti(sql string) (tables []string, sentinelHit bool) {
+	if !strings.ContainsRune(sql, ';') {
+		t := detectWrite(sql)
+		if t == ddlSentinel {
+			return nil, true
+		}
+		if t != "" {
+			return []string{t}, false
+		}
+		return nil, false
+	}
+	seen := make(map[string]struct{})
+	for _, seg := range SplitStatements(sql) {
+		t := detectWrite(seg)
+		if t == ddlSentinel {
+			return nil, true
+		}
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		tables = append(tables, t)
+	}
+	return tables, false
+}
+
+// sessionStateCommands lists the first-token SQL keywords whose responses
+// have no business in the cache: session/connection state mutations (SET /
+// RESET), notification machinery (LISTEN / UNLISTEN / NOTIFY), and
+// transaction control (BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE /
+// START / END / ABORT). Postgres returns command-tag-only responses for
+// these — caching them bloats the LRU with empty entries that never serve
+// real reads.
+//
+// Transaction-control keywords are also matched here as defence in depth;
+// the Query/QueryRow paths already short-circuit isTxStart/isTxEnd before
+// reaching the cache write step, but a future refactor that moves the put
+// site shouldn't reintroduce the bug.
+var sessionStateCommands = map[string]struct{}{
+	"SET": {}, "RESET": {},
+	"LISTEN": {}, "UNLISTEN": {}, "NOTIFY": {},
+	"BEGIN": {}, "COMMIT": {}, "ROLLBACK": {},
+	"SAVEPOINT": {}, "RELEASE": {},
+	"START": {}, "END": {}, "ABORT": {},
+}
+
+// isSessionStateCommand returns true when sql's first non-whitespace token
+// is a session-state / notification / transaction-control keyword whose
+// response should never be cached. See sessionStateCommands for the full
+// set and rationale. Multi-statement bodies are matched on their FIRST
+// segment's first token only — a multi-statement body that begins with
+// SELECT and ends with COMMIT is still a SELECT for caching purposes
+// (and will be handled by the read path).
+func isSessionStateCommand(sql string) bool {
+	trimmed := strings.TrimLeft(sql, " \t\r\n")
+	if trimmed == "" {
+		return false
+	}
+	end := 0
+	for end < len(trimmed) {
+		c := trimmed[end]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' {
+			break
+		}
+		end++
+	}
+	first := strings.ToUpper(trimmed[:end])
+	_, ok := sessionStateCommands[first]
+	return ok
+}
+
 func extractTables(sql string) map[string]bool {
 	tables := make(map[string]bool)
 	matches := tablePattern.FindAllStringSubmatch(sql, -1)

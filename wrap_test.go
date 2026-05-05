@@ -883,3 +883,187 @@ func TestStateHash_QueryAndQueryRowAlsoObserve(t *testing.T) {
 		t.Fatal("QueryRow path must observe SET commands")
 	}
 }
+
+// --- Bug 1: multi-statement write detection ---
+
+// A multi-statement Q like `SET app.tenant='x'; INSERT INTO orders VALUES (1)`
+// previously fell through detectWrite (first token was SET) and never
+// invalidated the orders cache. detectWriteMulti walks every segment so
+// the INSERT now drives an invalidation regardless of which path
+// (Query / QueryRow / Exec) the body arrives on.
+func TestMultiStatement_SetThenInsertInvalidatesViaQuery(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM orders")
+	if cc.cache.Get("SELECT * FROM orders", nil, cc.GucStateHash()) == nil {
+		t.Fatal("expected cache entry after baseline SELECT")
+	}
+
+	// Multi-statement body routed through Query.
+	cc.Query(ctx, "SET app.tenant = 'x'; INSERT INTO orders VALUES (1)")
+
+	// The new state hash applies after the SET, so check both the old
+	// baseline key (must be gone) and confirm Size dropped.
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected cache invalidation after multi-statement INSERT via Query, size=%d", cc.cache.Size())
+	}
+}
+
+func TestMultiStatement_SetThenInsertInvalidatesViaExec(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM orders")
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected 1 cache entry, got %d", cc.cache.Size())
+	}
+
+	cc.Exec(ctx, "SET app.tenant = 'x'; INSERT INTO orders VALUES (1)")
+
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected cache invalidation after multi-statement INSERT via Exec, size=%d", cc.cache.Size())
+	}
+}
+
+func TestMultiStatement_SetThenInsertInvalidatesViaQueryRow(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM orders")
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected 1 cache entry, got %d", cc.cache.Size())
+	}
+
+	cc.QueryRow(ctx, "SET app.tenant = 'x'; INSERT INTO orders VALUES (1)")
+
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected cache invalidation after multi-statement INSERT via QueryRow, size=%d", cc.cache.Size())
+	}
+}
+
+// `BEGIN; INSERT INTO t ...; COMMIT` is the explicit case called out in
+// the spec — txStartRe matches BEGIN and previously short-circuited
+// before write detection. detectWriteMulti now runs ahead of the
+// short-circuit.
+func TestMultiStatement_BeginInsertCommitInvalidates(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM orders")
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected 1 cache entry, got %d", cc.cache.Size())
+	}
+
+	cc.Exec(ctx, "BEGIN; INSERT INTO orders VALUES (1); COMMIT")
+
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected cache invalidation after BEGIN/INSERT/COMMIT body, size=%d", cc.cache.Size())
+	}
+}
+
+func TestMultiStatement_DDLAnywhereInvalidatesAll(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM users")
+	cc.Query(ctx, "SELECT * FROM orders")
+	if cc.cache.Size() != 2 {
+		t.Fatalf("expected 2 cache entries, got %d", cc.cache.Size())
+	}
+
+	cc.Exec(ctx, "INSERT INTO users VALUES (1); CREATE TABLE foo (id int)")
+
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected full cache wipe after DDL in multi-statement body, size=%d", cc.cache.Size())
+	}
+}
+
+func TestMultiStatement_TwoWritesUnionInvalidations(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	cc.Query(ctx, "SELECT * FROM users")
+	cc.Query(ctx, "SELECT * FROM orders")
+	cc.Query(ctx, "SELECT * FROM products")
+	if cc.cache.Size() != 3 {
+		t.Fatalf("expected 3 cache entries, got %d", cc.cache.Size())
+	}
+
+	cc.Exec(ctx, "INSERT INTO users VALUES (1); UPDATE orders SET x = 1")
+
+	// Both users and orders should be invalidated; products survives.
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected 1 cache entry (products) to survive, got %d", cc.cache.Size())
+	}
+	if cc.cache.Get("SELECT * FROM products", nil, 0) == nil {
+		t.Fatal("expected products cache entry to survive multi-statement write")
+	}
+}
+
+// --- Bug 2: SET / RESET / LISTEN responses must not be cached ---
+
+// Routed through Query, a bare SET produces an empty rows response. The
+// truthy-tail Put in pre-fix wrap.go inserted that empty entry into the
+// LRU. After the fix the Put is suppressed for first-token session-state
+// commands, so cache.Size() stays at 0.
+func TestSessionStateCommand_SetViaQueryNotCached(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected empty cache, got %d", cc.cache.Size())
+	}
+	cc.Query(ctx, "SET app.user_id = '42'")
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected SET response NOT to be cached, size=%d", cc.cache.Size())
+	}
+}
+
+func TestSessionStateCommand_ResetViaQueryNotCached(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Query(ctx, "RESET app.user_id")
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected RESET response NOT to be cached, size=%d", cc.cache.Size())
+	}
+}
+
+func TestSessionStateCommand_ListenViaQueryNotCached(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+	cc.Query(ctx, "LISTEN my_channel")
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected LISTEN response NOT to be cached, size=%d", cc.cache.Size())
+	}
+	cc.Query(ctx, "UNLISTEN my_channel")
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected UNLISTEN response NOT to be cached, size=%d", cc.cache.Size())
+	}
+	cc.Query(ctx, "NOTIFY my_channel, 'payload'")
+	if cc.cache.Size() != 0 {
+		t.Fatalf("expected NOTIFY response NOT to be cached, size=%d", cc.cache.Size())
+	}
+}
+
+// SELECTs still cache normally — ensure the new gate isn't over-broad.
+func TestSessionStateCommand_SelectStillCaches(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+	cc.Query(ctx, "SELECT * FROM users")
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected SELECT to be cached, size=%d", cc.cache.Size())
+	}
+}
+
+// SELECTs that return zero rows still cache (empty result is a valid
+// negative-cache entry, distinct from session-state commands which are
+// not even queries).
+func TestSessionStateCommand_EmptyResultSelectStillCaches(t *testing.T) {
+	cc, _ := setupWrapped(t, nil, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+	cc.Query(ctx, "SELECT * FROM users WHERE 1=0")
+	if cc.cache.Size() != 1 {
+		t.Fatalf("expected zero-row SELECT to still cache, size=%d", cc.cache.Size())
+	}
+}
