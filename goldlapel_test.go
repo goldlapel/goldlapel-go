@@ -1072,6 +1072,15 @@ func TestWithDisableSqloptimize_NotInConfigKeys(t *testing.T) {
 	}
 }
 
+func TestWithDisableSqloptimize_RejectedFromConfigMap(t *testing.T) {
+	// disable_sqloptimize is a top-level option (not in validConfigKeys), so
+	// passing it through WithConfig must error at argv build time. Mirrors
+	// the matviews / proxy_cache rejection tests — atomic break, no aliases.
+	if _, err := ConfigToArgs(map[string]interface{}{"disable_sqloptimize": true}); err == nil {
+		t.Fatal("expected ConfigToArgs to reject disable_sqloptimize")
+	}
+}
+
 func TestWithDisableAutoIndexes_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
 	if gl.disableAutoIndexes || gl.disableAutoIndexesSet {
@@ -1093,6 +1102,15 @@ func TestWithDisableAutoIndexes_NotInConfigKeys(t *testing.T) {
 		if k == "disable_auto_indexes" {
 			t.Fatalf("disable_auto_indexes must not appear in ConfigKeys(); got %q", k)
 		}
+	}
+}
+
+func TestWithDisableAutoIndexes_RejectedFromConfigMap(t *testing.T) {
+	// disable_auto_indexes is a top-level option (not in validConfigKeys), so
+	// passing it through WithConfig must error at argv build time. Mirrors
+	// the matviews / proxy_cache rejection tests — atomic break, no aliases.
+	if _, err := ConfigToArgs(map[string]interface{}{"disable_auto_indexes": true}); err == nil {
+		t.Fatal("expected ConfigToArgs to reject disable_auto_indexes")
 	}
 }
 

@@ -37,13 +37,13 @@ import (
 // GUC with a '.' in the name is also treated as unsafe (namespaced GUCs
 // are the canonical custom-RLS pattern).
 var unsafeGUCShortList = map[string]bool{
-	"search_path":                    true,
-	"role":                           true,
-	"session_authorization":          true,
-	"default_transaction_isolation":  true,
-	"default_transaction_read_only":  true,
-	"transaction_isolation":          true,
-	"row_security":                   true,
+	"search_path":                   true,
+	"role":                          true,
+	"session_authorization":         true,
+	"default_transaction_isolation": true,
+	"default_transaction_read_only": true,
+	"transaction_isolation":         true,
+	"row_security":                  true,
 }
 
 // SetCommandKind classifies a parsed SET / RESET. Callers care primarily
