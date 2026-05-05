@@ -337,7 +337,13 @@ func (nc *NativeCache) Size() int {
 	return len(nc.cache)
 }
 
-func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
+// Get looks up a cached entry for (sql, args, stateHash). The stateHash is
+// the wrapper's per-connection unsafe-GUC fingerprint (see guc_state.go);
+// pass 0 for the baseline state. Two connections with different unsafe
+// GUC settings (e.g. SET app.user_id='42' vs '43') hash to different
+// stateHash values and therefore never share a cache slot — this is the
+// wrapper-side mirror of the proxy's Option Y GUC-RLS cache safety.
+func (nc *NativeCache) Get(sql string, args []interface{}, stateHash uint64) *cacheEntry {
 	if !nc.enabled {
 		return nil
 	}
@@ -355,7 +361,7 @@ func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
 		return nil
 	}
 	defer nc.mu.Unlock()
-	key := makeKey(sql, args)
+	key := makeKey(sql, args, stateHash)
 	entry, ok := nc.cache[key]
 	if ok {
 		nc.counter++
@@ -367,7 +373,9 @@ func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
 	return nil
 }
 
-func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fields interface{}) {
+// Put inserts or refreshes a cache entry for (sql, args, stateHash). See
+// Get for the meaning of stateHash; pass 0 for the baseline state.
+func (nc *NativeCache) Put(sql string, args []interface{}, stateHash uint64, rows interface{}, fields interface{}) {
 	if !nc.enabled {
 		return
 	}
@@ -382,7 +390,7 @@ func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fie
 		nc.mu.Unlock()
 		return
 	}
-	key := makeKey(sql, args)
+	key := makeKey(sql, args, stateHash)
 	tables := extractTables(sql)
 	evicted := 0
 	if _, exists := nc.cache[key]; !exists && len(nc.cache) >= nc.maxEntries {
@@ -898,11 +906,20 @@ func (nc *NativeCache) stopSignalHandler() {
 
 // --- SQL parsing functions ---
 
-func makeKey(sql string, args []interface{}) string {
+// makeKey builds the per-entry cache key from (sql, args, stateHash). The
+// stateHash is the wrapper's per-connection unsafe-GUC fingerprint
+// (Option Y, mirroring the proxy's src/guc_state.rs). Folding it into the
+// key prevents one connection's RLS-shaped result set from being served
+// to a peer connection with different unsafe-GUC settings — e.g. user A's
+// rows leaking to user B when both share the wrapper's NativeCache
+// singleton. A stateHash of 0 means "no unsafe GUCs set" and matches the
+// baseline shared slot.
+func makeKey(sql string, args []interface{}, stateHash uint64) string {
+	hashHex := strconv.FormatUint(stateHash, 16)
 	if len(args) == 0 {
-		return sql + "\x00"
+		return hashHex + "\x00" + sql + "\x00"
 	}
-	return sql + "\x00" + fmt.Sprint(args)
+	return hashHex + "\x00" + sql + "\x00" + fmt.Sprint(args)
 }
 
 func detectWrite(sql string) string {

@@ -794,8 +794,11 @@ func TestConfigKeys_ContainsKnownKeys(t *testing.T) {
 	for _, k := range keys {
 		keySet[k] = true
 	}
-	// Tuning knobs still live in the structured config map.
-	for _, expected := range []string{"pool_size", "disable_matviews", "replica"} {
+	// Tuning knobs still live in the structured config map. (disable_matviews
+	// and disable_proxy_cache used to be here but have been promoted to
+	// top-level WithDisable* options as part of Wave 3 of the canonical
+	// surface; disable_pool stays since there's no top-level wrapper for it.)
+	for _, expected := range []string{"pool_size", "disable_pool", "replica"} {
 		if !keySet[expected] {
 			t.Fatalf("expected ConfigKeys() to contain %q", expected)
 		}
@@ -970,37 +973,125 @@ func TestWithMesh_NotInConfigKeys(t *testing.T) {
 	}
 }
 
-// --- WithEnableProxyCacheForWrappers ---
+// --- WithDisableProxyCache / WithDisableMatviews / WithDisableSqloptimize / WithDisableAutoIndexes ---
+//
+// Each of these promotes a previously-config-map disable flag to a
+// top-level functional option, mapping 1:1 to the proxy CLI flag
+// (--disable-proxy-cache, --disable-matviews, --disable-sqloptimize,
+// --disable-auto-indexes). The structured config map no longer accepts
+// "disable_proxy_cache" / "disable_matviews" — they're handled at the
+// option layer, with sqloptimize and auto-indexes wired in for the first
+// time as part of the Wave 3 surface promotion.
 
-func TestWithEnableProxyCacheForWrappers_Default(t *testing.T) {
+func TestWithDisableProxyCache_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.enableProxyCacheForWrappers {
-		t.Fatal("expected enableProxyCacheForWrappers=false by default")
+	if gl.disableProxyCache || gl.disableProxyCacheSet {
+		t.Fatalf("expected disableProxyCache=false / set=false by default; got %v / %v",
+			gl.disableProxyCache, gl.disableProxyCacheSet)
 	}
 }
 
-func TestWithEnableProxyCacheForWrappers_SetsTopLevelField(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableProxyCacheForWrappers(true))
-	if !gl.enableProxyCacheForWrappers {
-		t.Fatal("expected enableProxyCacheForWrappers=true")
+func TestWithDisableProxyCache_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableProxyCache(true))
+	if !gl.disableProxyCache || !gl.disableProxyCacheSet {
+		t.Fatalf("expected disableProxyCache=true / set=true; got %v / %v",
+			gl.disableProxyCache, gl.disableProxyCacheSet)
 	}
 }
 
-func TestWithEnableProxyCacheForWrappers_FalseLeavesFieldOff(t *testing.T) {
-	// Explicit opt-out must not flip the field on, matching WithSilent(false).
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableProxyCacheForWrappers(false))
-	if gl.enableProxyCacheForWrappers {
-		t.Fatal("expected WithEnableProxyCacheForWrappers(false) to leave enableProxyCacheForWrappers=false")
-	}
-}
-
-func TestWithEnableProxyCacheForWrappers_NotInConfigKeys(t *testing.T) {
-	// enable_proxy_cache_for_wrappers is a top-level option, not a tuning knob in
+func TestWithDisableProxyCache_NotInConfigKeys(t *testing.T) {
+	// disable_proxy_cache is now a top-level option, not a tuning knob in
 	// the structured config map.
-	keys := ConfigKeys()
-	for _, k := range keys {
-		if k == "enable_proxy_cache_for_wrappers" {
-			t.Fatalf("enable_proxy_cache_for_wrappers must not appear in ConfigKeys(); got %q", k)
+	for _, k := range ConfigKeys() {
+		if k == "disable_proxy_cache" {
+			t.Fatalf("disable_proxy_cache must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
+func TestWithDisableProxyCache_RejectedFromConfigMap(t *testing.T) {
+	// ConfigToArgs must reject the promoted key — promoting to a top-level
+	// option is an atomic break with no aliases, so a stale caller passing
+	// disable_proxy_cache via WithConfig should fail loudly.
+	if _, err := ConfigToArgs(map[string]interface{}{"disable_proxy_cache": true}); err == nil {
+		t.Fatal("expected ConfigToArgs to reject disable_proxy_cache")
+	}
+}
+
+func TestWithDisableMatviews_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.disableMatviews || gl.disableMatviewsSet {
+		t.Fatalf("expected disableMatviews=false / set=false; got %v / %v",
+			gl.disableMatviews, gl.disableMatviewsSet)
+	}
+}
+
+func TestWithDisableMatviews_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableMatviews(true))
+	if !gl.disableMatviews || !gl.disableMatviewsSet {
+		t.Fatalf("expected disableMatviews=true / set=true; got %v / %v",
+			gl.disableMatviews, gl.disableMatviewsSet)
+	}
+}
+
+func TestWithDisableMatviews_NotInConfigKeys(t *testing.T) {
+	for _, k := range ConfigKeys() {
+		if k == "disable_matviews" {
+			t.Fatalf("disable_matviews must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
+func TestWithDisableMatviews_RejectedFromConfigMap(t *testing.T) {
+	if _, err := ConfigToArgs(map[string]interface{}{"disable_matviews": true}); err == nil {
+		t.Fatal("expected ConfigToArgs to reject disable_matviews")
+	}
+}
+
+func TestWithDisableSqloptimize_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.disableSqloptimize || gl.disableSqloptimizeSet {
+		t.Fatalf("expected disableSqloptimize=false / set=false; got %v / %v",
+			gl.disableSqloptimize, gl.disableSqloptimizeSet)
+	}
+}
+
+func TestWithDisableSqloptimize_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableSqloptimize(true))
+	if !gl.disableSqloptimize || !gl.disableSqloptimizeSet {
+		t.Fatalf("expected disableSqloptimize=true / set=true; got %v / %v",
+			gl.disableSqloptimize, gl.disableSqloptimizeSet)
+	}
+}
+
+func TestWithDisableSqloptimize_NotInConfigKeys(t *testing.T) {
+	for _, k := range ConfigKeys() {
+		if k == "disable_sqloptimize" {
+			t.Fatalf("disable_sqloptimize must not appear in ConfigKeys(); got %q", k)
+		}
+	}
+}
+
+func TestWithDisableAutoIndexes_Default(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb")
+	if gl.disableAutoIndexes || gl.disableAutoIndexesSet {
+		t.Fatalf("expected disableAutoIndexes=false / set=false; got %v / %v",
+			gl.disableAutoIndexes, gl.disableAutoIndexesSet)
+	}
+}
+
+func TestWithDisableAutoIndexes_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableAutoIndexes(true))
+	if !gl.disableAutoIndexes || !gl.disableAutoIndexesSet {
+		t.Fatalf("expected disableAutoIndexes=true / set=true; got %v / %v",
+			gl.disableAutoIndexes, gl.disableAutoIndexesSet)
+	}
+}
+
+func TestWithDisableAutoIndexes_NotInConfigKeys(t *testing.T) {
+	for _, k := range ConfigKeys() {
+		if k == "disable_auto_indexes" {
+			t.Fatalf("disable_auto_indexes must not appear in ConfigKeys(); got %q", k)
 		}
 	}
 }

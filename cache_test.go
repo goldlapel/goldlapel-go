@@ -31,33 +31,51 @@ func makeTestCache(t *testing.T, maxEntries int, enabled bool, connected bool) *
 // --- makeKey ---
 
 func TestMakeKey_NoArgs(t *testing.T) {
-	key := makeKey("SELECT 1", nil)
-	if key != "SELECT 1\x00" {
+	key := makeKey("SELECT 1", nil, 0)
+	if key != "0\x00SELECT 1\x00" {
 		t.Fatalf("got %q", key)
 	}
 }
 
 func TestMakeKey_WithArgs(t *testing.T) {
-	key := makeKey("SELECT $1", []interface{}{42})
-	want := "SELECT $1\x00[42]"
+	key := makeKey("SELECT $1", []interface{}{42}, 0)
+	want := "0\x00SELECT $1\x00[42]"
 	if key != want {
 		t.Fatalf("got %q, want %q", key, want)
 	}
 }
 
 func TestMakeKey_DifferentArgs(t *testing.T) {
-	k1 := makeKey("SELECT $1", []interface{}{1})
-	k2 := makeKey("SELECT $1", []interface{}{2})
+	k1 := makeKey("SELECT $1", []interface{}{1}, 0)
+	k2 := makeKey("SELECT $1", []interface{}{2}, 0)
 	if k1 == k2 {
 		t.Fatal("different args should produce different keys")
 	}
 }
 
 func TestMakeKey_SameArgsSameKey(t *testing.T) {
-	k1 := makeKey("SELECT $1", []interface{}{42})
-	k2 := makeKey("SELECT $1", []interface{}{42})
+	k1 := makeKey("SELECT $1", []interface{}{42}, 0)
+	k2 := makeKey("SELECT $1", []interface{}{42}, 0)
 	if k1 != k2 {
 		t.Fatal("same args should produce same key")
+	}
+}
+
+// State hash separates cache slots: same SQL+args + different state hash
+// must produce distinct keys (per-connection unsafe-GUC isolation).
+func TestMakeKey_DifferentStateHashesProduceDifferentKeys(t *testing.T) {
+	k1 := makeKey("SELECT 1", nil, 0)
+	k2 := makeKey("SELECT 1", nil, 0xDEADBEEF)
+	if k1 == k2 {
+		t.Fatal("different state hashes should produce different keys")
+	}
+}
+
+func TestMakeKey_SameStateHashSameKey(t *testing.T) {
+	k1 := makeKey("SELECT 1", []interface{}{42}, 0xCAFEBABE)
+	k2 := makeKey("SELECT 1", []interface{}{42}, 0xCAFEBABE)
+	if k1 != k2 {
+		t.Fatal("same state hash + same SQL+args should produce same key")
 	}
 }
 
@@ -283,8 +301,8 @@ func TestIsTxStart_SelectNotStart(t *testing.T) {
 func TestCache_PutAndGet(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
 	rows := [][]interface{}{{1, "alice"}}
-	cache.Put("SELECT * FROM users", nil, rows, nil)
-	entry := cache.Get("SELECT * FROM users", nil)
+	cache.Put("SELECT * FROM users", nil, 0, rows, nil)
+	entry := cache.Get("SELECT * FROM users", nil, 0)
 	if entry == nil {
 		t.Fatal("expected non-nil entry")
 	}
@@ -296,33 +314,33 @@ func TestCache_PutAndGet(t *testing.T) {
 
 func TestCache_MissReturnsNil(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	if entry := cache.Get("SELECT 1", nil); entry != nil {
+	if entry := cache.Get("SELECT 1", nil, 0); entry != nil {
 		t.Fatal("expected nil for miss")
 	}
 }
 
 func TestCache_DisabledReturnsNil(t *testing.T) {
 	cache := makeTestCache(t, 100, false, true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	if entry := cache.Get("SELECT 1", nil); entry != nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil, 0); entry != nil {
 		t.Fatal("expected nil when disabled")
 	}
 }
 
 func TestCache_NotConnectedReturnsNil(t *testing.T) {
 	cache := makeTestCache(t, 100, true, false)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	if entry := cache.Get("SELECT 1", nil); entry != nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil, 0); entry != nil {
 		t.Fatal("expected nil when not connected")
 	}
 }
 
 func TestCache_ParamsDifferentiateKeys(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM users WHERE id = $1", []interface{}{1}, []interface{}{"alice"}, nil)
-	cache.Put("SELECT * FROM users WHERE id = $1", []interface{}{2}, []interface{}{"bob"}, nil)
-	e1 := cache.Get("SELECT * FROM users WHERE id = $1", []interface{}{1})
-	e2 := cache.Get("SELECT * FROM users WHERE id = $1", []interface{}{2})
+	cache.Put("SELECT * FROM users WHERE id = $1", []interface{}{1}, 0, []interface{}{"alice"}, nil)
+	cache.Put("SELECT * FROM users WHERE id = $1", []interface{}{2}, 0, []interface{}{"bob"}, nil)
+	e1 := cache.Get("SELECT * FROM users WHERE id = $1", []interface{}{1}, 0)
+	e2 := cache.Get("SELECT * FROM users WHERE id = $1", []interface{}{2}, 0)
 	if e1 == nil || e2 == nil {
 		t.Fatal("expected non-nil entries")
 	}
@@ -335,9 +353,9 @@ func TestCache_ParamsDifferentiateKeys(t *testing.T) {
 
 func TestCache_StatsTracking(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	cache.Get("SELECT 1", nil)
-	cache.Get("SELECT 2", nil)
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	cache.Get("SELECT 1", nil, 0)
+	cache.Get("SELECT 2", nil, 0)
 	if cache.StatsHits() != 1 {
 		t.Fatalf("expected 1 hit, got %d", cache.StatsHits())
 	}
@@ -350,38 +368,38 @@ func TestCache_StatsTracking(t *testing.T) {
 
 func TestLRU_EvictionAtCapacity(t *testing.T) {
 	cache := makeTestCache(t, 3, true, true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	cache.Put("SELECT 2", nil, []int{2}, nil)
-	cache.Put("SELECT 3", nil, []int{3}, nil)
-	cache.Put("SELECT 4", nil, []int{4}, nil)
-	if cache.Get("SELECT 1", nil) != nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	cache.Put("SELECT 2", nil, 0, []int{2}, nil)
+	cache.Put("SELECT 3", nil, 0, []int{3}, nil)
+	cache.Put("SELECT 4", nil, 0, []int{4}, nil)
+	if cache.Get("SELECT 1", nil, 0) != nil {
 		t.Fatal("expected SELECT 1 to be evicted")
 	}
-	if cache.Get("SELECT 4", nil) == nil {
+	if cache.Get("SELECT 4", nil, 0) == nil {
 		t.Fatal("expected SELECT 4 to be present")
 	}
 }
 
 func TestLRU_AccessRefreshes(t *testing.T) {
 	cache := makeTestCache(t, 3, true, true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	cache.Put("SELECT 2", nil, []int{2}, nil)
-	cache.Put("SELECT 3", nil, []int{3}, nil)
-	cache.Get("SELECT 1", nil) // refresh SELECT 1
-	cache.Put("SELECT 4", nil, []int{4}, nil) // evicts SELECT 2 (oldest)
-	if cache.Get("SELECT 1", nil) == nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	cache.Put("SELECT 2", nil, 0, []int{2}, nil)
+	cache.Put("SELECT 3", nil, 0, []int{3}, nil)
+	cache.Get("SELECT 1", nil, 0) // refresh SELECT 1
+	cache.Put("SELECT 4", nil, 0, []int{4}, nil) // evicts SELECT 2 (oldest)
+	if cache.Get("SELECT 1", nil, 0) == nil {
 		t.Fatal("expected SELECT 1 to be present after refresh")
 	}
-	if cache.Get("SELECT 2", nil) != nil {
+	if cache.Get("SELECT 2", nil, 0) != nil {
 		t.Fatal("expected SELECT 2 to be evicted")
 	}
 }
 
 func TestLRU_EvictionCleansTableIndex(t *testing.T) {
 	cache := makeTestCache(t, 2, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
-	cache.Put("SELECT * FROM users", nil, []int{2}, nil)
-	cache.Put("SELECT * FROM products", nil, []int{3}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
+	cache.Put("SELECT * FROM users", nil, 0, []int{2}, nil)
+	cache.Put("SELECT * FROM products", nil, 0, []int{3}, nil)
 	// orders should be evicted and removed from table index
 	if keys, ok := cache.tableIndex["orders"]; ok && len(keys) > 0 {
 		t.Fatal("expected orders table index to be cleaned")
@@ -392,35 +410,35 @@ func TestLRU_EvictionCleansTableIndex(t *testing.T) {
 
 func TestInvalidation_Table(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
-	cache.Put("SELECT * FROM users", nil, []int{2}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
+	cache.Put("SELECT * FROM users", nil, 0, []int{2}, nil)
 	cache.InvalidateTable("orders")
-	if cache.Get("SELECT * FROM orders", nil) != nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) != nil {
 		t.Fatal("expected orders to be invalidated")
 	}
-	if cache.Get("SELECT * FROM users", nil) == nil {
+	if cache.Get("SELECT * FROM users", nil, 0) == nil {
 		t.Fatal("expected users to still be present")
 	}
 }
 
 func TestInvalidation_All(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
-	cache.Put("SELECT * FROM users", nil, []int{2}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
+	cache.Put("SELECT * FROM users", nil, 0, []int{2}, nil)
 	cache.InvalidateAll()
-	if cache.Get("SELECT * FROM orders", nil) != nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) != nil {
 		t.Fatal("expected orders to be invalidated")
 	}
-	if cache.Get("SELECT * FROM users", nil) != nil {
+	if cache.Get("SELECT * FROM users", nil, 0) != nil {
 		t.Fatal("expected users to be invalidated")
 	}
 }
 
 func TestInvalidation_CrossReferenced(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders JOIN users ON 1=1", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders JOIN users ON 1=1", nil, 0, []int{1}, nil)
 	cache.InvalidateTable("orders")
-	if cache.Get("SELECT * FROM orders JOIN users ON 1=1", nil) != nil {
+	if cache.Get("SELECT * FROM orders JOIN users ON 1=1", nil, 0) != nil {
 		t.Fatal("expected joined query to be invalidated")
 	}
 	if keys, ok := cache.tableIndex["users"]; ok && len(keys) > 0 {
@@ -430,7 +448,7 @@ func TestInvalidation_CrossReferenced(t *testing.T) {
 
 func TestInvalidation_Stats(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 	cache.InvalidateTable("orders")
 	if cache.StatsInvalidations() != 1 {
 		t.Fatalf("expected 1 invalidation, got %d", cache.StatsInvalidations())
@@ -441,36 +459,36 @@ func TestInvalidation_Stats(t *testing.T) {
 
 func TestSignal_TableInvalidates(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 	cache.processSignal("I:orders")
-	if cache.Get("SELECT * FROM orders", nil) != nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) != nil {
 		t.Fatal("expected invalidation via signal")
 	}
 }
 
 func TestSignal_WildcardInvalidatesAll(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 	cache.processSignal("I:*")
-	if cache.Get("SELECT * FROM orders", nil) != nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) != nil {
 		t.Fatal("expected wildcard invalidation")
 	}
 }
 
 func TestSignal_KeepalivePreservesCache(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 	cache.processSignal("P:")
-	if cache.Get("SELECT * FROM orders", nil) == nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) == nil {
 		t.Fatal("keepalive should not invalidate")
 	}
 }
 
 func TestSignal_UnknownPreservesCache(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 	cache.processSignal("X:something")
-	if cache.Get("SELECT * FROM orders", nil) == nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) == nil {
 		t.Fatal("unknown signal should not invalidate")
 	}
 }
@@ -502,12 +520,12 @@ func TestPushInvalidation_RemoteSignalClearsCache(t *testing.T) {
 	}
 
 	// Put into cache (must do after connected)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 
 	conn.Write([]byte("I:orders\n"))
 	time.Sleep(200 * time.Millisecond)
 
-	if cache.Get("SELECT * FROM orders", nil) != nil {
+	if cache.Get("SELECT * FROM orders", nil, 0) != nil {
 		t.Fatal("expected orders to be invalidated via push")
 	}
 
@@ -536,7 +554,7 @@ func TestPushInvalidation_ConnectionDropClearsCache(t *testing.T) {
 	}
 
 	// Put into cache (after connected)
-	cache.Put("SELECT * FROM orders", nil, []int{1}, nil)
+	cache.Put("SELECT * FROM orders", nil, 0, []int{1}, nil)
 
 	// Drop connection
 	conn.Close()
@@ -602,14 +620,14 @@ func TestConcurrentPutAndGet(t *testing.T) {
 	writer := func(start, count int) {
 		defer wg.Done()
 		for i := start; i < start+count; i++ {
-			cache.Put("SELECT "+string(rune('A'+i%26)), nil, []int{i}, nil)
+			cache.Put("SELECT "+string(rune('A'+i%26)), nil, 0, []int{i}, nil)
 		}
 	}
 
 	reader := func(start, count int) {
 		defer wg.Done()
 		for i := start; i < start+count; i++ {
-			cache.Get("SELECT "+string(rune('A'+i%26)), nil)
+			cache.Get("SELECT "+string(rune('A'+i%26)), nil, 0)
 		}
 	}
 
@@ -624,7 +642,7 @@ func TestConcurrentPutAndGet(t *testing.T) {
 func TestConcurrentInvalidation(t *testing.T) {
 	cache := makeTestCache(t, 1000, true, true)
 	for i := 0; i < 100; i++ {
-		cache.Put("SELECT * FROM t"+string(rune('0'+i%10)), []interface{}{i}, []int{i}, nil)
+		cache.Put("SELECT * FROM t"+string(rune('0'+i%10)), []interface{}{i}, 0, []int{i}, nil)
 	}
 
 	var wg sync.WaitGroup
@@ -639,7 +657,7 @@ func TestConcurrentInvalidation(t *testing.T) {
 	reader := func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			cache.Get("SELECT * FROM t"+string(rune('0'+i%10)), []interface{}{i})
+			cache.Get("SELECT * FROM t"+string(rune('0'+i%10)), []interface{}{i}, 0)
 		}
 	}
 
@@ -652,7 +670,7 @@ func TestConcurrentInvalidation(t *testing.T) {
 
 func TestStats_ConcurrentAccess(t *testing.T) {
 	cache := makeTestCache(t, 1000, true, true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -661,8 +679,8 @@ func TestStats_ConcurrentAccess(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			cache.Get("SELECT 1", nil)
-			cache.Get("SELECT 2", nil)
+			cache.Get("SELECT 1", nil, 0)
+			cache.Get("SELECT 2", nil, 0)
 		}
 	}()
 
@@ -680,7 +698,7 @@ func TestStats_ConcurrentAccess(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			cache.Put("SELECT temp", nil, []int{1}, nil)
+			cache.Put("SELECT temp", nil, 0, []int{1}, nil)
 			cache.InvalidateAll()
 		}
 	}()
@@ -724,8 +742,8 @@ func TestDisableNativeCache_GetReturnsMissAndTicksMisses(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
 	cache.SetDisableNativeCache(true)
 	// Even after a Put (which is a no-op below), Get must miss.
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	if entry := cache.Get("SELECT 1", nil); entry != nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil, 0); entry != nil {
 		t.Fatal("expected nil on Get when native cache is disabled")
 	}
 	if cache.StatsMisses() != 1 {
@@ -740,7 +758,7 @@ func TestDisableNativeCache_PutIsNoOp(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
 	cache.SetDisableNativeCache(true)
 	for i := 0; i < 10; i++ {
-		cache.Put("SELECT * FROM orders", nil, []int{i}, nil)
+		cache.Put("SELECT * FROM orders", nil, 0, []int{i}, nil)
 	}
 	if cache.Size() != 0 {
 		t.Fatalf("expected cache to remain empty when native cache disabled, got size %d", cache.Size())
@@ -755,8 +773,8 @@ func TestDisableNativeCache_HitsAndEvictionsStayZero(t *testing.T) {
 	cache := makeTestCache(t, 1, true, true)
 	cache.SetDisableNativeCache(true)
 	for i := 0; i < 50; i++ {
-		cache.Put("SELECT * FROM t", []interface{}{i}, []int{i}, nil)
-		cache.Get("SELECT * FROM t", []interface{}{i})
+		cache.Put("SELECT * FROM t", []interface{}{i}, 0, []int{i}, nil)
+		cache.Get("SELECT * FROM t", []interface{}{i}, 0)
 	}
 	if cache.StatsHits() != 0 {
 		t.Fatalf("expected 0 hits, got %d", cache.StatsHits())
@@ -772,14 +790,14 @@ func TestDisableNativeCache_HitsAndEvictionsStayZero(t *testing.T) {
 func TestDisableNativeCache_ToggleBackOnRestoresCacheBehavior(t *testing.T) {
 	cache := makeTestCache(t, 100, true, true)
 	cache.SetDisableNativeCache(true)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	if cache.Get("SELECT 1", nil) != nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	if cache.Get("SELECT 1", nil, 0) != nil {
 		t.Fatal("expected miss while disabled")
 	}
 	// Re-enable: a fresh Put + Get should now produce a hit.
 	cache.SetDisableNativeCache(false)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	if entry := cache.Get("SELECT 1", nil); entry == nil {
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	if entry := cache.Get("SELECT 1", nil, 0); entry == nil {
 		t.Fatal("expected hit after re-enabling native cache")
 	}
 	if cache.StatsHits() != 1 {

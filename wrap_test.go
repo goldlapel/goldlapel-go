@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -581,12 +582,12 @@ func TestSelfInvalidation_InsertInvalidatesTable(t *testing.T) {
 	ctx := context.Background()
 
 	cc.Query(ctx, "SELECT * FROM users")
-	if cc.cache.Get("SELECT * FROM users", nil) == nil {
+	if cc.cache.Get("SELECT * FROM users", nil, 0) == nil {
 		t.Fatal("expected cache entry after query")
 	}
 
 	cc.Exec(ctx, "INSERT INTO users VALUES (2)")
-	if cc.cache.Get("SELECT * FROM users", nil) != nil {
+	if cc.cache.Get("SELECT * FROM users", nil, 0) != nil {
 		t.Fatal("expected cache entry to be invalidated after INSERT")
 	}
 }
@@ -597,7 +598,7 @@ func TestSelfInvalidation_UpdateInvalidatesTable(t *testing.T) {
 
 	cc.Query(ctx, "SELECT * FROM users")
 	cc.Exec(ctx, "UPDATE users SET name = 'bob'")
-	if cc.cache.Get("SELECT * FROM users", nil) != nil {
+	if cc.cache.Get("SELECT * FROM users", nil, 0) != nil {
 		t.Fatal("expected cache invalidation after UPDATE")
 	}
 }
@@ -608,7 +609,7 @@ func TestSelfInvalidation_TruncateInvalidatesTable(t *testing.T) {
 
 	cc.Query(ctx, "SELECT * FROM users")
 	cc.Exec(ctx, "TRUNCATE users")
-	if cc.cache.Get("SELECT * FROM users", nil) != nil {
+	if cc.cache.Get("SELECT * FROM users", nil, 0) != nil {
 		t.Fatal("expected cache invalidation after TRUNCATE")
 	}
 }
@@ -666,7 +667,219 @@ func TestMultipleWritesSameTable(t *testing.T) {
 		cc.Exec(ctx, fmt.Sprintf("INSERT INTO users VALUES (%d)", i))
 	}
 	// After final insert, cache should be empty for users
-	if cc.cache.Get("SELECT * FROM users", nil) != nil {
+	if cc.cache.Get("SELECT * FROM users", nil, 0) != nil {
 		t.Fatal("expected no cache entry after multiple writes")
+	}
+}
+
+// --- L1 state-hash integration (Option Y wrapper-side) ---
+//
+// These tests wire CachedConn end-to-end through Query/QueryRow/Exec
+// against a mock Querier and verify that unsafe-GUC SETs change the
+// per-connection cache key — preventing cache leaks when two CachedConns
+// share the singleton NativeCache but differ in their RLS-shaping GUC
+// state.
+
+// selectCount returns how many of the SQLs the mock saw start with
+// SELECT — i.e. it filters out the SET / RESET / BEGIN / COMMIT noise
+// that every state-hash test produces. Existing queryCount() lumps Query
+// + QueryRow + Exec together, which inflates the number we care about
+// (real fetches against the backend).
+func selectCount(m *mockQuerier) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, q := range m.queries {
+		t := strings.TrimSpace(q)
+		if strings.HasPrefix(strings.ToUpper(t), "SELECT") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestStateHash_SafeSetDoesNotChangeCacheKey(t *testing.T) {
+	cc, _ := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	// Cache a SELECT under the baseline state.
+	cc.Query(ctx, "SELECT * FROM users")
+	hashBefore := cc.GucStateHash()
+
+	// SET timezone is harmless — the hash must not move.
+	if _, err := cc.Exec(ctx, "SET timezone = 'UTC'"); err != nil {
+		t.Fatal(err)
+	}
+	if cc.GucStateHash() != hashBefore {
+		t.Fatalf("safe SET must not change state hash: %d → %d",
+			hashBefore, cc.GucStateHash())
+	}
+}
+
+func TestStateHash_UnsafeSetChangesCacheKey(t *testing.T) {
+	cc, mock := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	// Cache a SELECT under the baseline state. First call: real query.
+	cc.Query(ctx, "SELECT * FROM accounts")
+	if selectCount(mock) != 1 {
+		t.Fatalf("expected 1 real SELECT, got %d", selectCount(mock))
+	}
+	hashBefore := cc.GucStateHash()
+
+	// SET an unsafe GUC — the hash must move.
+	if _, err := cc.Exec(ctx, "SET app.user_id = '42'"); err != nil {
+		t.Fatal(err)
+	}
+	hashAfter := cc.GucStateHash()
+	if hashBefore == hashAfter {
+		t.Fatalf("unsafe SET must change state hash; both are %d", hashBefore)
+	}
+
+	// The same SELECT under the new state hash must miss the cache and
+	// route through to the real Querier — the previous user's cached rows
+	// must NOT be served.
+	cc.Query(ctx, "SELECT * FROM accounts")
+	if selectCount(mock) != 2 {
+		t.Fatalf("expected 2 real SELECTs (cache key separated by state hash), got %d", selectCount(mock))
+	}
+}
+
+func TestStateHash_TwoConnectionsWithDifferentStateNeverCrossShare(t *testing.T) {
+	// The wrapper's NativeCache is a process-wide singleton. Two
+	// CachedConns built against it must not serve each other's RLS-shaped
+	// rows when their unsafe-GUC state differs — this is the cache
+	// security invariant Option Y enforces.
+	ResetNativeCache()
+	cache := GetNativeCache()
+	cache.mu.Lock()
+	cache.invConnected = true
+	cache.mu.Unlock()
+
+	mockA := newMockQuerier([][]interface{}{{"alice-only"}}, []FieldDescription{{Name: "name"}})
+	mockB := newMockQuerier([][]interface{}{{"bob-only"}}, []FieldDescription{{Name: "name"}})
+
+	connA := &CachedConn{real: mockA, cache: cache, gucState: NewConnectionGucState()}
+	connB := &CachedConn{real: mockB, cache: cache, gucState: NewConnectionGucState()}
+	ctx := context.Background()
+
+	// connA SETs app.user_id='alice', then queries — caches under
+	// (sql=SELECT *, hash=H(app.user_id=alice)).
+	connA.Exec(ctx, "SET app.user_id = 'alice'")
+	connA.Query(ctx, "SELECT * FROM accounts")
+
+	// connB SETs app.user_id='bob', then queries the same SQL. With the
+	// state hash folded into the cache key, connB MUST miss connA's
+	// cached row (different hash slot) and route through to its own
+	// mock for fresh data.
+	connB.Exec(ctx, "SET app.user_id = 'bob'")
+	connB.Query(ctx, "SELECT * FROM accounts")
+
+	if selectCount(mockB) != 1 {
+		t.Fatalf("connB should have hit its real backend (different state hash from connA); got %d real SELECTs on B",
+			selectCount(mockB))
+	}
+}
+
+func TestStateHash_SameStateOnTwoConnectionsCanShareCache(t *testing.T) {
+	// Inverse of the security invariant: when two CachedConns hold the
+	// SAME unsafe-GUC state, the singleton native cache may serve a hit
+	// across them — same key, same hash, same slot.
+	ResetNativeCache()
+	cache := GetNativeCache()
+	cache.mu.Lock()
+	cache.invConnected = true
+	cache.mu.Unlock()
+
+	mockA := newMockQuerier([][]interface{}{{"shared"}}, []FieldDescription{{Name: "v"}})
+	mockB := newMockQuerier([][]interface{}{{"would-be-served-but-shouldnt-be"}}, []FieldDescription{{Name: "v"}})
+
+	connA := &CachedConn{real: mockA, cache: cache, gucState: NewConnectionGucState()}
+	connB := &CachedConn{real: mockB, cache: cache, gucState: NewConnectionGucState()}
+	ctx := context.Background()
+
+	connA.Exec(ctx, "SET app.user_id = '42'")
+	connB.Exec(ctx, "SET app.user_id = '42'")
+
+	connA.Query(ctx, "SELECT shared_value()")
+	// connB should hit the cache populated by connA — same SQL, same
+	// state hash. selectCount(mockB) stays at 0.
+	connB.Query(ctx, "SELECT shared_value()")
+
+	if selectCount(mockB) != 0 {
+		t.Fatalf("connB should have hit the singleton cache (same state hash as connA); got %d real SELECTs on B",
+			selectCount(mockB))
+	}
+	if selectCount(mockA) != 1 {
+		t.Fatalf("connA should have hit real backend exactly once (priming the cache); got %d", selectCount(mockA))
+	}
+}
+
+func TestStateHash_ResetReturnsToBaselineCacheKey(t *testing.T) {
+	// After SET app.user_id = '42'; ... ; RESET app.user_id, the cache
+	// key returns to the baseline (state hash 0) — so any rows previously
+	// cached at the baseline are once again accessible.
+	cc, mock := setupWrapped(t, [][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
+	ctx := context.Background()
+
+	// Prime the baseline cache slot.
+	cc.Query(ctx, "SELECT * FROM t")
+	if selectCount(mock) != 1 {
+		t.Fatalf("expected 1 real SELECT priming baseline, got %d", selectCount(mock))
+	}
+
+	// Move off baseline.
+	cc.Exec(ctx, "SET app.user_id = '42'")
+	cc.Query(ctx, "SELECT * FROM t")
+	if selectCount(mock) != 2 {
+		t.Fatalf("expected 2 real SELECTs (baseline + GUC-state slot), got %d", selectCount(mock))
+	}
+
+	// Return to baseline via RESET. The cached entry from the first call
+	// should still be reachable.
+	cc.Exec(ctx, "RESET app.user_id")
+	if cc.GucStateHash() != 0 {
+		t.Fatalf("RESET should restore baseline hash 0, got %d", cc.GucStateHash())
+	}
+	cc.Query(ctx, "SELECT * FROM t")
+	if selectCount(mock) != 2 {
+		t.Fatalf("expected RESET to restore baseline cache hit (still 2 real SELECTs), got %d", selectCount(mock))
+	}
+}
+
+func TestStateHash_SetLocalDoesNotMoveHash(t *testing.T) {
+	// SET LOCAL is observed but never moves the state hash — its effect
+	// is bounded to the current transaction, and CachedConn already
+	// bypasses the cache while inTransaction=true.
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+
+	cc.Exec(ctx, "BEGIN")
+	cc.Exec(ctx, "SET LOCAL app.user_id = '42'")
+	if cc.GucStateHash() != 0 {
+		t.Fatalf("SET LOCAL must not move hash: got %d", cc.GucStateHash())
+	}
+	cc.Exec(ctx, "COMMIT")
+	if cc.GucStateHash() != 0 {
+		t.Fatal("hash should still be 0 after COMMIT")
+	}
+}
+
+func TestStateHash_QueryAndQueryRowAlsoObserve(t *testing.T) {
+	// SET typically arrives via Exec, but defensive: any of the three
+	// entry points must observe SQL — some drivers route bare SET through
+	// Query / QueryRow.
+	cc, _ := setupWrapped(t, nil, nil)
+	ctx := context.Background()
+
+	cc.Query(ctx, "SET app.tenant = 'alpha'")
+	if cc.GucStateHash() == 0 {
+		t.Fatal("Query path must observe SET commands")
+	}
+
+	cc2, _ := setupWrapped(t, nil, nil)
+	cc2.QueryRow(ctx, "SET app.tenant = 'alpha'")
+	if cc2.GucStateHash() == 0 {
+		t.Fatal("QueryRow path must observe SET commands")
 	}
 }

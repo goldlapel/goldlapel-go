@@ -78,9 +78,9 @@ func TestTelemetry_WrapperIDDistinctAcrossInstances(t *testing.T) {
 
 func TestTelemetry_SnapshotCarriesRequiredFields(t *testing.T) {
 	cache, _, _ := makeTelemetryCache(t, 64)
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	cache.Get("SELECT 1", nil)
-	cache.Get("SELECT MISS", nil)
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	cache.Get("SELECT 1", nil, 0)
+	cache.Get("SELECT MISS", nil, 0)
 	snap := cache.buildSnapshot()
 	if snap.WrapperID != cache.WrapperID() {
 		t.Fatalf("wrapper_id mismatch: %q vs %q", snap.WrapperID, cache.WrapperID())
@@ -153,7 +153,7 @@ func TestTelemetry_EvictionsCounterStartsZero(t *testing.T) {
 func TestTelemetry_EvictionsCounterBumpsOnOverflow(t *testing.T) {
 	cache, _, _ := makeTelemetryCache(t, 4)
 	for i := 0; i < 8; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	// 8 puts, capacity 4 → 4 evictions.
 	if got := cache.StatsEvictions(); got != 4 {
@@ -164,7 +164,7 @@ func TestTelemetry_EvictionsCounterBumpsOnOverflow(t *testing.T) {
 func TestTelemetry_EvictionsCounterNoBumpWithinCapacity(t *testing.T) {
 	cache, _, _ := makeTelemetryCache(t, 8)
 	for i := 0; i < 4; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	if got := cache.StatsEvictions(); got != 0 {
 		t.Fatalf("expected 0 evictions, got %d", got)
@@ -177,7 +177,7 @@ func TestTelemetry_CacheFullFiresWhenEvictionsDominate(t *testing.T) {
 	// Capacity 4 — every put past the 4th evicts. Window = 200 puts.
 	cache, emissions, mu := makeTelemetryCache(t, 4)
 	for i := 0; i < evictRateWindow+10; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -190,7 +190,7 @@ func TestTelemetry_CacheFullDoesNotFireBelowWindow(t *testing.T) {
 	// With fewer puts than the window, no state-change fires — warmup gate.
 	cache, emissions, mu := makeTelemetryCache(t, 2)
 	for i := 0; i < evictRateWindow-1; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -204,7 +204,7 @@ func TestTelemetry_CacheFullEmittedExactlyOnceUntilRecovered(t *testing.T) {
 	// exactly once, not once per put.
 	cache, emissions, mu := makeTelemetryCache(t, 4)
 	for i := 0; i < evictRateWindow+50; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	mu.Lock()
 	count := countContains(*emissions, "cache_full")
@@ -285,7 +285,7 @@ func TestTelemetry_ReportStatsDisabledSuppressesEmissions(t *testing.T) {
 	cache.processRequest("snapshot")
 	cache.emitStateChange("wrapper_connected")
 	for i := 0; i < evictRateWindow+10; i++ {
-		cache.Put(uniqueSQL(i), nil, []int{i}, nil)
+		cache.Put(uniqueSQL(i), nil, 0, []int{i}, nil)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -439,8 +439,8 @@ func TestTelemetry_SnapshotRequestReturnsResponse(t *testing.T) {
 	// Pre-populate the cache so the response carries non-zero counters,
 	// matching the Python integration test.
 	cache.invConnected = true
-	cache.Put("SELECT 1", nil, []int{1}, nil)
-	cache.Get("SELECT 1", nil)
+	cache.Put("SELECT 1", nil, 0, []int{1}, nil)
+	cache.Get("SELECT 1", nil, 0)
 	cache.invConnected = false
 
 	srv := newTelemetryServer(t)

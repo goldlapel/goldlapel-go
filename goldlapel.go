@@ -79,20 +79,20 @@ var (
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
 		"tls_cert": true, "tls_key": true, "tls_client_ca": true,
-		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
+		"disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
 		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
-		"disable_proxy_cache": true, "disable_pool": true,
+		"disable_pool": true,
 		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
 		"enable_coalescing": true,
 		"replica":           true, "exclude_tables": true,
 	}
 
 	booleanKeys = map[string]bool{
-		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
+		"disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
 		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
-		"disable_proxy_cache": true, "disable_pool": true,
+		"disable_pool": true,
 		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
 		"enable_coalescing": true,
 	}
@@ -304,19 +304,6 @@ func WithMeshTag(tag string) Option {
 	})
 }
 
-// WithEnableProxyCacheForWrappers opts the wrapper into the proxy's
-// shared proxy-cache layer. Default behaviour (option not provided):
-// false — the wrapper relies on its own per-process native cache, which
-// is sufficient for most deployments. Pass true for fleet customers
-// (multi-pod, frequent restarts, mesh) where the proxy cache still adds
-// value as a shared cache across short-lived wrapper processes.
-// Equivalent CLI flag: --enable-proxy-cache-for-wrappers. Construction-time only.
-func WithEnableProxyCacheForWrappers(enable bool) Option {
-	return startOnly(func(gl *GoldLapel) {
-		gl.enableProxyCacheForWrappers = enable
-	})
-}
-
 // WithDisableNativeCache disables the wrapper's per-process native
 // cache without touching its tuned size. When true, NativeCache.Get
 // always misses (ticking the misses counter) and NativeCache.Put is a
@@ -333,6 +320,67 @@ func WithDisableNativeCache(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.disableNativeCache = disable
 		gl.disableNativeCacheSet = true
+	})
+}
+
+// WithDisableProxyCache turns off the proxy's shared proxy-cache layer
+// (the upstream-side cache that lives in the binary, distinct from the
+// wrapper's native cache). When true, the proxy emits --disable-proxy-cache
+// so cache-eligible queries are passed straight through to Postgres.
+// Default (option omitted): proxy decides (today: enabled). Construction-time only.
+//
+// Equivalent CLI flag: --disable-proxy-cache.
+// Equivalent env var: GOLDLAPEL_DISABLE_PROXY_CACHE.
+func WithDisableProxyCache(disable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.disableProxyCache = disable
+		gl.disableProxyCacheSet = true
+	})
+}
+
+// WithDisableMatviews turns off the proxy's automatic materialised-view
+// rewrite layer. When true, the proxy emits --disable-matviews so no
+// materialised views are auto-created and existing rewrites do not fire.
+// Useful for low-write-pressure workloads where the matview maintenance
+// cost outweighs the read speedup. Default (option omitted): proxy
+// decides (today: enabled). Construction-time only.
+//
+// Equivalent CLI flag: --disable-matviews.
+// Equivalent env var: GOLDLAPEL_DISABLE_MATVIEWS.
+func WithDisableMatviews(disable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.disableMatviews = disable
+		gl.disableMatviewsSet = true
+	})
+}
+
+// WithDisableSqloptimize turns off the proxy's SQL-rewrite optimisation
+// pipeline (shadow-mode + coalescing). When true, the proxy emits
+// --disable-sqloptimize and per-kind rewrite/optimisation strategies are
+// skipped. Default (option omitted): proxy decides (today: enabled).
+// Construction-time only.
+//
+// Equivalent CLI flag: --disable-sqloptimize.
+// Equivalent env var: GOLDLAPEL_DISABLE_SQLOPTIMIZE.
+func WithDisableSqloptimize(disable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.disableSqloptimize = disable
+		gl.disableSqloptimizeSet = true
+	})
+}
+
+// WithDisableAutoIndexes turns off automatic index creation. When true,
+// the proxy emits --disable-auto-indexes so the various index-strategy
+// kinds (btree, trigram, expression, partial, ...) do not auto-provision
+// indexes against upstream. Default (option omitted): proxy decides
+// (today: enabled). Construction-time only.
+//
+// Equivalent CLI flag: --disable-auto-indexes.
+// Equivalent env var: GOLDLAPEL_DISABLE_AUTO_INDEXES.
+func WithDisableAutoIndexes(disable bool) Option {
+	return startOnly(func(gl *GoldLapel) {
+		gl.disableAutoIndexes = disable
+		gl.disableAutoIndexesSet = true
 	})
 }
 
@@ -490,9 +538,21 @@ type GoldLapel struct {
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
 	reportStats         bool    // native-cache telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
 	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
-	enableProxyCacheForWrappers bool // when true, emit --enable-proxy-cache-for-wrappers so the wrapper participates in the proxy cache
 	disableNativeCache          bool // when true, the wrapper's NativeCache acts as a no-op pass-through
 	disableNativeCacheSet       bool // true once WithDisableNativeCache was applied, so we know to push the value down to the cache singleton
+	// Proxy-side disable flags promoted out of the structured config map (Wave 3
+	// of the canonical surface). Each pairs with an *Set sentinel so spawn()
+	// can distinguish "user explicitly opted out" from "user left it alone";
+	// only set values are emitted to the binary, leaving the proxy free to
+	// honour its own defaults / env-var fallbacks.
+	disableProxyCache     bool
+	disableProxyCacheSet  bool
+	disableMatviews       bool
+	disableMatviewsSet    bool
+	disableSqloptimize    bool
+	disableSqloptimizeSet bool
+	disableAutoIndexes    bool
+	disableAutoIndexesSet bool
 
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
@@ -636,8 +696,23 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	if gl.meshTag != "" {
 		args = append(args, "--mesh-tag", gl.meshTag)
 	}
-	if gl.enableProxyCacheForWrappers {
-		args = append(args, "--enable-proxy-cache-for-wrappers")
+	// Promoted disable-flag options. Each emits a bare presence-flag when
+	// true — the proxy CLI surface doesn't have an "enable-X" counterpart,
+	// so WithDisable*(false) is a no-op (the proxy's default applies,
+	// modulo the corresponding GOLDLAPEL_DISABLE_X env var). The *Set
+	// sentinel is still tracked on the struct for diagnostic / future use
+	// (e.g. surfacing "user explicitly left it on" to telemetry).
+	if gl.disableProxyCache {
+		args = append(args, "--disable-proxy-cache")
+	}
+	if gl.disableMatviews {
+		args = append(args, "--disable-matviews")
+	}
+	if gl.disableSqloptimize {
+		args = append(args, "--disable-sqloptimize")
+	}
+	if gl.disableAutoIndexes {
+		args = append(args, "--disable-auto-indexes")
 	}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)

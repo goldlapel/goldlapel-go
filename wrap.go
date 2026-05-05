@@ -44,14 +44,23 @@ type FieldDescription struct {
 // CachedConn wraps a Querier (e.g. pgx.Conn) with the wrapper's native cache.
 // Reads are served from cache when possible. Writes trigger invalidation.
 // Transactions bypass the cache entirely.
+//
+// gucState is the per-connection unsafe-GUC fingerprint (Option Y) — folded
+// into every cache key so two CachedConns with different SET app.user_id
+// values can never share a cache slot. Mirrors the proxy's per-connection
+// guc_state. See guc_state.go for the design rationale.
 type CachedConn struct {
 	real          Querier
 	cache         *NativeCache
 	inTransaction bool
+	gucState      *ConnectionGucState
 }
 
 // Wrap wraps a Querier with the wrapper's native cache and starts the
-// invalidation listener if not already running.
+// invalidation listener if not already running. Each Wrap() call returns
+// a fresh CachedConn with its own per-connection GUC state — caller is
+// expected to bind one CachedConn per logical Postgres connection (the
+// same way pgx.Conn is goroutine-confined).
 func Wrap(conn Querier, invalidationPort int) *CachedConn {
 	cache := GetNativeCache()
 	if invalidationPort <= 0 {
@@ -61,9 +70,28 @@ func Wrap(conn Querier, invalidationPort int) *CachedConn {
 		cache.ConnectInvalidation(invalidationPort)
 	}
 	return &CachedConn{
-		real:  conn,
-		cache: cache,
+		real:     conn,
+		cache:    cache,
+		gucState: NewConnectionGucState(),
 	}
+}
+
+// GucStateHash returns the current unsafe-GUC fingerprint for this
+// connection. Exposed primarily for tests; production callers don't need
+// to introspect it (Get/Put thread it through internally).
+func (cc *CachedConn) GucStateHash() uint64 {
+	return cc.ensureGucState().Hash()
+}
+
+// ensureGucState lazily initialises the per-connection GUC state for
+// CachedConns built directly via struct literal (e.g. test fixtures that
+// pre-date the field). Wrap() always initialises gucState eagerly; this
+// method is the safety net for hand-rolled construction paths.
+func (cc *CachedConn) ensureGucState() *ConnectionGucState {
+	if cc.gucState == nil {
+		cc.gucState = NewConnectionGucState()
+	}
+	return cc.gucState
 }
 
 // lastStartedInstance tracks the most recently Start()ed *GoldLapel so that
@@ -102,6 +130,14 @@ func (cc *CachedConn) Unwrap() Querier {
 // Query intercepts SQL queries. Writes trigger invalidation and are forwarded.
 // Reads check the L1 cache first, falling back to the real connection on miss.
 func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
+	// Per-connection unsafe-GUC tracking. Every wire-bound SQL string is
+	// observed so a SET app.user_id='42' that arrives via Query (some
+	// drivers route bare SET through Query) updates the connection's
+	// state hash before the cache is consulted. ObserveSQL is no-op for
+	// non-SET statements and a fast single-statement path for the common
+	// case, so the overhead per call is a couple of string-prefix checks.
+	cc.ensureGucState().ObserveSQL(sql)
+
 	// Transaction tracking
 	if isTxStart(sql) {
 		cc.inTransaction = true
@@ -128,8 +164,10 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		return cc.real.Query(ctx, sql, args...)
 	}
 
+	stateHash := cc.ensureGucState().Hash()
+
 	// Read path: check L1 cache
-	entry := cc.cache.Get(sql, args)
+	entry := cc.cache.Get(sql, args, stateHash)
 	if entry != nil {
 		rows, ok := entry.Rows.([][]interface{})
 		if ok {
@@ -171,14 +209,16 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		}
 	}
 
-	// Cache the result
-	cc.cache.Put(sql, args, collected, fields)
+	// Cache the result under the current per-connection state hash.
+	cc.cache.Put(sql, args, stateHash, collected, fields)
 
 	return &cachedRows{rows: collected, fields: fields, pos: -1}, nil
 }
 
 // QueryRow intercepts single-row queries.
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
+	cc.ensureGucState().ObserveSQL(sql)
+
 	// Transaction tracking
 	if isTxStart(sql) {
 		cc.inTransaction = true
@@ -205,8 +245,10 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		return cc.real.QueryRow(ctx, sql, args...)
 	}
 
+	stateHash := cc.ensureGucState().Hash()
+
 	// Read path: check L1 cache
-	entry := cc.cache.Get(sql, args)
+	entry := cc.cache.Get(sql, args, stateHash)
 	if entry != nil {
 		rows, ok := entry.Rows.([][]interface{})
 		if ok && len(rows) > 0 {
@@ -215,7 +257,10 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		return &cachedRow{values: nil}
 	}
 
-	// Cache miss: use Query to fetch, cache, and return first row
+	// Cache miss: use Query to fetch, cache, and return first row.
+	// Query() will re-observe and re-hash; that's idempotent for the
+	// already-applied SET above (Apply on the same (name, value) pair
+	// leaves the hash unchanged) so we don't double-count.
 	rows, err := cc.Query(ctx, sql, args...)
 	if err != nil {
 		return &cachedRow{err: err}
@@ -233,8 +278,15 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 }
 
 // Exec intercepts write commands. It always forwards to the real connection
-// and invalidates the cache for any detected writes.
+// and invalidates the cache for any detected writes. Bare SET / RESET
+// statements typically arrive via Exec (no result rows), so this is the
+// most important hook point for unsafe-GUC tracking — without it, a client
+// that does `conn.Exec("SET app.user_id = '42'")` followed by
+// `conn.Query("SELECT ...")` would never have moved the state hash before
+// the cache lookup.
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
+	cc.ensureGucState().ObserveSQL(sql)
+
 	// Transaction tracking
 	if isTxStart(sql) {
 		cc.inTransaction = true
