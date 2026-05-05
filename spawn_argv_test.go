@@ -11,15 +11,15 @@ import (
 	"time"
 )
 
-// TestSpawnArgv_EnableL2ForWrappers verifies that WithEnableL2ForWrappers(true)
-// causes spawn() to pass --enable-l2-for-wrappers in the subprocess argv. We
-// can't introspect cmd.Args after Start returns (Start nils gl on failure and
-// teardownLocked nils gl.cmd on the success path), so we use the same
-// fake-binary pattern as TestSubprocessCleanupOnConnectFailure: point
-// GOLDLAPEL_BINARY at a shell script that records "$@" to a file and never
-// binds a port. Start fails at the port-readiness poll; we then read the
-// captured argv off disk.
-func TestSpawnArgv_EnableL2ForWrappers(t *testing.T) {
+// TestSpawnArgv_EnableProxyCacheForWrappers verifies that
+// WithEnableProxyCacheForWrappers(true) causes spawn() to pass
+// --enable-proxy-cache-for-wrappers in the subprocess argv. We can't introspect
+// cmd.Args after Start returns (Start nils gl on failure and teardownLocked
+// nils gl.cmd on the success path), so we use the same fake-binary pattern as
+// TestSubprocessCleanupOnConnectFailure: point GOLDLAPEL_BINARY at a shell
+// script that records "$@" to a file and never binds a port. Start fails at
+// the port-readiness poll; we then read the captured argv off disk.
+func TestSpawnArgv_EnableProxyCacheForWrappers(t *testing.T) {
 	dir := t.TempDir()
 	argvFile := filepath.Join(dir, "argv.txt")
 	binPath := filepath.Join(dir, "goldlapel-fake")
@@ -43,7 +43,7 @@ exec sleep 60
 
 	gl, err := Start(ctx, "postgresql://user:pass@localhost:5432/db",
 		WithProxyPort(17742),
-		WithEnableL2ForWrappers(true),
+		WithEnableProxyCacheForWrappers(true),
 		WithSilent(true),
 		WithDashboardPort(0),
 		WithInvalidationPort(0),
@@ -61,15 +61,15 @@ exec sleep 60
 	}
 	args := strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	if !containsArg(args, "--enable-l2-for-wrappers") {
-		t.Fatalf("expected --enable-l2-for-wrappers in spawned argv, got %v", args)
+	if !containsArg(args, "--enable-proxy-cache-for-wrappers") {
+		t.Fatalf("expected --enable-proxy-cache-for-wrappers in spawned argv, got %v", args)
 	}
 }
 
-// TestSpawnArgv_EnableL2ForWrappers_DefaultOmitted verifies that when the
-// option is not provided, the flag does NOT appear in the argv (so the
+// TestSpawnArgv_EnableProxyCacheForWrappers_DefaultOmitted verifies that when
+// the option is not provided, the flag does NOT appear in the argv (so the
 // proxy applies its own default of wrapper-skip).
-func TestSpawnArgv_EnableL2ForWrappers_DefaultOmitted(t *testing.T) {
+func TestSpawnArgv_EnableProxyCacheForWrappers_DefaultOmitted(t *testing.T) {
 	dir := t.TempDir()
 	argvFile := filepath.Join(dir, "argv.txt")
 	binPath := filepath.Join(dir, "goldlapel-fake")
@@ -105,8 +105,8 @@ exec sleep 60
 	}
 	args := strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	if containsArg(args, "--enable-l2-for-wrappers") {
-		t.Fatalf("did not expect --enable-l2-for-wrappers in spawned argv when option not provided, got %v", args)
+	if containsArg(args, "--enable-proxy-cache-for-wrappers") {
+		t.Fatalf("did not expect --enable-proxy-cache-for-wrappers in spawned argv when option not provided, got %v", args)
 	}
 }
 

@@ -74,15 +74,15 @@ var (
 		"min_pattern_count": true, "refresh_interval_secs": true,
 		"pattern_ttl_secs": true, "max_tables_per_view": true, "max_columns_per_view": true,
 		"deep_pagination_threshold": true, "report_interval_secs": true,
-		"result_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
+		"proxy_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
 		"pool_size": true, "pool_timeout_secs": true, "pool_mode": true,
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
 		"tls_cert": true, "tls_key": true, "tls_client_ca": true,
 		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
-		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
-		"disable_result_cache": true, "disable_pool": true,
+		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
+		"disable_proxy_cache": true, "disable_pool": true,
 		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
 		"enable_coalescing": true,
 		"replica":           true, "exclude_tables": true,
@@ -91,8 +91,8 @@ var (
 	booleanKeys = map[string]bool{
 		"disable_matviews": true, "disable_consolidation": true, "disable_btree_indexes": true,
 		"disable_trigram_indexes": true, "disable_expression_indexes": true,
-		"disable_partial_indexes": true, "disable_rewrite": true, "disable_prepared_cache": true,
-		"disable_result_cache": true, "disable_pool": true,
+		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
+		"disable_proxy_cache": true, "disable_pool": true,
 		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
 		"enable_coalescing": true,
 	}
@@ -265,7 +265,7 @@ func WithSilent(silent bool) Option {
 	})
 }
 
-// WithReportStats toggles L1 telemetry emission to the proxy. When true
+// WithReportStats toggles native-cache telemetry emission to the proxy. When true
 // (the default), the wrapper's local cache emits state-change events
 // (wrapper_connected, wrapper_disconnected, cache_full, cache_recovered)
 // and replies to ?:snapshot requests on the existing invalidation socket
@@ -304,34 +304,35 @@ func WithMeshTag(tag string) Option {
 	})
 }
 
-// WithEnableL2ForWrappers opts the wrapper into the proxy's L2 (shared
-// result cache) layer. Default behaviour (option not provided): false —
-// the wrapper relies on its own per-process L1, which is sufficient for
-// most deployments. Pass true for fleet customers (multi-pod, frequent
-// restarts, mesh) where L2 still adds value as a shared cache across
-// short-lived wrapper processes.
-// Equivalent CLI flag: --enable-l2-for-wrappers. Construction-time only.
-func WithEnableL2ForWrappers(enable bool) Option {
+// WithEnableProxyCacheForWrappers opts the wrapper into the proxy's
+// shared proxy-cache layer. Default behaviour (option not provided):
+// false — the wrapper relies on its own per-process native cache, which
+// is sufficient for most deployments. Pass true for fleet customers
+// (multi-pod, frequent restarts, mesh) where the proxy cache still adds
+// value as a shared cache across short-lived wrapper processes.
+// Equivalent CLI flag: --enable-proxy-cache-for-wrappers. Construction-time only.
+func WithEnableProxyCacheForWrappers(enable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
-		gl.enableL2ForWrappers = enable
+		gl.enableProxyCacheForWrappers = enable
 	})
 }
 
-// WithDisableL1 disables the wrapper's per-process L1 cache without
-// touching its tuned size. When true, NativeCache.Get always misses
-// (ticking the misses counter) and NativeCache.Put is a silent no-op;
-// hits and evictions stay at zero. The invalidation goroutine continues
-// to run so telemetry signal flow (wrapper_connected, snapshot replies)
-// keeps working — Manor and the dashboard still see the wrapper even
-// when L1 is off. Default (option omitted): false.
+// WithDisableNativeCache disables the wrapper's per-process native
+// cache without touching its tuned size. When true, NativeCache.Get
+// always misses (ticking the misses counter) and NativeCache.Put is a
+// silent no-op; hits and evictions stay at zero. The invalidation
+// goroutine continues to run so telemetry signal flow
+// (wrapper_connected, snapshot replies) keeps working — Manor and the
+// dashboard still see the wrapper even when the native cache is off.
+// Default (option omitted): false.
 //
-// Orthogonal to WithConfig("result_cache_size", 0): customers who want
-// to toggle L1 off/on without losing their tuned cache size should use
-// this option. Construction-time only.
-func WithDisableL1(disable bool) Option {
+// Orthogonal to WithConfig("proxy_cache_size", 0): customers who want
+// to toggle the native cache off/on without losing their tuned cache
+// size should use this option. Construction-time only.
+func WithDisableNativeCache(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
-		gl.disableL1 = disable
-		gl.disableL1Set = true
+		gl.disableNativeCache = disable
+		gl.disableNativeCacheSet = true
 	})
 }
 
@@ -487,11 +488,11 @@ type GoldLapel struct {
 	silent              bool    // when true, printBanner is a no-op
 	mesh                bool    // startup mesh intent (emits --mesh)
 	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
-	reportStats         bool    // L1 telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
+	reportStats         bool    // native-cache telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
 	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
-	enableL2ForWrappers bool    // when true, emit --enable-l2-for-wrappers so the wrapper participates in L2
-	disableL1           bool    // when true, the wrapper's L1 NativeCache acts as a no-op pass-through
-	disableL1Set        bool    // true once WithDisableL1 was applied, so we know to push the value down to the cache singleton
+	enableProxyCacheForWrappers bool // when true, emit --enable-proxy-cache-for-wrappers so the wrapper participates in the proxy cache
+	disableNativeCache          bool // when true, the wrapper's NativeCache acts as a no-op pass-through
+	disableNativeCacheSet       bool // true once WithDisableNativeCache was applied, so we know to push the value down to the cache singleton
 
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
@@ -571,12 +572,12 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 	if gl.reportStatsSet {
 		GetNativeCache().SetReportStats(gl.reportStats)
 	}
-	// Push WithDisableL1 down to the singleton cache so any subsequent
-	// Wrap() call observes the no-op pass-through behaviour. Same
-	// pattern as reportStats — only stamp when explicitly set so the
-	// cache's default (false) stands when the option wasn't passed.
-	if gl.disableL1Set {
-		GetNativeCache().SetDisableL1(gl.disableL1)
+	// Push WithDisableNativeCache down to the singleton cache so any
+	// subsequent Wrap() call observes the no-op pass-through behaviour.
+	// Same pattern as reportStats — only stamp when explicitly set so
+	// the cache's default (false) stands when the option wasn't passed.
+	if gl.disableNativeCacheSet {
+		GetNativeCache().SetDisableNativeCache(gl.disableNativeCache)
 	}
 	registerStartedInstance(gl)
 	return gl, nil
@@ -635,8 +636,8 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	if gl.meshTag != "" {
 		args = append(args, "--mesh-tag", gl.meshTag)
 	}
-	if gl.enableL2ForWrappers {
-		args = append(args, "--enable-l2-for-wrappers")
+	if gl.enableProxyCacheForWrappers {
+		args = append(args, "--enable-proxy-cache-for-wrappers")
 	}
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)
@@ -1270,7 +1271,7 @@ func WrapperVersion() string {
 
 // ApplicationNameMarker returns the application_name string the wrapper sets
 // on PG connections so the proxy can classify wrapper-vs-raw traffic and
-// gate L2 result cache (the wrapper has its own L1; raw clients don't).
+// gate the proxy cache (the wrapper has its own native cache; raw clients don't).
 func ApplicationNameMarker() string {
 	return "goldlapel:go:" + WrapperVersion()
 }

@@ -970,83 +970,83 @@ func TestWithMesh_NotInConfigKeys(t *testing.T) {
 	}
 }
 
-// --- WithEnableL2ForWrappers ---
+// --- WithEnableProxyCacheForWrappers ---
 
-func TestWithEnableL2ForWrappers_Default(t *testing.T) {
+func TestWithEnableProxyCacheForWrappers_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.enableL2ForWrappers {
-		t.Fatal("expected enableL2ForWrappers=false by default")
+	if gl.enableProxyCacheForWrappers {
+		t.Fatal("expected enableProxyCacheForWrappers=false by default")
 	}
 }
 
-func TestWithEnableL2ForWrappers_SetsTopLevelField(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableL2ForWrappers(true))
-	if !gl.enableL2ForWrappers {
-		t.Fatal("expected enableL2ForWrappers=true")
+func TestWithEnableProxyCacheForWrappers_SetsTopLevelField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableProxyCacheForWrappers(true))
+	if !gl.enableProxyCacheForWrappers {
+		t.Fatal("expected enableProxyCacheForWrappers=true")
 	}
 }
 
-func TestWithEnableL2ForWrappers_FalseLeavesFieldOff(t *testing.T) {
+func TestWithEnableProxyCacheForWrappers_FalseLeavesFieldOff(t *testing.T) {
 	// Explicit opt-out must not flip the field on, matching WithSilent(false).
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableL2ForWrappers(false))
-	if gl.enableL2ForWrappers {
-		t.Fatal("expected WithEnableL2ForWrappers(false) to leave enableL2ForWrappers=false")
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithEnableProxyCacheForWrappers(false))
+	if gl.enableProxyCacheForWrappers {
+		t.Fatal("expected WithEnableProxyCacheForWrappers(false) to leave enableProxyCacheForWrappers=false")
 	}
 }
 
-func TestWithEnableL2ForWrappers_NotInConfigKeys(t *testing.T) {
-	// enable_l2_for_wrappers is a top-level option, not a tuning knob in
+func TestWithEnableProxyCacheForWrappers_NotInConfigKeys(t *testing.T) {
+	// enable_proxy_cache_for_wrappers is a top-level option, not a tuning knob in
 	// the structured config map.
 	keys := ConfigKeys()
 	for _, k := range keys {
-		if k == "enable_l2_for_wrappers" {
-			t.Fatalf("enable_l2_for_wrappers must not appear in ConfigKeys(); got %q", k)
+		if k == "enable_proxy_cache_for_wrappers" {
+			t.Fatalf("enable_proxy_cache_for_wrappers must not appear in ConfigKeys(); got %q", k)
 		}
 	}
 }
 
-// --- WithDisableL1 ---
+// --- WithDisableNativeCache ---
 
-func TestWithDisableL1_Default(t *testing.T) {
+func TestWithDisableNativeCache_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableL1 {
-		t.Fatal("expected disableL1=false by default")
+	if gl.disableNativeCache {
+		t.Fatal("expected disableNativeCache=false by default")
 	}
-	if gl.disableL1Set {
-		t.Fatal("expected disableL1Set=false when option not provided")
-	}
-}
-
-func TestWithDisableL1_TrueSetsField(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableL1(true))
-	if !gl.disableL1 {
-		t.Fatal("expected disableL1=true")
-	}
-	if !gl.disableL1Set {
-		t.Fatal("expected disableL1Set=true after WithDisableL1")
+	if gl.disableNativeCacheSet {
+		t.Fatal("expected disableNativeCacheSet=false when option not provided")
 	}
 }
 
-func TestWithDisableL1_FalseStillStampsCache(t *testing.T) {
-	// Explicit WithDisableL1(false) must mark disableL1Set so Start
-	// pushes the value down to the cache (re-enabling L1 if a previous
-	// run had disabled it on the singleton).
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableL1(false))
-	if gl.disableL1 {
-		t.Fatal("expected disableL1=false")
+func TestWithDisableNativeCache_TrueSetsField(t *testing.T) {
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableNativeCache(true))
+	if !gl.disableNativeCache {
+		t.Fatal("expected disableNativeCache=true")
 	}
-	if !gl.disableL1Set {
-		t.Fatal("expected disableL1Set=true even with explicit WithDisableL1(false)")
+	if !gl.disableNativeCacheSet {
+		t.Fatal("expected disableNativeCacheSet=true after WithDisableNativeCache")
 	}
 }
 
-func TestWithDisableL1_NotInConfigKeys(t *testing.T) {
-	// disable_l1 is a top-level option, not a tuning knob in the
+func TestWithDisableNativeCache_FalseStillStampsCache(t *testing.T) {
+	// Explicit WithDisableNativeCache(false) must mark disableNativeCacheSet so
+	// Start pushes the value down to the cache (re-enabling the native cache if
+	// a previous run had disabled it on the singleton).
+	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableNativeCache(false))
+	if gl.disableNativeCache {
+		t.Fatal("expected disableNativeCache=false")
+	}
+	if !gl.disableNativeCacheSet {
+		t.Fatal("expected disableNativeCacheSet=true even with explicit WithDisableNativeCache(false)")
+	}
+}
+
+func TestWithDisableNativeCache_NotInConfigKeys(t *testing.T) {
+	// disable_native_cache is a top-level option, not a tuning knob in the
 	// structured config map (mirroring WithSilent/WithMesh/etc.).
 	keys := ConfigKeys()
 	for _, k := range keys {
-		if k == "disable_l1" {
-			t.Fatalf("disable_l1 must not appear in ConfigKeys(); got %q", k)
+		if k == "disable_native_cache" {
+			t.Fatalf("disable_native_cache must not appear in ConfigKeys(); got %q", k)
 		}
 	}
 }

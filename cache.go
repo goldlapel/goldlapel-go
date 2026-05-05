@@ -72,13 +72,14 @@ type NativeCache struct {
 	counter      uint64
 	maxEntries   int
 	enabled      bool
-	// disabled is the explicit WithDisableL1 toggle — orthogonal to
+	// disabled is the explicit WithDisableNativeCache toggle — orthogonal to
 	// `enabled` (which is the GOLDLAPEL_NATIVE_CACHE env-var kill-switch)
 	// and to maxEntries. When true, Get always returns nil (incrementing
 	// misses, never hits, never evictions) and Put is a silent no-op.
 	// The invalidation goroutine continues to run so telemetry signal
 	// flow (wrapper_connected / snapshot replies) keeps working — Manor
-	// and the dashboard still need to see the wrapper even when L1 is off.
+	// and the dashboard still need to see the wrapper even when the
+	// native cache is off.
 	disabled     bool
 	mu           sync.Mutex
 	invConnected bool
@@ -270,21 +271,23 @@ func (nc *NativeCache) ReportStatsEnabled() bool {
 	return nc.reportStats
 }
 
-// SetDisableL1 toggles the explicit L1 no-op pass-through. Wired through
-// goldlapel.Start's WithDisableL1 option so library users can disable L1
-// without losing their tuned cache size (passing WithConfig("result_cache_size", 0)
-// would force them to). Safe to call before or after ConnectInvalidation;
-// the new value takes effect on the next Get/Put.
-func (nc *NativeCache) SetDisableL1(disable bool) {
+// SetDisableNativeCache toggles the explicit native-cache no-op
+// pass-through. Wired through goldlapel.Start's WithDisableNativeCache
+// option so library users can disable the native cache without losing
+// their tuned cache size (passing WithConfig("proxy_cache_size", 0)
+// would force them to). Safe to call before or after
+// ConnectInvalidation; the new value takes effect on the next Get/Put.
+func (nc *NativeCache) SetDisableNativeCache(disable bool) {
 	nc.mu.Lock()
 	nc.disabled = disable
 	nc.mu.Unlock()
 }
 
-// DisableL1 reports whether L1 is currently in no-op pass-through mode.
-// Exposed primarily for tests; production callers shouldn't need to gate
-// on this — Get/Put already short-circuit internally.
-func (nc *NativeCache) DisableL1() bool {
+// DisableNativeCache reports whether the native cache is currently in
+// no-op pass-through mode. Exposed primarily for tests; production
+// callers shouldn't need to gate on this — Get/Put already
+// short-circuit internally.
+func (nc *NativeCache) DisableNativeCache() bool {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	return nc.disabled
@@ -343,7 +346,7 @@ func (nc *NativeCache) Get(sql string, args []interface{}) *cacheEntry {
 		nc.mu.Unlock()
 		return nil
 	}
-	// disabled L1: tick misses (callers measure miss rate), never hit.
+	// disabled native cache: tick misses (callers measure miss rate), never hit.
 	// Skip the key-build + cache lookup entirely — no point. Hits and
 	// evictions stay at zero by definition; only misses move.
 	if nc.disabled {
@@ -373,8 +376,8 @@ func (nc *NativeCache) Put(sql string, args []interface{}, rows interface{}, fie
 		nc.mu.Unlock()
 		return
 	}
-	// disabled L1: silent no-op. Don't touch cache state, don't touch
-	// the eviction-rate window, don't bump counters — the layer is off.
+	// disabled native cache: silent no-op. Don't touch cache state, don't
+	// touch the eviction-rate window, don't bump counters — the layer is off.
 	if nc.disabled {
 		nc.mu.Unlock()
 		return
@@ -694,10 +697,12 @@ func (nc *NativeCache) recordEvictionLocked(evicted int) {
 // snapshot is the JSON shape the proxy aggregates per-tick. The proxy
 // parses these structurally; field names + types must match the
 // canonical pattern across all wrapper languages exactly. The State
-// field is populated only on S: emissions. L1Disabled is surfaced only
-// when the wrapper has explicit WithDisableL1(true) — older proxies
-// that don't know the field will simply ignore it; HQ/Manor consumers
-// that do know it can render the wrapper's L1 state correctly.
+// field is populated only on S: emissions. Disabled is surfaced only
+// when the wrapper has explicit WithDisableNativeCache(true) — older
+// proxies that don't know the field will simply ignore it; HQ/Manor
+// consumers that do know it can render the wrapper's native-cache
+// state correctly. The field lives nested under native_cache.wrappers[]
+// in aggregated wire shape, so the short name disambiguates by context.
 type snapshot struct {
 	WrapperID          string `json:"wrapper_id"`
 	Lang               string `json:"lang"`
@@ -710,7 +715,7 @@ type snapshot struct {
 	CapacityEntries    int    `json:"capacity_entries"`
 	TsMs               int64  `json:"ts_ms"`
 	State              string `json:"state,omitempty"`
-	L1Disabled         bool   `json:"l1_disabled,omitempty"`
+	Disabled           bool   `json:"disabled,omitempty"`
 }
 
 // buildSnapshot reads counters + size in a single critical section so
@@ -732,7 +737,7 @@ func (nc *NativeCache) buildSnapshot() snapshot {
 		Invalidations:      atomic.LoadInt64(&nc.statsInvalidations),
 		CurrentSizeEntries: size,
 		CapacityEntries:    nc.maxEntries,
-		L1Disabled:         disabled,
+		Disabled:           disabled,
 	}
 }
 

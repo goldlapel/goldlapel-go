@@ -26,7 +26,7 @@ func startForStreams(t *testing.T) *GoldLapel {
 		WithProxyPort(port),
 		WithInvalidationPort(0),
 		WithConfig(map[string]interface{}{
-			"disable_result_cache":  true,
+			"disable_proxy_cache":   true,
 			"disable_consolidation": true,
 		}),
 	)

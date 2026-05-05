@@ -41,7 +41,7 @@ type FieldDescription struct {
 	Name string
 }
 
-// CachedConn wraps a Querier (e.g. pgx.Conn) with L1 native cache.
+// CachedConn wraps a Querier (e.g. pgx.Conn) with the wrapper's native cache.
 // Reads are served from cache when possible. Writes trigger invalidation.
 // Transactions bypass the cache entirely.
 type CachedConn struct {
@@ -50,8 +50,8 @@ type CachedConn struct {
 	inTransaction bool
 }
 
-// Wrap wraps a Querier with L1 native cache and starts the invalidation
-// listener if not already running.
+// Wrap wraps a Querier with the wrapper's native cache and starts the
+// invalidation listener if not already running.
 func Wrap(conn Querier, invalidationPort int) *CachedConn {
 	cache := GetNativeCache()
 	if invalidationPort <= 0 {
