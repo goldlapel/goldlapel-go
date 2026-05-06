@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // ErrNoRows is returned by Row.Scan when the query returns no rows.
@@ -49,11 +50,59 @@ type FieldDescription struct {
 // into every cache key so two CachedConns with different SET app.user_id
 // values can never share a cache slot. Mirrors the proxy's per-connection
 // guc_state. See guc_state.go for the design rationale.
+//
+// Verify lifecycle:
+//
+//   - Every Query/QueryRow/Exec runs maybeVerifyOnCheckout before touching
+//     the cache. If gucState.IsDirty() returns true (a prior call observed
+//     a top-level SELECT <ident>(...) that may have done a server-side
+//     SET) the wrapper re-reads pg_settings on the same connection and
+//     Reseeds the unsafe-GUC value map. This is the safety net for
+//     stored-function SETs the wire layer can't see.
+//
+//   - After observing a top-level SELECT <ident>(...) the wrapper marks
+//     dirty and schedules an async verify in a background goroutine
+//     (verifyWG / verifyCtx). The async path keeps the user's hot path
+//     unblocked; the next checkout still re-runs verify if the async
+//     path lost the race or hadn't completed yet.
+//
+//   - Close() cancels the in-flight verify goroutines via verifyCancel
+//     and waits on verifyWG. Users that rely on pgx.Conn's own Close()
+//     should call cc.Close() first to avoid leaving verify goroutines
+//     dangling against a torn-down connection.
 type CachedConn struct {
 	real          Querier
 	cache         *NativeCache
 	inTransaction bool
 	gucState      *ConnectionGucState
+
+	// gucStateOnce gates lazy init of gucState for struct-literal
+	// CachedConn instances (Wrap() initialises eagerly; this is the
+	// safety net for test fixtures and hand-rolled construction).
+	gucStateOnce sync.Once
+
+	// Verify lifecycle. verifyCtx is the cancellation signal for in-flight
+	// async verify goroutines; verifyCancel terminates them at Close(); and
+	// verifyWG tracks them so Close() can wait for orderly exit.
+	// verifyOnce gates lazy init of these fields — Wrap() initialises
+	// eagerly, but struct-literal CachedConn instances (test fixtures) get
+	// initialisation on first use.
+	verifyOnce   sync.Once
+	verifyCtx    context.Context
+	verifyCancel context.CancelFunc
+	verifyWG     sync.WaitGroup
+
+	// inFlightVerify gates the async post-call path so a burst of
+	// SELECT <fn>() calls only schedules ONE verify goroutine at a time.
+	// Acts as a small concurrency limiter — if a verify is already in
+	// flight, subsequent triggers no-op (the verify will pick up any
+	// state mutations they would have caused). atomic.Bool because the
+	// hot path needs to compare-and-set without taking a mutex.
+	inFlightVerify atomic.Bool
+
+	// closed is set by Close() to suppress further async verify
+	// scheduling. Atomic for the same reason as inFlightVerify.
+	closed atomic.Bool
 }
 
 // Wrap wraps a Querier with the wrapper's native cache and starts the
@@ -87,11 +136,193 @@ func (cc *CachedConn) GucStateHash() uint64 {
 // CachedConns built directly via struct literal (e.g. test fixtures that
 // pre-date the field). Wrap() always initialises gucState eagerly; this
 // method is the safety net for hand-rolled construction paths.
+//
+// Concurrency-safe via gucStateOnce — concurrent first-use across
+// multiple goroutines is well-defined (one initialiser runs, all see
+// the same pointer).
 func (cc *CachedConn) ensureGucState() *ConnectionGucState {
-	if cc.gucState == nil {
-		cc.gucState = NewConnectionGucState()
-	}
+	cc.gucStateOnce.Do(func() {
+		if cc.gucState == nil {
+			cc.gucState = NewConnectionGucState()
+		}
+	})
 	return cc.gucState
+}
+
+// ensureVerifyCtx lazily initialises the verify lifecycle. Idempotent
+// via verifyOnce; safe to call from any goroutine before scheduling an
+// async verify.
+func (cc *CachedConn) ensureVerifyCtx() {
+	cc.verifyOnce.Do(func() {
+		cc.verifyCtx, cc.verifyCancel = context.WithCancel(context.Background())
+	})
+}
+
+// Close cancels any in-flight verify goroutines and waits for them to
+// exit. Safe to call multiple times; subsequent calls no-op. After
+// Close, async verify scheduling is suppressed (a follow-up
+// Query/QueryRow/Exec still works against the underlying Querier — only
+// the verify-on-checkout path is suppressed, since dispatching
+// verify against a connection the caller is about to discard would
+// race with the caller's own teardown).
+//
+// Close does NOT close the underlying Querier — that's the caller's
+// responsibility. Close exists so that callers running pgx.Conn or
+// pgxpool can drop the wrapper and its verify goroutines cleanly.
+//
+// Idiomatic usage:
+//
+//	cc := goldlapel.Wrap(conn, port)
+//	defer cc.Close()
+//	... // queries go here
+func (cc *CachedConn) Close() {
+	if !cc.closed.CompareAndSwap(false, true) {
+		return
+	}
+	cc.ensureVerifyCtx()
+	if cc.verifyCancel != nil {
+		cc.verifyCancel()
+	}
+	cc.verifyWG.Wait()
+}
+
+// maybeVerifyOnCheckout runs a synchronous verify if the connection's
+// GUC state is dirty. Called from Query/QueryRow/Exec immediately
+// before the cache lookup — the verify rebuilds state from
+// pg_settings so the cache key reflects the server's actual session
+// state, not stale wire-side observations.
+//
+// Verify failure (the underlying connection errors out) is logged
+// implicitly via the error path of cc.real.Query; we treat the state
+// as untrustworthy and leave the dirty flag set. The caller's query
+// then proceeds against the same Querier — if the connection is
+// genuinely broken, the user's call will surface the same error. We
+// never block the user on a verify error.
+//
+// Inside a transaction the cache is bypassed regardless of state, so
+// verify is skipped — the dirty flag will be re-evaluated on the next
+// post-commit checkout.
+func (cc *CachedConn) maybeVerifyOnCheckout(ctx context.Context) {
+	if cc.inTransaction {
+		return
+	}
+	state := cc.ensureGucState()
+	if !state.IsDirty() {
+		return
+	}
+	cc.runVerify(ctx)
+}
+
+// runVerify reads `pg_settings WHERE source = 'session'` directly from
+// the underlying Querier and Reseeds the GUC state map. Synchronous —
+// callers that need the async variant call scheduleAsyncVerify
+// instead. Returns nothing because errors are intentionally swallowed:
+// a transient verify failure leaves the dirty flag set so the next
+// checkout retries.
+//
+// The verify SQL filters to source='session' so we only see GUCs the
+// user actually changed (default values stay out of the map).
+// Reseed's filter then drops anything that isn't an unsafe GUC, so
+// the final state map matches the canonical SET-observed shape.
+func (cc *CachedConn) runVerify(ctx context.Context) {
+	const verifySQL = "SELECT name, setting FROM pg_settings WHERE source = 'session'"
+	rows, err := cc.real.Query(ctx, verifySQL)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	values := make(map[string]string)
+	for rows.Next() {
+		vals, vErr := rows.Values()
+		if vErr != nil {
+			return
+		}
+		if len(vals) < 2 {
+			continue
+		}
+		name, _ := vals[0].(string)
+		setting, _ := vals[1].(string)
+		if name == "" {
+			continue
+		}
+		values[name] = setting
+	}
+	if rows.Err() != nil {
+		return
+	}
+	cc.ensureGucState().Reseed(values)
+}
+
+// shouldScheduleVerifyAfter reports whether the wrapper should mark
+// the connection dirty + schedule an async verify after this SQL
+// completes. True for top-level `SELECT <ident>(...)` shapes that
+// AREN'T already covered by inline parsing (set_config). The wrapper's
+// ObserveSQL has already extracted state from set_config calls, so
+// they don't need a follow-up verify; arbitrary other functions are
+// the post-call-verify case the spec calls out.
+//
+// The verify SQL itself (`SELECT name, setting FROM pg_settings ...`)
+// is a column-projection SELECT, not a bare function call, so
+// IsTopLevelFunctionCall returns false — no recursion concern.
+func (cc *CachedConn) shouldScheduleVerifyAfter(sql string) bool {
+	if !IsTopLevelFunctionCall(sql) {
+		return false
+	}
+	// A top-level set_config(...) is a recognised SET-equivalent — the
+	// wrapper's ObserveSQL has already extracted name/value from it
+	// and updated the state map. Scheduling a verify for it would be
+	// redundant work + would set the dirty flag the verify would then
+	// have to clear.
+	if cmd := ParseSetCommand(sql); cmd.Kind != SetCmdNone {
+		return false
+	}
+	return true
+}
+
+// scheduleAsyncVerify spawns a background goroutine that calls
+// runVerify. Used after observing a top-level SELECT <ident>(...) so
+// any server-side SET inside the function body is reflected in our
+// state map without blocking the user's hot path.
+//
+// Concurrency-limited: if a verify is already in flight on this
+// connection, the new trigger no-ops. The in-flight verify will pick
+// up any state mutations the new trigger would have refreshed.
+//
+// Goroutine-leak protection:
+//   - Close() cancels verifyCtx, terminating any in-flight verify when
+//     the underlying Query returns or its context is observed.
+//   - Close() waits on verifyWG, so callers that defer cc.Close()
+//     don't race with verify completion.
+//   - Once Close has been called, scheduleAsyncVerify is a no-op
+//     (closed atomic check) — no new goroutines are dispatched.
+//
+// The user's calling-context is intentionally NOT propagated into
+// the verify goroutine — the user's ctx is bound to their statement
+// lifetime, but verify must run AFTER the user's call completes (the
+// statement may have moved server state). We use the long-lived
+// verifyCtx (cancelled only by Close) so verify can outlive the
+// triggering call.
+func (cc *CachedConn) scheduleAsyncVerify() {
+	if cc.closed.Load() {
+		return
+	}
+	if !cc.inFlightVerify.CompareAndSwap(false, true) {
+		return
+	}
+	cc.ensureVerifyCtx()
+	cc.verifyWG.Add(1)
+	go func() {
+		defer cc.verifyWG.Done()
+		defer cc.inFlightVerify.Store(false)
+		// Run verify against the long-lived verifyCtx; if Close()
+		// has cancelled it, runVerify's underlying Query will
+		// observe ctx.Err() and return without mutating state. We
+		// don't short-circuit on closed.Load() here — once we've
+		// passed the schedule-time closed check + incremented WG,
+		// completing the verify (or letting it observe its own ctx
+		// cancellation) is the simpler invariant.
+		cc.runVerify(cc.verifyCtx)
+	}()
 }
 
 // lastStartedInstance tracks the most recently Start()ed *GoldLapel so that
@@ -130,6 +361,14 @@ func (cc *CachedConn) Unwrap() Querier {
 // Query intercepts SQL queries. Writes trigger invalidation and are forwarded.
 // Reads check the L1 cache first, falling back to the real connection on miss.
 func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
+	// Verify-on-checkout — if a prior call observed a SQL shape that
+	// could have moved server state without us seeing the SET (e.g.
+	// `SELECT my_func()` whose body did `SET app.user_id`), the dirty
+	// flag is set and we re-read pg_settings before the cache lookup.
+	// No-op outside a transaction with a clean state. Inside a tx the
+	// cache is bypassed regardless, so verify is also skipped.
+	cc.maybeVerifyOnCheckout(ctx)
+
 	// Per-connection unsafe-GUC tracking. Every wire-bound SQL string is
 	// observed so a SET app.user_id='42' that arrives via Query (some
 	// drivers route bare SET through Query) updates the connection's
@@ -137,6 +376,16 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	// non-SET statements and a fast single-statement path for the common
 	// case, so the overhead per call is a couple of string-prefix checks.
 	cc.ensureGucState().ObserveSQL(sql)
+
+	// Top-level SELECT <ident>(...) shapes are stored-function calls
+	// whose body may have done a server-side SET we'll never see on
+	// the wire. Mark the connection dirty (the next checkout will
+	// verify) and schedule an async verify so the dirty window is
+	// short. Excludes set_config — already handled inline by ObserveSQL.
+	if cc.shouldScheduleVerifyAfter(sql) {
+		cc.ensureGucState().MarkDirty()
+		defer cc.scheduleAsyncVerify()
+	}
 
 	// Multi-statement-aware write detection runs before any short-circuit
 	// — a body like `BEGIN; INSERT INTO orders VALUES (1); COMMIT` must
@@ -233,7 +482,12 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 
 // QueryRow intercepts single-row queries.
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
+	cc.maybeVerifyOnCheckout(ctx)
 	cc.ensureGucState().ObserveSQL(sql)
+	if cc.shouldScheduleVerifyAfter(sql) {
+		cc.ensureGucState().MarkDirty()
+		defer cc.scheduleAsyncVerify()
+	}
 
 	// Multi-statement-aware write detection runs ahead of any short-circuit
 	// — see Query() for the full rationale.
@@ -304,7 +558,12 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 // `conn.Query("SELECT ...")` would never have moved the state hash before
 // the cache lookup.
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
+	cc.maybeVerifyOnCheckout(ctx)
 	cc.ensureGucState().ObserveSQL(sql)
+	if cc.shouldScheduleVerifyAfter(sql) {
+		cc.ensureGucState().MarkDirty()
+		defer cc.scheduleAsyncVerify()
+	}
 
 	// Multi-statement-aware write detection — runs ahead of tx tracking
 	// so a `BEGIN; INSERT INTO t ...; COMMIT` body still invalidates t.

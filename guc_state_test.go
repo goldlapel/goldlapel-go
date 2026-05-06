@@ -486,6 +486,186 @@ func TestConnectionGucState_DiscardOtherDoesNotChangeHash(t *testing.T) {
 	}
 }
 
+func TestConnectionGucState_DiscardAllClearsDirtyFlag(t *testing.T) {
+	s := NewConnectionGucState()
+	s.MarkDirty()
+	if !s.IsDirty() {
+		t.Fatal("MarkDirty did not set the flag")
+	}
+	s.ObserveSQL("DISCARD ALL")
+	if s.IsDirty() {
+		t.Error("DISCARD ALL should clear the dirty flag")
+	}
+}
+
+func TestConnectionGucState_ResetAllClearsDirtyFlag(t *testing.T) {
+	s := NewConnectionGucState()
+	s.MarkDirty()
+	s.ObserveSQL("RESET ALL")
+	if s.IsDirty() {
+		t.Error("RESET ALL should clear the dirty flag")
+	}
+}
+
+func TestConnectionGucState_DiscardOtherClearsDirtyButNotState(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	h := s.Hash()
+
+	for _, sub := range []string{"PLANS", "SEQUENCES", "TEMP", "TEMPORARY"} {
+		s.MarkDirty() // re-set per-iteration since DISCARD clears it.
+		s.ObserveSQL("DISCARD " + sub)
+		if s.Hash() != h {
+			t.Errorf("DISCARD %s should not change hash: got %d, want %d", sub, s.Hash(), h)
+		}
+		if s.IsDirty() {
+			t.Errorf("DISCARD %s should clear dirty flag", sub)
+		}
+	}
+}
+
+// --- ConnectionGucState: dirty flag ---
+
+func TestConnectionGucState_DirtyFlagDefaultsFalse(t *testing.T) {
+	s := NewConnectionGucState()
+	if s.IsDirty() {
+		t.Fatal("fresh state should not be dirty")
+	}
+}
+
+func TestConnectionGucState_MarkDirtyAndClear(t *testing.T) {
+	s := NewConnectionGucState()
+	s.MarkDirty()
+	if !s.IsDirty() {
+		t.Fatal("MarkDirty should set flag")
+	}
+	s.MarkClean()
+	if s.IsDirty() {
+		t.Fatal("MarkClean should clear flag")
+	}
+}
+
+func TestConnectionGucState_DirtyFlagIndependentOfHash(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	h := s.Hash()
+	s.MarkDirty()
+	if s.Hash() != h {
+		t.Errorf("MarkDirty must not perturb hash: %d vs %d", s.Hash(), h)
+	}
+	s.MarkClean()
+	if s.Hash() != h {
+		t.Errorf("MarkClean must not perturb hash: %d vs %d", s.Hash(), h)
+	}
+}
+
+// --- ConnectionGucState: Reseed ---
+
+func TestConnectionGucState_ReseedReplacesAllValues(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	s.ObserveSQL("SET role = 'admin'")
+	s.MarkDirty()
+
+	// Reseed with a different snapshot.
+	h := s.Reseed(map[string]string{
+		"app.user_id": "99",
+		// role is dropped; search_path is added.
+		"search_path": "tenant_b",
+	})
+
+	if h == 0 {
+		t.Fatal("reseeded state should have non-zero hash")
+	}
+	if s.IsDirty() {
+		t.Fatal("Reseed should clear dirty flag")
+	}
+
+	// Confirm Reseed wiped the old values.
+	want := NewConnectionGucState()
+	want.ObserveSQL("SET app.user_id = '99'")
+	want.ObserveSQL("SET search_path = 'tenant_b'")
+	if s.Hash() != want.Hash() {
+		t.Fatalf("Reseed should match equivalent observed-SET state: %d vs %d", s.Hash(), want.Hash())
+	}
+}
+
+func TestConnectionGucState_ReseedFiltersSafeGUCs(t *testing.T) {
+	s := NewConnectionGucState()
+	// pg_settings would yield every session-level GUC; we filter to
+	// unsafe-only at Reseed time.
+	h := s.Reseed(map[string]string{
+		"app.user_id":         "42",        // unsafe (namespaced)
+		"work_mem":            "8MB",       // safe — must not enter the map
+		"search_path":         "tenant_a",  // unsafe (short list)
+		"client_min_messages": "warning",   // safe
+	})
+
+	want := NewConnectionGucState()
+	want.ObserveSQL("SET app.user_id = '42'")
+	want.ObserveSQL("SET search_path = 'tenant_a'")
+	if h != want.Hash() {
+		t.Fatalf("Reseed should hash like the unsafe-only equivalent: %d vs %d", h, want.Hash())
+	}
+}
+
+func TestConnectionGucState_ReseedNilClearsState(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	s.MarkDirty()
+	if s.Reseed(nil) != 0 {
+		t.Fatal("Reseed(nil) should drop to baseline hash")
+	}
+	if s.IsDirty() {
+		t.Fatal("Reseed should clear dirty flag")
+	}
+}
+
+// --- IsTopLevelFunctionCall ---
+
+func TestIsTopLevelFunctionCall_RecognisesBareCalls(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT my_func()",
+		"SELECT my_func(1, 2, 3)",
+		"SELECT my_func('a', 'b')",
+		"select my_func()",
+		"SELECT my_schema.my_func()",
+		"SELECT my_func() ;",
+		"SELECT my_func();",
+	} {
+		if !IsTopLevelFunctionCall(sql) {
+			t.Errorf("%q: expected top-level function call", sql)
+		}
+	}
+}
+
+func TestIsTopLevelFunctionCall_RejectsNonFunctionShapes(t *testing.T) {
+	for _, sql := range []string{
+		"",
+		"SELECT 1",
+		"SELECT * FROM t",
+		"SELECT col, my_func() FROM t",
+		"SELECT my_func() FROM t",
+		"SELECT my_func() WHERE x = 1",
+		"INSERT INTO t VALUES (1)",
+		"SET app.user_id = '42'",
+		"SELECTOR_LIKE_PREFIX()", // not actually SELECT
+	} {
+		if IsTopLevelFunctionCall(sql) {
+			t.Errorf("%q: should not match top-level function call", sql)
+		}
+	}
+}
+
+func TestIsTopLevelFunctionCall_HandlesArgumentsWithParensAndCommas(t *testing.T) {
+	// The argument-list parser must walk balanced parens and quoted
+	// literals. A function whose argument is itself a sub-call shouldn't
+	// truncate at the inner ).
+	if !IsTopLevelFunctionCall("SELECT my_func(other(1, 2), 'a, b')") {
+		t.Error("nested call should still match")
+	}
+}
+
 // --- ConnectionGucState ---
 
 func TestConnectionGucState_EmptyHashIsZero(t *testing.T) {

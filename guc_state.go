@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // unsafeGUCShortList enumerates GUC names whose value can change query
@@ -633,6 +634,16 @@ func stripValueQuotes(value string) string {
 // pgx.Conn or a single pgxpool acquisition), so contention is bounded —
 // the mutex guards against the rare case where the same CachedConn is
 // shared across goroutines without external coordination.
+//
+// The `dirty` flag is a separate atomic axis from the GUC value map: it
+// signals "the wire layer might have missed a state mutation" (e.g. a
+// stored function did `SET app.user_id` server-side, or a top-level
+// `SELECT my_func()` may have done so). Callers can MarkDirty when they
+// see a SQL shape that could have moved server state without us
+// observing it on the wire, and MarkClean (or Reseed) when they
+// confirm state via pg_settings or after a DISCARD ALL. Wrapper layers
+// consult IsDirty() to decide whether to fire a verify-on-checkout
+// query.
 type ConnectionGucState struct {
 	mu sync.RWMutex
 	// Lowercased GUC name → raw value string. Only unsafe GUCs.
@@ -643,10 +654,19 @@ type ConnectionGucState struct {
 	// exactly what we want for the common case of a wrapper user who
 	// never SETs anything unsafe.
 	hash uint64
+	// dirty signals "wire-layer observation may be stale". Set when a
+	// top-level SELECT <function>(...) lands (the function may have
+	// done a server-side SET we didn't see); cleared by MarkClean (run
+	// after a successful verify) or by an observed DISCARD / RESET ALL.
+	// atomic.Bool so IsDirty() / MarkDirty() / ClearDirty() never have
+	// to take s.mu — they sit on a hot path (every wrapper call inspects
+	// the flag) and we don't want to contend with concurrent state-hash
+	// readers.
+	dirty atomic.Bool
 }
 
-// NewConnectionGucState returns a fresh state in the baseline (hash == 0)
-// configuration.
+// NewConnectionGucState returns a fresh state in the baseline (hash == 0,
+// dirty == false) configuration.
 func NewConnectionGucState() *ConnectionGucState {
 	return &ConnectionGucState{values: make(map[string]string)}
 }
@@ -657,6 +677,58 @@ func (s *ConnectionGucState) Hash() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.hash
+}
+
+// IsDirty reports whether the wire-layer fingerprint is suspected of
+// being stale. See the type doc for when callers MarkDirty.
+func (s *ConnectionGucState) IsDirty() bool {
+	return s.dirty.Load()
+}
+
+// MarkDirty signals "wire-layer observation may be stale" — typically
+// set after observing a top-level SELECT <function>(...) where the
+// function body could have issued a server-side SET we don't see on
+// the wire. The wrapper's verify path runs `SELECT name, setting FROM
+// pg_settings WHERE source='session'` to reconstruct the truth and
+// then calls MarkClean / Reseed.
+func (s *ConnectionGucState) MarkDirty() {
+	s.dirty.Store(true)
+}
+
+// MarkClean clears the dirty flag. Intended for callers that have
+// just rebuilt state from authoritative server-side data (verify) or
+// observed a session-clearing command (DISCARD ALL / RESET ALL).
+func (s *ConnectionGucState) MarkClean() {
+	s.dirty.Store(false)
+}
+
+// Reseed replaces the entire unsafe-GUC value set in one critical
+// section. Used by the verify path: the verify query yields a fresh
+// authoritative snapshot of `pg_settings WHERE source='session'`, the
+// caller passes the (name, value) pairs as a map, and Reseed swaps the
+// whole map after filtering to unsafe-only names. Returns the new
+// hash. Always clears the dirty flag — Reseed represents an
+// authoritative refresh.
+func (s *ConnectionGucState) Reseed(values map[string]string) uint64 {
+	s.mu.Lock()
+	if values == nil {
+		s.values = make(map[string]string)
+	} else {
+		next := make(map[string]string, len(values))
+		for k, v := range values {
+			lk := strings.ToLower(k)
+			if !IsUnsafeGUC(lk) {
+				continue
+			}
+			next[lk] = v
+		}
+		s.values = next
+	}
+	s.recomputeHashLocked()
+	h := s.hash
+	s.mu.Unlock()
+	s.dirty.Store(false)
+	return h
 }
 
 // Apply applies a parsed SET / RESET / DISCARD. No-op for SetCmdSetLocal
@@ -693,8 +765,19 @@ func (s *ConnectionGucState) Apply(cmd SetCommand) {
 			s.recomputeHashLocked()
 		}
 		s.mu.Unlock()
-	case SetCmdSetLocal, SetCmdDiscardOther, SetCmdNone:
-		// Intentionally ignored for state-hash purposes.
+		// RESET ALL / DISCARD ALL is authoritative: the server has
+		// dropped every non-default GUC, so any prior dirty suspicion
+		// is moot.
+		s.dirty.Store(false)
+	case SetCmdDiscardOther:
+		// PLANS / SEQUENCES / TEMP / TEMPORARY don't touch GUCs, but
+		// PG will only execute them outside a transaction. Observing
+		// one means the connection has been recycled by its pool —
+		// any uncertainty about server-side SETs is, in practice,
+		// resolved by the recycle.
+		s.dirty.Store(false)
+	case SetCmdSetLocal, SetCmdNone:
+		// Intentionally ignored.
 	}
 }
 
@@ -721,6 +804,89 @@ func (s *ConnectionGucState) ObserveSQL(sql string) bool {
 		}
 	}
 	return s.Hash() != before
+}
+
+// IsTopLevelFunctionCall reports whether `sql` is a top-level
+// `SELECT <ident>(...)` shape — i.e. the canonical "call a function and
+// return its result" pattern. Used by the verify path to decide when
+// to schedule an async post-call verify: if the function body did
+// `SET app.user_id = ...` server-side, the wire layer never saw the
+// SET, so we mark the connection dirty and re-read pg_settings.
+//
+// Recognised shapes:
+//   - SELECT my_func()
+//   - SELECT my_func(arg, ...)
+//   - SELECT schema.func(...)
+//
+// Excluded shapes (return false):
+//   - SELECT col, my_func() FROM t              (column projection)
+//   - SELECT my_func() FROM t                   (FROM clause)
+//   - SELECT my_func() WHERE ...                (WHERE clause)
+//   - SELECT 1                                  (no function call)
+//   - Anything not starting with SELECT
+//
+// Conservative — only matches the bare-function form that's the
+// canonical "call this stored procedure" pattern. False negatives
+// (real function calls that don't match) just skip the async verify;
+// the dirty flag will eventually get re-evaluated on the next
+// observed SET / RESET / verify trigger.
+func IsTopLevelFunctionCall(sql string) bool {
+	s := strings.TrimSpace(sql)
+	s = strings.TrimRight(strings.TrimSuffix(s, ";"), " \t\r\n")
+	if s == "" {
+		return false
+	}
+	if !strings.HasPrefix(strings.ToUpper(s), "SELECT") {
+		return false
+	}
+	// Must be SELECT followed by whitespace, not e.g. SELECTOR-something.
+	if len(s) < 7 || (s[6] != ' ' && s[6] != '\t' && s[6] != '\n' && s[6] != '\r') {
+		return false
+	}
+	rest := strings.TrimSpace(s[6:])
+	if rest == "" {
+		return false
+	}
+
+	// Find the first '(' — that's the function-arguments delimiter.
+	openParen := strings.IndexByte(rest, '(')
+	if openParen < 0 {
+		return false
+	}
+
+	// The text before '(' must be a single qualified identifier:
+	// `name` or `schema.name` (optionally `cat.schema.name`). No
+	// commas, spaces, or quotes mid-identifier — those signal a
+	// projection list (`col, fn(`) or a more complex expression.
+	identPart := strings.TrimSpace(rest[:openParen])
+	if identPart == "" {
+		return false
+	}
+	for _, c := range identPart {
+		// Letters / digits / underscores / dots only. Reject
+		// anything else (commas, spaces, parens, operators, quotes).
+		if !(c == '_' || c == '.' ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+
+	// The argument list must close with a balanced ')' AND nothing
+	// of substance can follow (other than whitespace / a trailing
+	// semicolon). A trailing FROM / WHERE / etc. means the function
+	// call is inside a larger query, not the whole statement.
+	body := rest[openParen+1:]
+	closeParen := findMatchingParen(body)
+	if closeParen < 0 {
+		return false
+	}
+	tail := strings.TrimSpace(body[closeParen+1:])
+	if tail != "" && tail != ";" {
+		return false
+	}
+	return true
 }
 
 // recomputeHashLocked must be called with s.mu held for write. Iterates

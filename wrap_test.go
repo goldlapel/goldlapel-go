@@ -117,6 +117,11 @@ func setupWrapped(t *testing.T, rows [][]interface{}, fields []FieldDescription)
 	cache.mu.Unlock()
 	mock := newMockQuerier(rows, fields)
 	cc := &CachedConn{real: mock, cache: cache}
+	// Drain any async verify goroutines at test end — without this,
+	// a verify spawned by a top-level SELECT-function-call test could
+	// outlive the test and write to the mock after the test goroutine
+	// returned.
+	t.Cleanup(func() { cc.Close() })
 	return cc, mock
 }
 
@@ -646,6 +651,7 @@ func TestQuery_SelectNotCachedWhenNotConnected(t *testing.T) {
 	// Not connected - don't set invConnected
 	mock := newMockQuerier([][]interface{}{{1}}, []FieldDescription{{Name: "id"}})
 	cc := &CachedConn{real: mock, cache: cache}
+	t.Cleanup(func() { cc.Close() })
 	ctx := context.Background()
 
 	cc.Query(ctx, "SELECT * FROM users")
@@ -685,15 +691,24 @@ func TestMultipleWritesSameTable(t *testing.T) {
 // that every state-hash test produces. Existing queryCount() lumps Query
 // + QueryRow + Exec together, which inflates the number we care about
 // (real fetches against the backend).
+// selectCount counts user-visible SELECTs the wrapper forwarded to the
+// underlying Querier. Internal verify chatter (the wrapper's
+// pg_settings probe used by the verify-on-checkout / async-verify
+// paths) is excluded — that traffic is correctness machinery, not
+// "real SELECTs" the test is reasoning about.
 func selectCount(m *mockQuerier) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
 	for _, q := range m.queries {
 		t := strings.TrimSpace(q)
-		if strings.HasPrefix(strings.ToUpper(t), "SELECT") {
-			n++
+		if !strings.HasPrefix(strings.ToUpper(t), "SELECT") {
+			continue
 		}
+		if strings.Contains(q, "pg_settings") && strings.Contains(q, "source = 'session'") {
+			continue
+		}
+		n++
 	}
 	return n
 }
@@ -762,6 +777,7 @@ func TestStateHash_TwoConnectionsWithDifferentStateNeverCrossShare(t *testing.T)
 
 	connA := &CachedConn{real: mockA, cache: cache, gucState: NewConnectionGucState()}
 	connB := &CachedConn{real: mockB, cache: cache, gucState: NewConnectionGucState()}
+	t.Cleanup(func() { connA.Close(); connB.Close() })
 	ctx := context.Background()
 
 	// connA SETs app.user_id='alice', then queries — caches under
@@ -797,6 +813,7 @@ func TestStateHash_SameStateOnTwoConnectionsCanShareCache(t *testing.T) {
 
 	connA := &CachedConn{real: mockA, cache: cache, gucState: NewConnectionGucState()}
 	connB := &CachedConn{real: mockB, cache: cache, gucState: NewConnectionGucState()}
+	t.Cleanup(func() { connA.Close(); connB.Close() })
 	ctx := context.Background()
 
 	connA.Exec(ctx, "SET app.user_id = '42'")
