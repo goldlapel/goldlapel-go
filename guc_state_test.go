@@ -476,7 +476,7 @@ func TestConnectionGucState_DiscardOtherDoesNotChangeHash(t *testing.T) {
 	s.ObserveSQL("SET app.user_id = '42'")
 	h := s.Hash()
 	for _, sub := range []string{"PLANS", "SEQUENCES", "TEMP", "TEMPORARY"} {
-		if s.ObserveSQL("DISCARD "+sub) {
+		if s.ObserveSQL("DISCARD " + sub) {
 			t.Errorf("DISCARD %s should not move state hash", sub)
 		}
 		if s.Hash() != h {
@@ -595,10 +595,10 @@ func TestConnectionGucState_ReseedFiltersSafeGUCs(t *testing.T) {
 	// pg_settings would yield every session-level GUC; we filter to
 	// unsafe-only at Reseed time.
 	h := s.Reseed(map[string]string{
-		"app.user_id":         "42",        // unsafe (namespaced)
-		"work_mem":            "8MB",       // safe — must not enter the map
-		"search_path":         "tenant_a",  // unsafe (short list)
-		"client_min_messages": "warning",   // safe
+		"app.user_id":         "42",       // unsafe (namespaced)
+		"work_mem":            "8MB",      // safe — must not enter the map
+		"search_path":         "tenant_a", // unsafe (short list)
+		"client_min_messages": "warning",  // safe
 	})
 
 	want := NewConnectionGucState()

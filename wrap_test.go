@@ -77,7 +77,7 @@ func (r *mockRows) Scan(dest ...interface{}) error {
 	return nil
 }
 
-func (r *mockRows) Close()    {}
+func (r *mockRows) Close()     {}
 func (r *mockRows) Err() error { return nil }
 func (r *mockRows) FieldDescriptions() []FieldDescription {
 	return r.fields
