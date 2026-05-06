@@ -554,6 +554,13 @@ type GoldLapel struct {
 	disableAutoIndexes    bool
 	disableAutoIndexesSet bool
 
+	// Aggressive-verify mode (smart-auto-enable for the trigger-
+	// internal-SET coverage gap). Default is AggressiveVerifyAuto;
+	// WithAggressiveVerify(On/Off) overrides via the Set sentinel.
+	// See aggressive_verify.go for the full design.
+	aggressiveVerify    AggressiveVerifyMode
+	aggressiveVerifySet bool
+
 	mu                  sync.Mutex
 	// DDL API state — see ddl.go.
 	dashboardToken string    // provisioned on spawn; cleared on Stop
