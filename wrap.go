@@ -103,6 +103,14 @@ type CachedConn struct {
 	// closed is set by Close() to suppress further async verify
 	// scheduling. Atomic for the same reason as inFlightVerify.
 	closed atomic.Bool
+
+	// poolDiscarder is an optional bridge to the pool-level
+	// DISCARD-on-release tracker. When non-nil, every observed unsafe
+	// SET / RESET / DISCARD updates the discarder's dirty flag so a
+	// pgxpool.Config.AfterRelease hook calling OnAfterRelease can
+	// decide whether to issue DISCARD ALL on connection return.
+	// See pool.go for the discarder's full lifecycle.
+	poolDiscarder *PoolReleaseDiscarder
 }
 
 // Wrap wraps a Querier with the wrapper's native cache and starts the
@@ -253,6 +261,92 @@ func (cc *CachedConn) runVerify(ctx context.Context) {
 	cc.ensureGucState().Reseed(values)
 }
 
+// observeForPool propagates SQL-stream observations into the pool
+// discarder (if attached). Called alongside ObserveSQL on every wire-
+// bound SQL string.
+//
+//   - Any unsafe SET / RESET / DISCARD-other / set_config(false) →
+//     pool dirty (the connection now carries session state another
+//     borrower would inherit on pool reuse).
+//   - DISCARD ALL / RESET ALL → pool clean (PG has cleared session
+//     state authoritatively).
+//   - SET LOCAL / set_config(..., true) → pool unaffected (LOCAL
+//     scope is automatically dropped at COMMIT/ROLLBACK).
+//
+// Multi-statement Q messages are handled by inspecting each
+// segment; the first state-affecting segment wins for the dirty
+// direction, but RESET ALL / DISCARD ALL anywhere in the body
+// drops dirty (PG's actual behaviour: DISCARD inside a script
+// resets state at that point).
+func (cc *CachedConn) observeForPool(sql string) {
+	if cc.poolDiscarder == nil {
+		return
+	}
+	process := func(stmt string) {
+		cmd := ParseSetCommand(stmt)
+		switch cmd.Kind {
+		case SetCmdSet:
+			if IsUnsafeGUC(cmd.Name) {
+				cc.poolDiscarder.MarkDirty()
+			}
+		case SetCmdReset:
+			if IsUnsafeGUC(cmd.Name) {
+				cc.poolDiscarder.MarkDirty()
+			}
+		case SetCmdResetAll:
+			cc.poolDiscarder.MarkClean()
+		case SetCmdDiscardOther:
+			// Doesn't touch GUC state; doesn't change pool-clean
+			// status either. (DISCARD PLANS still leaves the
+			// connection's GUCs in place.)
+		}
+	}
+	stripped := sql
+	if !containsTopLevelSemicolon(stripped) {
+		process(stripped)
+		return
+	}
+	for _, seg := range SplitStatements(stripped) {
+		process(seg)
+	}
+}
+
+// containsTopLevelSemicolon reports whether `sql` contains a `;`
+// character outside of a string literal — i.e. whether it's a
+// multi-statement body. Cheap to compute; mirrors the fast-path
+// check inside ObserveSQL so observeForPool stays consistent.
+func containsTopLevelSemicolon(sql string) bool {
+	var quote byte
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case ';':
+			// Trailing-only `;` is benign; check we have content
+			// after it (otherwise it's just a terminator).
+			rest := sql[i+1:]
+			for _, r := range rest {
+				if r != ' ' && r != '\t' && r != '\r' && r != '\n' && r != ';' {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
 // shouldScheduleVerifyAfter reports whether the wrapper should mark
 // the connection dirty + schedule an async verify after this SQL
 // completes. True for top-level `SELECT <ident>(...)` shapes that
@@ -376,6 +470,7 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	// non-SET statements and a fast single-statement path for the common
 	// case, so the overhead per call is a couple of string-prefix checks.
 	cc.ensureGucState().ObserveSQL(sql)
+	cc.observeForPool(sql)
 
 	// Top-level SELECT <ident>(...) shapes are stored-function calls
 	// whose body may have done a server-side SET we'll never see on
@@ -484,6 +579,7 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
 	cc.maybeVerifyOnCheckout(ctx)
 	cc.ensureGucState().ObserveSQL(sql)
+	cc.observeForPool(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
@@ -560,6 +656,7 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
 	cc.maybeVerifyOnCheckout(ctx)
 	cc.ensureGucState().ObserveSQL(sql)
+	cc.observeForPool(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
