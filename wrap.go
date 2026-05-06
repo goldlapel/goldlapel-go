@@ -111,6 +111,22 @@ type CachedConn struct {
 	// decide whether to issue DISCARD ALL on connection return.
 	// See pool.go for the discarder's full lifecycle.
 	poolDiscarder *PoolReleaseDiscarder
+
+	// realMu serialises calls into cc.real. The wrapper assumes the
+	// underlying Querier follows pgx.Conn's "goroutine-confined"
+	// convention — but the async verify path spawns a goroutine that
+	// also issues `SELECT name, setting FROM pg_settings ...` against
+	// cc.real. Without a mutex, the verify goroutine and a concurrent
+	// user-issued query would race on a non-goroutine-safe connection
+	// (raw pgx.Conn, sql.Conn). The mutex is held only for the
+	// duration of the cc.real call itself; it does NOT protect
+	// caller-side iteration of the returned Rows (callers must
+	// already serialise their own usage of pgx.Rows).
+	//
+	// For pgxpool / sql.DB users where cc.real IS goroutine-safe,
+	// the mutex is essentially free (uncontended). For raw-conn
+	// users, the mutex is what makes the async verify path safe.
+	realMu sync.Mutex
 }
 
 // Wrap wraps a Querier with the wrapper's native cache and starts the
@@ -166,13 +182,15 @@ func (cc *CachedConn) ensureVerifyCtx() {
 	})
 }
 
-// Close cancels any in-flight verify goroutines and waits for them to
-// exit. Safe to call multiple times; subsequent calls no-op. After
-// Close, async verify scheduling is suppressed (a follow-up
-// Query/QueryRow/Exec still works against the underlying Querier — only
-// the verify-on-checkout path is suppressed, since dispatching
-// verify against a connection the caller is about to discard would
-// race with the caller's own teardown).
+// Close cancels any in-flight async verify goroutines and waits for
+// them to exit. Safe to call multiple times; subsequent calls no-op.
+// After Close, scheduleAsyncVerify is a no-op so a follow-up
+// Query/QueryRow/Exec on a "closed" CachedConn still routes the user's
+// SQL to the underlying Querier (verify-on-checkout still fires
+// synchronously if state is dirty) — only the async post-call path
+// is suppressed, since dispatching a fresh goroutine against a
+// connection the caller is about to discard would race with the
+// caller's own teardown.
 //
 // Close does NOT close the underlying Querier — that's the caller's
 // responsibility. Close exists so that callers running pgx.Conn or
@@ -232,8 +250,17 @@ func (cc *CachedConn) maybeVerifyOnCheckout(ctx context.Context) {
 // user actually changed (default values stay out of the map).
 // Reseed's filter then drops anything that isn't an unsafe GUC, so
 // the final state map matches the canonical SET-observed shape.
+//
+// realMu is taken for the duration of the cc.real.Query and the row
+// drain — pgx.Conn semantics require single-goroutine access to the
+// conn AND its outstanding Rows. Holding the lock for the whole
+// drain ensures verify doesn't overlap with a concurrent user-issued
+// Query/QueryRow/Exec on the same connection (pgxpool / sql.DB users
+// won't notice; raw pgx.Conn users can rely on serialization).
 func (cc *CachedConn) runVerify(ctx context.Context) {
 	const verifySQL = "SELECT name, setting FROM pg_settings WHERE source = 'session'"
+	cc.realMu.Lock()
+	defer cc.realMu.Unlock()
 	rows, err := cc.real.Query(ctx, verifySQL)
 	if err != nil {
 		return
@@ -259,6 +286,82 @@ func (cc *CachedConn) runVerify(ctx context.Context) {
 		return
 	}
 	cc.ensureGucState().Reseed(values)
+}
+
+// fetchAndDrain takes realMu, issues cc.real.Query, fully drains the
+// Rows into a [][]interface{} slice, and releases realMu — all under
+// a defer so a panic in any downstream call still releases the
+// mutex. Used by Query's cache-miss path; the resulting slice is
+// what gets stored in the native cache.
+//
+// Returns:
+//   - collected: rows successfully iterated (possibly partial).
+//   - fields:    column metadata.
+//   - drainErr:  rows.Err() observed during iteration. Surfaced via
+//     the returned cachedRows.err so the caller sees it on first
+//     iteration — preserves the pre-realMu wrapper contract.
+//   - queryErr:  cc.real.Query's own error. Propagated to the user
+//     directly; collected/fields are nil in this case.
+func (cc *CachedConn) fetchAndDrain(ctx context.Context, sql string, args ...interface{}) (collected [][]interface{}, fields []FieldDescription, drainErr error, queryErr error) {
+	cc.realMu.Lock()
+	defer cc.realMu.Unlock()
+	rows, err := cc.real.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if rows == nil {
+		return nil, nil, nil, nil
+	}
+	defer rows.Close()
+	fields = rows.FieldDescriptions()
+	for rows.Next() {
+		vals, vErr := rows.Values()
+		if vErr != nil {
+			break
+		}
+		dup := make([]interface{}, len(vals))
+		copy(dup, vals)
+		collected = append(collected, dup)
+	}
+	drainErr = rows.Err()
+	return collected, fields, drainErr, nil
+}
+
+// realQuery takes realMu briefly while issuing cc.real.Query and
+// hands the live Rows back to the caller. Used by branches that
+// don't drain rows themselves (the BEGIN / COMMIT / ddl-hit / in-tx
+// paths). The mutex protects against an in-flight verify goroutine
+// concurrently issuing pg_settings against the same connection.
+//
+// The mutex is NOT held during the caller's subsequent iteration of
+// the returned Rows — that's a per-Querier concern (pgx.Conn forbids
+// it; pgxpool / sql.DB tolerate it). Callers that ALSO mix live
+// Rows with concurrent verify-eligible queries on raw pgx.Conn are
+// outside the wrapper's safety boundary; this is a pre-existing
+// pgx.Conn convention, not a new wrapper limitation.
+func (cc *CachedConn) realQuery(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
+	cc.realMu.Lock()
+	rows, err := cc.real.Query(ctx, sql, args...)
+	cc.realMu.Unlock()
+	return rows, err
+}
+
+// realQueryRow mirrors realQuery for the single-row API. pgx.Row /
+// sql.Row hold a connection until Scan is called; the mutex is
+// taken only for the QueryRow call itself.
+func (cc *CachedConn) realQueryRow(ctx context.Context, sql string, args ...interface{}) Row {
+	cc.realMu.Lock()
+	row := cc.real.QueryRow(ctx, sql, args...)
+	cc.realMu.Unlock()
+	return row
+}
+
+// realExec mirrors realQuery for Exec. Exec returns immediately so
+// the mutex is held for the full call.
+func (cc *CachedConn) realExec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
+	cc.realMu.Lock()
+	defer cc.realMu.Unlock()
+	return cc.real.Exec(ctx, sql, args...)
 }
 
 // observeForPool propagates SQL-stream observations into the pool
@@ -503,18 +606,18 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	// left the cache bypassed forever until the next BEGIN/COMMIT cycle.
 	if containsTxControl(sql) {
 		cc.inTransaction = applyTxState(sql, cc.inTransaction)
-		return cc.real.Query(ctx, sql, args...)
+		return cc.realQuery(ctx, sql, args...)
 	}
 
 	// If write detection consumed the body, no further cache work is
 	// possible — the response is a write tag, not a row stream.
 	if ddlHit || len(writeTables) > 0 {
-		return cc.real.Query(ctx, sql, args...)
+		return cc.realQuery(ctx, sql, args...)
 	}
 
 	// Inside transaction: bypass cache
 	if cc.inTransaction {
-		return cc.real.Query(ctx, sql, args...)
+		return cc.realQuery(ctx, sql, args...)
 	}
 
 	stateHash := cc.ensureGucState().Hash()
@@ -534,32 +637,14 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		}
 	}
 
-	// Cache miss: execute for real
-	rows, err := cc.real.Query(ctx, sql, args...)
+	// Cache miss: execute for real. Hold realMu across the full
+	// drain — pgx.Conn forbids overlapping use of the conn while a
+	// Rows is alive, and the verify goroutine takes the same mutex
+	// so the two paths can't race on a non-goroutine-safe Querier.
+	collected, fields, drainErr, err := cc.fetchAndDrain(ctx, sql, args...)
 	if err != nil {
-		return rows, err
-	}
-
-	// Collect rows to cache
-	var collected [][]interface{}
-	var fields []FieldDescription
-	if rows != nil {
-		fields = rows.FieldDescriptions()
-		for rows.Next() {
-			vals, vErr := rows.Values()
-			if vErr != nil {
-				// Can't cache this result, return the rows as-is
-				// (but rows is consumed at this point, so wrap collected + remaining)
-				break
-			}
-			dup := make([]interface{}, len(vals))
-			copy(dup, vals)
-			collected = append(collected, dup)
-		}
-		rows.Close()
-		if rows.Err() != nil {
-			return &cachedRows{rows: collected, fields: fields, pos: -1, err: rows.Err()}, nil
-		}
+		// fetchAndDrain has already released realMu.
+		return nil, err
 	}
 
 	// Cache the result under the current per-connection state hash —
@@ -572,7 +657,7 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		cc.cache.Put(sql, args, stateHash, collected, fields)
 	}
 
-	return &cachedRows{rows: collected, fields: fields, pos: -1}, nil
+	return &cachedRows{rows: collected, fields: fields, pos: -1, err: drainErr}, nil
 }
 
 // QueryRow intercepts single-row queries.
@@ -600,18 +685,18 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 	// full rationale.
 	if containsTxControl(sql) {
 		cc.inTransaction = applyTxState(sql, cc.inTransaction)
-		return cc.real.QueryRow(ctx, sql, args...)
+		return cc.realQueryRow(ctx, sql, args...)
 	}
 
 	// If write detection fired, dispatch to the real backend — there is
 	// no row stream to cache.
 	if ddlHit || len(writeTables) > 0 {
-		return cc.real.QueryRow(ctx, sql, args...)
+		return cc.realQueryRow(ctx, sql, args...)
 	}
 
 	// Inside transaction: bypass cache
 	if cc.inTransaction {
-		return cc.real.QueryRow(ctx, sql, args...)
+		return cc.realQueryRow(ctx, sql, args...)
 	}
 
 	stateHash := cc.ensureGucState().Hash()
@@ -677,7 +762,7 @@ func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{})
 	// full rationale.
 	cc.inTransaction = applyTxState(sql, cc.inTransaction)
 
-	return cc.real.Exec(ctx, sql, args...)
+	return cc.realExec(ctx, sql, args...)
 }
 
 // --- Cached result types ---
