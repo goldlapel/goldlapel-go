@@ -218,9 +218,9 @@ func SplitStatements(sql string) []string {
 	return out
 }
 
-// ParseSetCommand parses a SET / RESET / DISCARD command out of a single
-// SQL statement. Returns SetCmdNone when the statement is not a recognised
-// state-mutation shape.
+// ParseSetCommand parses a SET / RESET / DISCARD / set_config() command
+// out of a single SQL statement. Returns SetCmdNone when the statement
+// is not a recognised state-mutation shape.
 //
 // Recognises:
 //   - SET name = value, SET name TO value
@@ -236,6 +236,10 @@ func SplitStatements(sql string) []string {
 //     — returned as SetCmdDiscardOther. State-hash unchanged, but useful
 //     for callers that maintain side caches (prepared-statement cache,
 //     verify-on-checkout dirty flag, etc.).
+//   - SELECT [pg_catalog.]set_config(name, value, is_local) — the
+//     canonical Supabase / PostgREST RLS-context shape. is_local=false
+//     maps to SetCmdSet; is_local=true maps to SetCmdSetLocal. Per PG
+//     docs, set_config is the function-form equivalent of SET / SET LOCAL.
 //
 // The legacy two-word `SET TIME ZONE 'UTC'` form returns SetCmdNone —
 // the one-word `timezone` GUC IS now in the unsafe list (rendering
@@ -280,6 +284,13 @@ func ParseSetCommand(sql string) SetCommand {
 			return SetCommand{Kind: SetCmdDiscardOther}
 		}
 		return none
+	}
+
+	// SELECT [pg_catalog.]set_config(name, value, is_local) — function
+	// form of SET. Delegated to a dedicated parser so the SET path stays
+	// scoped to the keyword-prefixed grammar.
+	if strings.EqualFold(head, "SELECT") {
+		return parseSetConfigCall(s)
 	}
 
 	if strings.EqualFold(head, "RESET") {
@@ -377,6 +388,212 @@ func ParseSetCommand(sql string) SetCommand {
 		return SetCommand{Kind: SetCmdSetLocal, Name: name, Value: value}
 	}
 	return SetCommand{Kind: SetCmdSet, Name: name, Value: value}
+}
+
+// parseSetConfigCall parses a single SQL statement of the shape
+//
+//	SELECT [pg_catalog.]set_config('name', 'value', is_local)
+//
+// where is_local is a boolean literal (`true` / `false` / `'t'` / `'f'`
+// / `0` / `1`). Returns SetCmdSet on is_local=false, SetCmdSetLocal on
+// is_local=true. Anything that doesn't match is SetCmdNone.
+//
+// PG's set_config(name TEXT, new_value TEXT, is_local BOOLEAN) is
+// documented as the function-form equivalent of SET / SET LOCAL — the
+// canonical Supabase / PostgREST RLS-context shape uses it because a
+// single Q-message can chain `SELECT set_config(...); SELECT ... FROM
+// accounts` without two round-trips. Recognising it here is what closes
+// the v1 known-limitation called out in
+// docs/todos/guc-rls-cache-safety.md.
+//
+// The parser is intentionally narrow: it only matches the plain
+// 3-argument form. set_config wrapped in another expression
+// (`SELECT col, set_config(...) FROM t`), used as a join target, etc.
+// returns SetCmdNone — those are exotic enough that the verify-on-
+// checkout dirty path is a better safety net than a brittle parser.
+func parseSetConfigCall(stmt string) SetCommand {
+	none := SetCommand{Kind: SetCmdNone}
+
+	// Strip the leading SELECT keyword (already verified by the caller).
+	rest := strings.TrimSpace(stmt)
+	if len(rest) < 6 || !strings.EqualFold(rest[:6], "SELECT") {
+		return none
+	}
+	rest = strings.TrimSpace(rest[6:])
+
+	// Optional pg_catalog. schema qualifier.
+	if len(rest) >= 11 && strings.EqualFold(rest[:11], "pg_catalog.") {
+		rest = strings.TrimSpace(rest[11:])
+	}
+
+	// Match the literal `set_config(` prefix (case-insensitive). Anything
+	// before the open paren that isn't the bare function name is rejected.
+	openParen := strings.IndexByte(rest, '(')
+	if openParen < 0 {
+		return none
+	}
+	fnName := strings.TrimSpace(rest[:openParen])
+	if !strings.EqualFold(fnName, "set_config") {
+		return none
+	}
+
+	// Locate the matching close paren. Walk the body honouring single-
+	// and double-quoted literals so a `)` inside a quoted value doesn't
+	// terminate the call early.
+	body := rest[openParen+1:]
+	closeParen := findMatchingParen(body)
+	if closeParen < 0 {
+		return none
+	}
+	args := body[:closeParen]
+	tail := strings.TrimSpace(body[closeParen+1:])
+	// Allow an optional trailing semicolon. Anything else after the `)`
+	// is a more complex SELECT — we don't try to parse it.
+	if tail != "" && tail != ";" {
+		return none
+	}
+
+	// Split args on top-level commas (respecting quoted literals). Expect
+	// exactly three.
+	parts := splitTopLevelCommas(args)
+	if len(parts) != 3 {
+		return none
+	}
+
+	rawName := strings.TrimSpace(parts[0])
+	rawValue := strings.TrimSpace(parts[1])
+	rawIsLocal := strings.TrimSpace(parts[2])
+
+	// The first argument must be a string literal — set_config requires
+	// a literal name; passing a column reference is legal SQL but not
+	// the canonical RLS shape, and would force us to cope with arbitrary
+	// expressions. Bail out conservatively.
+	if !looksLikeStringLiteral(rawName) {
+		return none
+	}
+	name := stripValueQuotes(rawName)
+	name = strings.ToLower(name)
+	if name == "" {
+		return none
+	}
+
+	value := stripValueQuotes(rawValue)
+	// is_local must be parseable as a boolean. PG accepts the standard
+	// boolean literal forms (true/false, t/f, yes/no, on/off, 1/0); we
+	// accept the same set, case-insensitive, optionally quoted.
+	isLocal, ok := parseBoolLiteral(rawIsLocal)
+	if !ok {
+		return none
+	}
+
+	if isLocal {
+		return SetCommand{Kind: SetCmdSetLocal, Name: name, Value: value}
+	}
+	return SetCommand{Kind: SetCmdSet, Name: name, Value: value}
+}
+
+// findMatchingParen returns the byte index of the close paren that
+// matches an implicit open paren at index -1 of `s`. Honours single-
+// and double-quoted literals (PG's doubled-quote escape included) so
+// that `')'` inside a string literal doesn't end the scan early.
+// Returns -1 if no balanced close paren is found.
+func findMatchingParen(s string) int {
+	depth := 0
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				if i+1 < len(s) && s[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
+	}
+	return -1
+}
+
+// splitTopLevelCommas splits `s` on commas that are NOT inside a quoted
+// literal or a nested paren group. Returns the segments trimmed of
+// surrounding whitespace.
+func splitTopLevelCommas(s string) []string {
+	var out []string
+	depth := 0
+	var quote byte
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				if i+1 < len(s) && s[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(s[start:]))
+	return out
+}
+
+// looksLikeStringLiteral reports whether `s` is wrapped in matching
+// single or double quotes. Used by parseSetConfigCall to reject calls
+// where the name argument is not a literal (we don't want to extract
+// state from `set_config(some_col, ...)`).
+func looksLikeStringLiteral(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	first := s[0]
+	last := s[len(s)-1]
+	return (first == '\'' && last == '\'') || (first == '"' && last == '"')
+}
+
+// parseBoolLiteral parses one of the boolean-literal forms PG accepts
+// for a BOOLEAN argument: true / false / t / f / yes / no / on / off /
+// 1 / 0. Quoting is allowed (set_config takes its third argument as a
+// boolean, and clients commonly pass `'false'` / `'t'`). Returns the
+// boolean value and a recognised flag.
+func parseBoolLiteral(raw string) (bool, bool) {
+	v := strings.ToLower(stripValueQuotes(raw))
+	switch v {
+	case "true", "t", "yes", "y", "on", "1":
+		return true, true
+	case "false", "f", "no", "n", "off", "0":
+		return false, true
+	}
+	return false, false
 }
 
 // normalizeGUCName lowercases the GUC name and strips surrounding double

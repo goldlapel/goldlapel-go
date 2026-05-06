@@ -291,6 +291,169 @@ func TestParseSetCommand_RejectsDiscardWithUnknownSubcommand(t *testing.T) {
 	}
 }
 
+// --- ParseSetCommand: SELECT set_config(...) ---
+
+func TestParseSetCommand_SetConfigBasic(t *testing.T) {
+	cmd := ParseSetCommand("SELECT set_config('app.user_id', '42', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.user_id" || cmd.Value != "42" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigPgCatalogQualified(t *testing.T) {
+	cmd := ParseSetCommand("SELECT pg_catalog.set_config('app.tenant', 'acme', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.tenant" || cmd.Value != "acme" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigIsLocalTrueMapsToSetLocal(t *testing.T) {
+	cmd := ParseSetCommand("SELECT set_config('app.user_id', '42', true)")
+	if cmd.Kind != SetCmdSetLocal || cmd.Name != "app.user_id" || cmd.Value != "42" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigQuotedBoolForms(t *testing.T) {
+	cases := map[string]SetCommandKind{
+		"SELECT set_config('app.x', '1', 't')":     SetCmdSetLocal,
+		"SELECT set_config('app.x', '1', 'f')":     SetCmdSet,
+		"SELECT set_config('app.x', '1', 'true')":  SetCmdSetLocal,
+		"SELECT set_config('app.x', '1', 'false')": SetCmdSet,
+		"SELECT set_config('app.x', '1', 'on')":    SetCmdSetLocal,
+		"SELECT set_config('app.x', '1', 'off')":   SetCmdSet,
+		"SELECT set_config('app.x', '1', 1)":       SetCmdSetLocal,
+		"SELECT set_config('app.x', '1', 0)":       SetCmdSet,
+	}
+	for sql, want := range cases {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != want {
+			t.Errorf("%q: want %v, got %+v", sql, want, cmd)
+		}
+	}
+}
+
+func TestParseSetCommand_SetConfigCaseInsensitive(t *testing.T) {
+	cmd := ParseSetCommand("select Set_Config('app.user_id', '42', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.user_id" || cmd.Value != "42" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigLowercasesGUCName(t *testing.T) {
+	cmd := ParseSetCommand("SELECT set_config('App.User_ID', '42', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.user_id" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigEmptyValue(t *testing.T) {
+	// Empty string is a valid value (resets the parameter to its default).
+	cmd := ParseSetCommand("SELECT set_config('app.user_id', '', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.user_id" || cmd.Value != "" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigTrailingSemicolon(t *testing.T) {
+	cmd := ParseSetCommand("SELECT set_config('app.user_id', '42', false);")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.user_id" || cmd.Value != "42" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_RejectsSetConfigWrongArgCount(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT set_config('app.user_id', '42')",
+		"SELECT set_config('app.user_id')",
+		"SELECT set_config()",
+		"SELECT set_config('app.user_id', '42', false, 'extra')",
+	} {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != SetCmdNone {
+			t.Errorf("%q: expected SetCmdNone, got %+v", sql, cmd)
+		}
+	}
+}
+
+func TestParseSetCommand_RejectsSetConfigInsideLargerSelect(t *testing.T) {
+	// We deliberately don't try to parse set_config when it's nested in
+	// a larger expression. Rejecting these shapes is conservative — the
+	// dirty flag + verify-on-checkout will catch any state that did
+	// move.
+	for _, sql := range []string{
+		"SELECT col, set_config('a.b', '1', false) FROM t",
+		"SELECT set_config('a.b', '1', false) FROM t",
+		"SELECT set_config('a.b', '1', false) WHERE x = 1",
+	} {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != SetCmdNone {
+			t.Errorf("%q: expected SetCmdNone, got %+v", sql, cmd)
+		}
+	}
+}
+
+func TestParseSetCommand_RejectsSetConfigWithBadBoolean(t *testing.T) {
+	cmd := ParseSetCommand("SELECT set_config('app.user_id', '42', maybe)")
+	if cmd.Kind != SetCmdNone {
+		t.Errorf("expected SetCmdNone, got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_RejectsSetConfigWithNonLiteralName(t *testing.T) {
+	// Column references / identifiers aren't the canonical RLS shape.
+	cmd := ParseSetCommand("SELECT set_config(some_col, '42', false)")
+	if cmd.Kind != SetCmdNone {
+		t.Errorf("expected SetCmdNone, got %+v", cmd)
+	}
+}
+
+func TestParseSetCommand_SetConfigArgsContainParens(t *testing.T) {
+	// Quoted values containing parens or commas must not confuse the
+	// argument splitter.
+	cmd := ParseSetCommand("SELECT set_config('app.tenant', 'foo(bar)baz', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.tenant" || cmd.Value != "foo(bar)baz" {
+		t.Fatalf("got %+v", cmd)
+	}
+	cmd = ParseSetCommand("SELECT set_config('app.tenant', 'a, b, c', false)")
+	if cmd.Kind != SetCmdSet || cmd.Name != "app.tenant" || cmd.Value != "a, b, c" {
+		t.Fatalf("got %+v", cmd)
+	}
+}
+
+// --- ConnectionGucState: set_config integration ---
+
+func TestConnectionGucState_SetConfigUpdatesState(t *testing.T) {
+	s := NewConnectionGucState()
+	a := NewConnectionGucState()
+
+	if !s.ObserveSQL("SELECT set_config('app.user_id', '42', false)") {
+		t.Fatal("set_config should mutate state")
+	}
+	a.ObserveSQL("SET app.user_id = '42'")
+	if s.Hash() != a.Hash() {
+		t.Fatalf("set_config(false) should equal SET: %d vs %d", s.Hash(), a.Hash())
+	}
+}
+
+func TestConnectionGucState_SetConfigIsLocalDoesNotMutateState(t *testing.T) {
+	s := NewConnectionGucState()
+	if s.ObserveSQL("SELECT set_config('app.user_id', '42', true)") {
+		t.Error("set_config(..., true) is SET LOCAL — should not mutate state")
+	}
+	if s.Hash() != 0 {
+		t.Fatalf("hash should remain baseline, got %d", s.Hash())
+	}
+}
+
+func TestConnectionGucState_SetConfigPgCatalogPathIntegrates(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SELECT pg_catalog.set_config('search_path', 'tenant_a, public', false)")
+	if s.Hash() == 0 {
+		t.Fatal("pg_catalog.set_config on unsafe GUC should mutate state")
+	}
+}
+
 // --- ConnectionGucState: DISCARD integration ---
 
 func TestConnectionGucState_DiscardAllClearsState(t *testing.T) {
