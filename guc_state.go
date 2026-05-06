@@ -69,13 +69,28 @@ var unsafeGUCShortList = map[string]bool{
 	"lc_time":       true,
 }
 
-// SetCommandKind classifies a parsed SET / RESET. Callers care primarily
-// about the (kind, name, value) triple; the kind disambiguates SET from
-// SET LOCAL from RESET / RESET ALL.
+// discardSubcommandsOther is the set of `DISCARD <subcommand>` values
+// that are NOT equivalent to `RESET ALL`. PG accepts ALL / PLANS /
+// SEQUENCES / TEMP / TEMPORARY (the last two are aliases). DISCARD ALL
+// clears every session resource (GUCs, prepared statements, sequences,
+// temp tables, locks, listens, advisory locks, plan cache); the others
+// are scoped subsets that don't touch GUC state. Kept upper-case for
+// case-insensitive comparison after Strings.ToUpper.
+var discardSubcommandsOther = map[string]bool{
+	"PLANS":     true,
+	"SEQUENCES": true,
+	"TEMP":      true,
+	"TEMPORARY": true,
+}
+
+// SetCommandKind classifies a parsed SET / RESET / DISCARD. Callers care
+// primarily about the (kind, name, value) triple; the kind disambiguates
+// the operation.
 type SetCommandKind int
 
 const (
-	// SetCmdNone marks a SQL string that did not parse as a SET / RESET.
+	// SetCmdNone marks a SQL string that did not parse as a recognised
+	// state-mutation command.
 	SetCmdNone SetCommandKind = iota
 	// SetCmdSet is `SET name = value` / `SET name TO value` /
 	// `SET SESSION name = value`.
@@ -85,8 +100,18 @@ const (
 	SetCmdSetLocal
 	// SetCmdReset is `RESET name`.
 	SetCmdReset
-	// SetCmdResetAll is `RESET ALL`.
+	// SetCmdResetAll is `RESET ALL` AND `DISCARD ALL` (the latter is a
+	// strict superset, but for state-hash purposes both clear every
+	// non-default GUC).
 	SetCmdResetAll
+	// SetCmdDiscardOther is `DISCARD PLANS` / `DISCARD SEQUENCES` /
+	// `DISCARD TEMP` / `DISCARD TEMPORARY`. These don't touch GUC state
+	// (so the hash map is unchanged), but observing them is useful — a
+	// pool that recycles connections with one of these subcommands has
+	// implicitly invalidated prepared-statement / temp-table state, and
+	// callers that maintain side caches (prepared-statement cache, etc.)
+	// can clear those when they observe this kind.
+	SetCmdDiscardOther
 )
 
 // SetCommand is the parsed shape of a single SET / RESET statement. Name
@@ -193,9 +218,9 @@ func SplitStatements(sql string) []string {
 	return out
 }
 
-// ParseSetCommand parses a SET / RESET command out of a single SQL
-// statement. Returns SetCmdNone when the statement is not a recognised
-// SET / RESET shape.
+// ParseSetCommand parses a SET / RESET / DISCARD command out of a single
+// SQL statement. Returns SetCmdNone when the statement is not a recognised
+// state-mutation shape.
 //
 // Recognises:
 //   - SET name = value, SET name TO value
@@ -203,10 +228,22 @@ func SplitStatements(sql string) []string {
 //   - SET LOCAL name = value, SET LOCAL name TO value
 //   - RESET name
 //   - RESET ALL
+//   - DISCARD ALL — equivalent to RESET ALL for state-hash purposes
+//     (and strictly more — also clears prepared statements, temp tables,
+//     advisory locks, listens, etc. — but those don't affect cache
+//     correctness directly).
+//   - DISCARD PLANS / DISCARD SEQUENCES / DISCARD TEMP / DISCARD TEMPORARY
+//     — returned as SetCmdDiscardOther. State-hash unchanged, but useful
+//     for callers that maintain side caches (prepared-statement cache,
+//     verify-on-checkout dirty flag, etc.).
 //
-// The legacy two-word `SET TIME ZONE 'UTC'` form returns SetCmdNone — the
-// timezone GUC is harmless, so misclassifying it as not-a-tracked-SET is
-// safe for cache correctness.
+// The legacy two-word `SET TIME ZONE 'UTC'` form returns SetCmdNone —
+// the one-word `timezone` GUC IS now in the unsafe list (rendering
+// matters), but the two-word grammar doesn't fit our parser. Returning
+// SetCmdNone here is acceptable in practice because the dirty flag +
+// verify-on-checkout fallback (see ConnectionGucState) will rebuild
+// state from pg_settings on next checkout if the unusual form ever
+// lands.
 //
 // The parser is intentionally narrow: it handles a single statement. For
 // multi-statement SQL bodies, use SplitStatements first and call
@@ -226,6 +263,24 @@ func ParseSetCommand(sql string) SetCommand {
 	}
 
 	head := tokens[0]
+
+	// DISCARD branch — `DISCARD ALL` is identical to `RESET ALL` for
+	// state-hash purposes; `DISCARD PLANS` / `SEQUENCES` / `TEMP` /
+	// `TEMPORARY` are no-op for state-hash but useful for side-cache
+	// callers.
+	if strings.EqualFold(head, "DISCARD") {
+		if len(tokens) != 2 {
+			return none
+		}
+		sub := strings.ToUpper(tokens[1])
+		if sub == "ALL" {
+			return SetCommand{Kind: SetCmdResetAll}
+		}
+		if discardSubcommandsOther[sub] {
+			return SetCommand{Kind: SetCmdDiscardOther}
+		}
+		return none
+	}
 
 	if strings.EqualFold(head, "RESET") {
 		if len(tokens) < 2 {
@@ -387,9 +442,13 @@ func (s *ConnectionGucState) Hash() uint64 {
 	return s.hash
 }
 
-// Apply applies a parsed SET / RESET. No-op for SetCmdSetLocal (transient
-// — cache is bypassed inside transactions anyway); no-op for safe GUC
-// names; no-op for SetCmdNone.
+// Apply applies a parsed SET / RESET / DISCARD. No-op for SetCmdSetLocal
+// (transient — cache is bypassed inside transactions anyway); no-op
+// for safe GUC names; no-op for SetCmdNone. SetCmdDiscardOther
+// (DISCARD PLANS / SEQUENCES / TEMP / TEMPORARY) is also a no-op for
+// the state-hash map — those subcommands don't touch GUCs — but
+// callers that wrap ConnectionGucState may use the kind for side-effects
+// (clearing a prepared-statement cache, etc.).
 func (s *ConnectionGucState) Apply(cmd SetCommand) {
 	switch cmd.Kind {
 	case SetCmdSet:
@@ -417,8 +476,8 @@ func (s *ConnectionGucState) Apply(cmd SetCommand) {
 			s.recomputeHashLocked()
 		}
 		s.mu.Unlock()
-	case SetCmdSetLocal, SetCmdNone:
-		// Intentionally ignored.
+	case SetCmdSetLocal, SetCmdDiscardOther, SetCmdNone:
+		// Intentionally ignored for state-hash purposes.
 	}
 }
 

@@ -235,10 +235,91 @@ func TestParseSetCommand_RejectsResetWithGarbage(t *testing.T) {
 }
 
 func TestParseSetCommand_RejectsSetTimeZoneTwoWordForm(t *testing.T) {
-	// `SET TIME ZONE 'UTC'` is the legacy two-word form. We don't model
-	// it because timezone is harmless. Returning SetCmdNone is correct.
+	// `SET TIME ZONE 'UTC'` is the legacy two-word form. The one-word
+	// `timezone` GUC IS unsafe (it changes wire-rendering of timestamps),
+	// but the two-word grammar doesn't fit our parser. Returning
+	// SetCmdNone is acceptable in practice because the dirty flag +
+	// verify-on-checkout fallback (see ConnectionGucState) will rebuild
+	// state from pg_settings on next checkout if the unusual form ever
+	// lands.
 	if cmd := ParseSetCommand("SET TIME ZONE 'UTC'"); cmd.Kind != SetCmdNone {
 		t.Errorf("got %+v", cmd)
+	}
+}
+
+// --- ParseSetCommand: DISCARD ---
+
+func TestParseSetCommand_DiscardAll(t *testing.T) {
+	for _, sql := range []string{
+		"DISCARD ALL",
+		"discard all",
+		"Discard All",
+		"DISCARD ALL;",
+	} {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != SetCmdResetAll {
+			t.Errorf("%q: expected SetCmdResetAll, got %+v", sql, cmd)
+		}
+	}
+}
+
+func TestParseSetCommand_DiscardOtherSubcommands(t *testing.T) {
+	for _, sql := range []string{
+		"DISCARD PLANS",
+		"DISCARD SEQUENCES",
+		"DISCARD TEMP",
+		"DISCARD TEMPORARY",
+		"discard plans",
+	} {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != SetCmdDiscardOther {
+			t.Errorf("%q: expected SetCmdDiscardOther, got %+v", sql, cmd)
+		}
+	}
+}
+
+func TestParseSetCommand_RejectsDiscardWithUnknownSubcommand(t *testing.T) {
+	for _, sql := range []string{
+		"DISCARD",         // missing argument
+		"DISCARD CACHE",   // not a real subcommand
+		"DISCARD ALL FOO", // junk after ALL
+	} {
+		cmd := ParseSetCommand(sql)
+		if cmd.Kind != SetCmdNone {
+			t.Errorf("%q: expected SetCmdNone, got %+v", sql, cmd)
+		}
+	}
+}
+
+// --- ConnectionGucState: DISCARD integration ---
+
+func TestConnectionGucState_DiscardAllClearsState(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	s.ObserveSQL("SET search_path TO 'tenant_a'")
+	if s.Hash() == 0 {
+		t.Fatal("setup: expected non-zero hash")
+	}
+	if !s.ObserveSQL("DISCARD ALL") {
+		t.Error("DISCARD ALL on non-empty state should report changed")
+	}
+	if s.Hash() != 0 {
+		t.Fatalf("DISCARD ALL should restore baseline, got %d", s.Hash())
+	}
+}
+
+func TestConnectionGucState_DiscardOtherDoesNotChangeHash(t *testing.T) {
+	s := NewConnectionGucState()
+	s.ObserveSQL("SET app.user_id = '42'")
+	h := s.Hash()
+	for _, sub := range []string{"PLANS", "SEQUENCES", "TEMP", "TEMPORARY"} {
+		if s.ObserveSQL("DISCARD "+sub) {
+			t.Errorf("DISCARD %s should not move state hash", sub)
+		}
+		if s.Hash() != h {
+			t.Errorf("DISCARD %s should leave hash unchanged: got %d, want %d",
+				sub, s.Hash(), h)
+		}
 	}
 }
 
