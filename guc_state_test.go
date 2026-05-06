@@ -47,15 +47,43 @@ func TestIsUnsafeGUC_NamespacedAreUnsafe(t *testing.T) {
 
 func TestIsUnsafeGUC_SafeGUCsAreSafe(t *testing.T) {
 	for _, name := range []string{
-		"timezone",
 		"application_name",
 		"statement_timeout",
 		"work_mem",
 		"client_encoding",
-		"DateStyle",
+		"random_page_cost",
+		"effective_cache_size",
+		"jit",
 	} {
 		if IsUnsafeGUC(name) {
 			t.Errorf("expected %q to be safe", name)
+		}
+	}
+}
+
+// TestIsUnsafeGUC_RenderingGUCsAreUnsafe locks in the rendering / locale
+// GUCs as unsafe. These don't change which rows the server returns, but
+// they DO change how those rows are textually rendered — so two
+// connections sharing a cache slot under different rendering settings
+// would observe each other's rendering. See the unsafeGUCShortList
+// docstring for the full rationale.
+func TestIsUnsafeGUC_RenderingGUCsAreUnsafe(t *testing.T) {
+	for _, name := range []string{
+		"DateStyle",
+		"datestyle",
+		"IntervalStyle",
+		"intervalstyle",
+		"TimeZone",
+		"timezone",
+		"bytea_output",
+		"BYTEA_OUTPUT",
+		"lc_messages",
+		"lc_monetary",
+		"lc_numeric",
+		"lc_time",
+	} {
+		if !IsUnsafeGUC(name) {
+			t.Errorf("expected rendering GUC %q to be unsafe", name)
 		}
 	}
 }
@@ -226,9 +254,11 @@ func TestConnectionGucState_EmptyHashIsZero(t *testing.T) {
 func TestConnectionGucState_SafeSetDoesNotChangeHash(t *testing.T) {
 	s := NewConnectionGucState()
 	for _, sql := range []string{
-		"SET timezone = 'UTC'",
 		"SET application_name = 'foo'",
 		"SET statement_timeout = 5000",
+		"SET work_mem = '64MB'",
+		"SET random_page_cost = 1.1",
+		"SET jit = off",
 	} {
 		s.ObserveSQL(sql)
 		if s.Hash() != 0 {
@@ -326,7 +356,7 @@ func TestConnectionGucState_ObserveSQLReturnsChangeFlag(t *testing.T) {
 	if s.ObserveSQL("SELECT 1") {
 		t.Error("non-SET should report unchanged")
 	}
-	if s.ObserveSQL("SET timezone = 'UTC'") {
+	if s.ObserveSQL("SET work_mem = '64MB'") {
 		t.Error("safe SET should report unchanged")
 	}
 	if !s.ObserveSQL("RESET app.user_id") {
@@ -338,7 +368,7 @@ func TestConnectionGucState_ResetSafeGUCIsNoOp(t *testing.T) {
 	s := NewConnectionGucState()
 	s.ObserveSQL("SET app.user_id = '42'")
 	h := s.Hash()
-	s.ObserveSQL("RESET timezone") // safe — must not perturb.
+	s.ObserveSQL("RESET work_mem") // safe — must not perturb.
 	if s.Hash() != h {
 		t.Fatalf("RESET on safe GUC should not move hash: got %d, want %d", s.Hash(), h)
 	}

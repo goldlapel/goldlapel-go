@@ -706,8 +706,9 @@ func TestStateHash_SafeSetDoesNotChangeCacheKey(t *testing.T) {
 	cc.Query(ctx, "SELECT * FROM users")
 	hashBefore := cc.GucStateHash()
 
-	// SET timezone is harmless — the hash must not move.
-	if _, err := cc.Exec(ctx, "SET timezone = 'UTC'"); err != nil {
+	// SET work_mem is harmless (planner knob, not a wire-rendering or
+	// row-set GUC) — the hash must not move.
+	if _, err := cc.Exec(ctx, "SET work_mem = '64MB'"); err != nil {
 		t.Fatal(err)
 	}
 	if cc.GucStateHash() != hashBefore {

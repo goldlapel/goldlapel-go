@@ -33,10 +33,24 @@ import (
 )
 
 // unsafeGUCShortList enumerates GUC names whose value can change query
-// results without changing the SQL text. Matched case-insensitively. Any
-// GUC with a '.' in the name is also treated as unsafe (namespaced GUCs
-// are the canonical custom-RLS pattern).
+// results — either WHICH rows the server returns, or HOW those rows are
+// rendered on the wire. Matched case-insensitively. Any GUC with a '.'
+// in the name is also treated as unsafe (namespaced GUCs are the canonical
+// custom-RLS pattern).
+//
+// The list has two flavours:
+//
+//   - row-set GUCs: search_path / role / *_isolation / row_security —
+//     change which rows come back under RLS.
+//   - rendering GUCs: DateStyle / IntervalStyle / TimeZone / bytea_output /
+//     lc_* — don't change the row set, but change how PG textually renders
+//     dates / intervals / numerics / monetary on the wire. Two connections
+//     with the same SQL but different DateStyle would otherwise share a
+//     cache slot and the second connection would observe the first
+//     connection's rendering — a correctness gap, even if not an RLS leak.
+//     Cheap to fold into the state hash; covers a real footgun.
 var unsafeGUCShortList = map[string]bool{
+	// Row-set GUCs (RLS / privilege boundary).
 	"search_path":                   true,
 	"role":                          true,
 	"session_authorization":         true,
@@ -44,6 +58,15 @@ var unsafeGUCShortList = map[string]bool{
 	"default_transaction_read_only": true,
 	"transaction_isolation":         true,
 	"row_security":                  true,
+	// Rendering / locale GUCs (wire-format correctness).
+	"datestyle":     true,
+	"intervalstyle": true,
+	"timezone":      true,
+	"bytea_output":  true,
+	"lc_messages":   true,
+	"lc_monetary":   true,
+	"lc_numeric":    true,
+	"lc_time":       true,
 }
 
 // SetCommandKind classifies a parsed SET / RESET. Callers care primarily
