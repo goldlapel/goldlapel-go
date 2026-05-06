@@ -785,25 +785,136 @@ func (s *ConnectionGucState) Apply(cmd SetCommand) {
 // it contains. Multi-statement bodies are split on top-level ';' (string
 // literals respected) so a single Q like `SET app.user_id = '42'; SELECT 1`
 // still updates state. Returns true if the call mutated the state hash.
+//
+// ObserveSQL is the eager / unconditional form — it commits state hash
+// changes regardless of whether the underlying Querier later succeeds.
+// Callers that need to defer mutation until they observe Querier success
+// (the SET-actually-applied protocol) should use PendingObservation
+// instead, which separates parse-time from commit-time.
 func (s *ConnectionGucState) ObserveSQL(sql string) bool {
 	before := s.Hash()
-	// Fast path: no inner ';' means a single statement; skip the
-	// allocation in SplitStatements for the common wire-message case.
+	for _, cmd := range parseSetCommands(sql) {
+		s.Apply(cmd)
+	}
+	return s.Hash() != before
+}
+
+// parseSetCommands extracts every state-mutation command from a SQL
+// string. Returns nil for SQL with no recognised SETs. Used by
+// ObserveSQL and by Pending() so both share a single parse pass.
+//
+// Fast path: bodies with no inner ';' skip SplitStatements and call
+// ParseSetCommand directly on the trimmed body. Bodies with at least
+// one inner ';' walk every segment.
+func parseSetCommands(sql string) []SetCommand {
 	stripped := strings.TrimRight(strings.TrimRight(sql, " \t\r\n"), ";")
 	if !strings.ContainsRune(stripped, ';') {
 		cmd := ParseSetCommand(sql)
-		if cmd.Kind != SetCmdNone {
-			s.Apply(cmd)
+		if cmd.Kind == SetCmdNone {
+			return nil
 		}
-	} else {
-		for _, stmt := range SplitStatements(sql) {
-			cmd := ParseSetCommand(stmt)
-			if cmd.Kind != SetCmdNone {
-				s.Apply(cmd)
-			}
+		return []SetCommand{cmd}
+	}
+	var out []SetCommand
+	for _, stmt := range SplitStatements(sql) {
+		cmd := ParseSetCommand(stmt)
+		if cmd.Kind != SetCmdNone {
+			out = append(out, cmd)
 		}
 	}
-	return s.Hash() != before
+	return out
+}
+
+// PendingObservation captures the state-mutation effect of a SQL string
+// that has been parsed but NOT yet committed to the connection's GUC
+// state hash. The caller commits via Apply() (Querier reported success)
+// or rolls back via DiscardAfterError() (Querier reported an error).
+//
+// The motivation is the SET-actually-applied protocol: if the wrapper
+// observed `SET app.user_id = '42'` and eagerly mutated the state hash
+// before dispatch, but pgx/database/sql then returned an error from
+// Exec, the wrapper's hash would diverge from the server's actual GUC
+// state — every subsequent cache lookup would land in a "phantom"
+// cache slot that the server's session never reaches. Worse, an
+// errored RESET would drop the wrapper's record of an unsafe GUC the
+// server still has set — a correctness gap (next read serves baseline
+// rows under non-baseline server state, an RLS-shaped leak).
+//
+// PendingObservation moves mutation behind a commit barrier so the
+// wrapper's hash only changes after the wire layer confirms the
+// statement landed. On error, the wrapper drops the pending mutation
+// AND marks the connection dirty — the next checkout's verify-against-
+// pg_settings reconciles authoritatively, which is the right safety net
+// for the multi-statement edge case (`SET ...; SELECT ...` where the
+// SET succeeded server-side but the SELECT failed: we can't tell from
+// pgx's single error which segments landed, so we punt to verify).
+//
+// The struct is not goroutine-safe by design: it is created, settled,
+// and discarded entirely within a single Query/QueryRow/Exec call on
+// the same goroutine. State is shared via the `state` pointer; the
+// state's own methods are goroutine-safe.
+type PendingObservation struct {
+	state *ConnectionGucState
+	cmds  []SetCommand
+}
+
+// Pending parses sql for state-mutation commands but does NOT apply
+// them. The returned PendingObservation must be settled via either
+// Apply() or DiscardAfterError() before the call returns; failing to
+// settle is a wrapper bug (the parsed commands silently disappear).
+//
+// Pending is cheap to call on SQL with no SET / RESET / DISCARD —
+// returns a zero-cmd PendingObservation that no-ops on settle. This
+// keeps the per-call overhead in line with the bare ObserveSQL fast
+// path.
+func (s *ConnectionGucState) Pending(sql string) *PendingObservation {
+	return &PendingObservation{state: s, cmds: parseSetCommands(sql)}
+}
+
+// HasMutation reports whether any state-mutation command was parsed
+// out of the originating SQL. Used by callers (wrap.go) to decide
+// whether DiscardAfterError should mark the connection dirty: if no
+// SETs were parsed, there's nothing to roll back, and the dirty mark
+// would just trigger an unnecessary verify on the next checkout.
+func (p *PendingObservation) HasMutation() bool {
+	return len(p.cmds) > 0
+}
+
+// Apply commits every parsed command to the underlying state. Called
+// by the wrapper after the underlying Querier reports nil error. The
+// state hash moves to reflect every recognised SET / RESET / DISCARD;
+// SET LOCAL and SetCmdNone are filtered out at parse time so the
+// commit list is already clean. Returns true if the apply changed the
+// hash.
+func (p *PendingObservation) Apply() bool {
+	if p == nil || p.state == nil || len(p.cmds) == 0 {
+		return false
+	}
+	before := p.state.Hash()
+	for _, cmd := range p.cmds {
+		p.state.Apply(cmd)
+	}
+	return p.state.Hash() != before
+}
+
+// DiscardAfterError drops the parsed commands without applying them
+// AND marks the underlying state dirty (when at least one mutation was
+// observed) so the next checkout runs verify-against-pg_settings.
+//
+// The dirty mark is mandatory — even on what looks like a single-
+// statement error, pgx/database/sql may have batched the SQL across
+// multiple PG protocol messages, and a partial-apply at the server
+// would leave the wrapper's hash in a stale state that only verify
+// can repair. The cost is one verify on the unhappy path, which is
+// the right trade for cache-correctness.
+//
+// SetCmdNone-only Pending observations (no recognised mutation)
+// short-circuit: discarding nothing requires no dirty mark.
+func (p *PendingObservation) DiscardAfterError() {
+	if p == nil || p.state == nil || len(p.cmds) == 0 {
+		return
+	}
+	p.state.MarkDirty()
 }
 
 // IsTopLevelFunctionCall reports whether `sql` is a top-level

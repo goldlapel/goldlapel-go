@@ -364,29 +364,34 @@ func (cc *CachedConn) realExec(ctx context.Context, sql string, args ...interfac
 	return cc.real.Exec(ctx, sql, args...)
 }
 
-// observeForPool propagates SQL-stream observations into the pool
-// discarder (if attached). Called alongside ObserveSQL on every wire-
-// bound SQL string.
+// applyPoolEffectFromCmds propagates a pre-parsed command list into
+// the pool discarder (if attached). Idempotent under repeated calls
+// for the same SQL; the wrapper invokes this from settleObservation
+// only when the underlying Querier returned nil error, so failed SETs
+// don't dirty the pool.
 //
-//   - Any unsafe SET / RESET / DISCARD-other / set_config(false) →
-//     pool dirty (the connection now carries session state another
-//     borrower would inherit on pool reuse).
+// Per-command effect:
+//
+//   - Unsafe SET / RESET / set_config(false) → pool dirty (the
+//     connection now carries session state another borrower would
+//     inherit on pool reuse).
 //   - DISCARD ALL / RESET ALL → pool clean (PG has cleared session
 //     state authoritatively).
 //   - SET LOCAL / set_config(..., true) → pool unaffected (LOCAL
 //     scope is automatically dropped at COMMIT/ROLLBACK).
+//   - DISCARD PLANS / SEQUENCES / TEMP / TEMPORARY → pool unaffected
+//     (these don't touch GUC state, so the pool dirty axis doesn't
+//     move).
 //
-// Multi-statement Q messages are handled by inspecting each
-// segment; the first state-affecting segment wins for the dirty
-// direction, but RESET ALL / DISCARD ALL anywhere in the body
-// drops dirty (PG's actual behaviour: DISCARD inside a script
-// resets state at that point).
-func (cc *CachedConn) observeForPool(sql string) {
+// Multi-statement bodies feed every parsed command in order — RESET
+// ALL / DISCARD ALL anywhere in the list clears the dirty bit (PG's
+// actual behaviour: DISCARD inside a script resets state at that
+// point).
+func (cc *CachedConn) applyPoolEffectFromCmds(cmds []SetCommand) {
 	if cc.poolDiscarder == nil {
 		return
 	}
-	process := func(stmt string) {
-		cmd := ParseSetCommand(stmt)
+	for _, cmd := range cmds {
 		switch cmd.Kind {
 		case SetCmdSet:
 			if IsUnsafeGUC(cmd.Name) {
@@ -398,56 +403,102 @@ func (cc *CachedConn) observeForPool(sql string) {
 			}
 		case SetCmdResetAll:
 			cc.poolDiscarder.MarkClean()
-		case SetCmdDiscardOther:
-			// Doesn't touch GUC state; doesn't change pool-clean
-			// status either. (DISCARD PLANS still leaves the
-			// connection's GUCs in place.)
+		case SetCmdDiscardOther, SetCmdSetLocal, SetCmdNone:
+			// No pool effect.
 		}
-	}
-	stripped := sql
-	if !containsTopLevelSemicolon(stripped) {
-		process(stripped)
-		return
-	}
-	for _, seg := range SplitStatements(stripped) {
-		process(seg)
 	}
 }
 
-// containsTopLevelSemicolon reports whether `sql` contains a `;`
-// character outside of a string literal — i.e. whether it's a
-// multi-statement body. Cheap to compute; mirrors the fast-path
-// check inside ObserveSQL so observeForPool stays consistent.
-func containsTopLevelSemicolon(sql string) bool {
-	var quote byte
-	for i := 0; i < len(sql); i++ {
-		c := sql[i]
-		if quote != 0 {
-			if c == quote {
-				if i+1 < len(sql) && sql[i+1] == quote {
-					i++
-					continue
-				}
-				quote = 0
-			}
-			continue
-		}
-		switch c {
-		case '\'', '"':
-			quote = c
-		case ';':
-			// Trailing-only `;` is benign; check we have content
-			// after it (otherwise it's just a terminator).
-			rest := sql[i+1:]
-			for _, r := range rest {
-				if r != ' ' && r != '\t' && r != '\r' && r != '\n' && r != ';' {
-					return true
-				}
-			}
-			return false
-		}
+// pendingObservation is the wrapper-level bundle of every state
+// mutation a single Query / QueryRow / Exec call observed on the wire
+// — the GUC-state hash mutation, the pool-discarder dirty/clean
+// effect, and the inTransaction flag flip. None of these are committed
+// until the Querier reports nil error; on error, settle() drops the
+// pending mutations and (when at least one mutation was observed)
+// marks the GUC state dirty so the next checkout reconciles via
+// verify-against-pg_settings.
+//
+// This is the SET-actually-applied protocol. Without it, the wrapper
+// eagerly mutates state on observation, which means a SET that errored
+// at the wire (network blip, syntax error, permission denied) would
+// still move the wrapper's hash — divergence from the server's actual
+// session state, which fragments cache slots and (for an errored
+// RESET) opens an RLS-shaped correctness hole when baseline-cached
+// rows get served under non-baseline server state.
+//
+// Multi-statement edge case: pgx returns the LAST error encountered,
+// and PG semantics say earlier successful segments still apply
+// server-side. We can't tell from a single err which segments landed,
+// so DiscardAfterError marks dirty — the next checkout's verify
+// queries pg_settings authoritatively. The cost is one verify on the
+// unhappy path; the win is provable correctness.
+type pendingObservation struct {
+	guc     *PendingObservation
+	cmds    []SetCommand // parsed commands; shared with guc.cmds
+	txAfter bool         // post-body inTransaction value (only valid when hasTx==true)
+	hasTx   bool         // true if SQL contained any transaction-control segment
+}
+
+// preparePending parses sql once for state-mutation commands and tx
+// control, stages every effect without applying it, and returns the
+// staged bundle. The caller must finalise via settle() — applying on
+// success, discarding (with implicit dirty mark) on error.
+//
+// Cheap on SQL with no SET / RESET / DISCARD / BEGIN / COMMIT —
+// reduces to a single ParseSetCommand fast-path call plus the
+// containsTxControl boolean check.
+func (cc *CachedConn) preparePending(sql string) *pendingObservation {
+	state := cc.ensureGucState()
+	pending := &pendingObservation{
+		guc:     state.Pending(sql),
+		txAfter: cc.inTransaction,
 	}
-	return false
+	pending.cmds = pending.guc.cmds
+	if containsTxControl(sql) {
+		pending.hasTx = true
+		pending.txAfter = applyTxState(sql, cc.inTransaction)
+	}
+	return pending
+}
+
+// settle commits or rolls back the staged observation based on err
+// from the Querier.
+//
+// Success path (err == nil):
+//   - Apply parsed SET / RESET / DISCARD commands to the GUC state hash.
+//   - Propagate observed effects into the pool discarder.
+//   - Flip cc.inTransaction to the post-body value when the body
+//     contained tx control.
+//
+// Error path (err != nil):
+//   - Drop the staged GUC commands. If any state-mutation command was
+//     observed, mark the GUC state dirty so the next checkout fires a
+//     verify-against-pg_settings — this is the safety net for
+//     multi-statement bodies that may have applied earlier segments
+//     before failing.
+//   - Skip pool-dirty propagation; if the Exec failed the pool
+//     borrower hasn't moved server state we'd want to DISCARD on
+//     release.
+//   - Leave cc.inTransaction untouched at its pre-call value. A
+//     failed BEGIN never opened a transaction; a failed COMMIT
+//     leaves the transaction open server-side; a failed ROLLBACK
+//     SHOULD have rolled back, but our safest default is to defer
+//     to verify-on-checkout (same as the multi-stmt SET case): a
+//     genuine ROLLBACK failure is rare and recovers on the next
+//     successful tx-control statement.
+func (cc *CachedConn) settle(p *pendingObservation, err error) {
+	if p == nil {
+		return
+	}
+	if err == nil {
+		p.guc.Apply()
+		cc.applyPoolEffectFromCmds(p.cmds)
+		if p.hasTx {
+			cc.inTransaction = p.txAfter
+		}
+		return
+	}
+	p.guc.DiscardAfterError()
 }
 
 // shouldScheduleVerifyAfter reports whether the wrapper should mark
@@ -567,19 +618,22 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	cc.maybeVerifyOnCheckout(ctx)
 
 	// Per-connection unsafe-GUC tracking. Every wire-bound SQL string is
-	// observed so a SET app.user_id='42' that arrives via Query (some
-	// drivers route bare SET through Query) updates the connection's
-	// state hash before the cache is consulted. ObserveSQL is no-op for
-	// non-SET statements and a fast single-statement path for the common
-	// case, so the overhead per call is a couple of string-prefix checks.
-	cc.ensureGucState().ObserveSQL(sql)
-	cc.observeForPool(sql)
+	// parsed for SET / RESET / DISCARD, but mutations are STAGED rather
+	// than applied — settle commits on Querier success, discards (and
+	// marks dirty) on error. The cache lookup below uses the pre-call
+	// hash, which is the right slot: if a SET is in this body and the
+	// call succeeds, the new hash applies to the NEXT call's lookup.
+	pending := cc.preparePending(sql)
 
 	// Top-level SELECT <ident>(...) shapes are stored-function calls
 	// whose body may have done a server-side SET we'll never see on
 	// the wire. Mark the connection dirty (the next checkout will
 	// verify) and schedule an async verify so the dirty window is
 	// short. Excludes set_config — already handled inline by ObserveSQL.
+	// Note: dirty is marked unconditionally (independent of Querier
+	// success) — the dirty flag is the safety net for "we don't know
+	// what the function body did", and even an erroring function call
+	// may have done a server-side SET before failing.
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
@@ -598,28 +652,20 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		}
 	}
 
-	// Transaction tracking — multi-statement-aware. applyTxState walks
-	// every top-level segment so a body like
-	// `BEGIN; INSERT INTO orders VALUES (1); COMMIT` ends with
-	// inTransaction=false to mirror the server, instead of the legacy
-	// first-token-only check that flipped it true based on BEGIN and
-	// left the cache bypassed forever until the next BEGIN/COMMIT cycle.
-	if containsTxControl(sql) {
-		cc.inTransaction = applyTxState(sql, cc.inTransaction)
-		return cc.realQuery(ctx, sql, args...)
+	// Transaction-control / write / in-tx paths bypass the cache entirely
+	// and dispatch straight to the underlying Querier. Settle pending
+	// based on the Querier's err — the SET-actually-applied protocol
+	// applies to every wire-bound dispatch, not just SET-bearing SQL.
+	if pending.hasTx || ddlHit || len(writeTables) > 0 || cc.inTransaction {
+		rows, err := cc.realQuery(ctx, sql, args...)
+		cc.settle(pending, err)
+		return rows, err
 	}
 
-	// If write detection consumed the body, no further cache work is
-	// possible — the response is a write tag, not a row stream.
-	if ddlHit || len(writeTables) > 0 {
-		return cc.realQuery(ctx, sql, args...)
-	}
-
-	// Inside transaction: bypass cache
-	if cc.inTransaction {
-		return cc.realQuery(ctx, sql, args...)
-	}
-
+	// Cacheable read path: use the pre-call hash (settle hasn't run yet).
+	// Same-call SETs route through the bypass branches above; this branch
+	// only runs for non-SET, non-tx-control, non-write SQL where the
+	// pre-call hash IS the right cache slot.
 	stateHash := cc.ensureGucState().Hash()
 
 	// Read path: check L1 cache
@@ -633,6 +679,10 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 					fields = f
 				}
 			}
+			// Cache hit — we never sent SQL to the wire. Settle as
+			// success: pending has no SET commands for non-SET SQL
+			// (the bypass branches catch SETs), so this is a no-op.
+			cc.settle(pending, nil)
 			return &cachedRows{rows: rows, fields: fields, pos: -1}, nil
 		}
 	}
@@ -644,8 +694,15 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 	collected, fields, drainErr, err := cc.fetchAndDrain(ctx, sql, args...)
 	if err != nil {
 		// fetchAndDrain has already released realMu.
+		cc.settle(pending, err)
 		return nil, err
 	}
+
+	// fetchAndDrain succeeded at the Query level (rows.Err() may still
+	// surface a drain-side issue, but the SQL did dispatch and the
+	// server processed it — earlier multi-stmt segments DID apply).
+	// Settle as success.
+	cc.settle(pending, nil)
 
 	// Cache the result under the current per-connection state hash —
 	// unless this was a session-state command (SET / RESET / LISTEN /
@@ -661,10 +718,20 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 }
 
 // QueryRow intercepts single-row queries.
+//
+// pgx.Row delivers errors at Scan() time, not at QueryRow-return time
+// — the underlying conn is held until Scan reads the response. To
+// honour the SET-actually-applied protocol on this surface, the
+// returned Row is wrapped in a settlingRow that observes the Scan err
+// and runs settle(pending, err) before returning to the caller. Cache
+// hits and the realQueryRow bypass paths each settle in their own
+// branch; the cache-miss-via-Query fallback piggybacks on Query's
+// own settle (Query owns its pending), so QueryRow's pending is
+// committed/discarded synchronously alongside the inner Query call
+// (no settlingRow needed there).
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
 	cc.maybeVerifyOnCheckout(ctx)
-	cc.ensureGucState().ObserveSQL(sql)
-	cc.observeForPool(sql)
+	pending := cc.preparePending(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
@@ -681,41 +748,42 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		}
 	}
 
-	// Transaction tracking — multi-statement-aware. See Query() for the
-	// full rationale.
-	if containsTxControl(sql) {
-		cc.inTransaction = applyTxState(sql, cc.inTransaction)
-		return cc.realQueryRow(ctx, sql, args...)
+	// Bypass the read cache for tx-control / write / in-tx bodies and
+	// wrap the underlying Row in a settlingRow so the SET-actually-
+	// applied protocol observes the deferred Scan err.
+	if pending.hasTx || ddlHit || len(writeTables) > 0 || cc.inTransaction {
+		row := cc.realQueryRow(ctx, sql, args...)
+		return &settlingRow{row: row, cc: cc, pending: pending}
 	}
 
-	// If write detection fired, dispatch to the real backend — there is
-	// no row stream to cache.
-	if ddlHit || len(writeTables) > 0 {
-		return cc.realQueryRow(ctx, sql, args...)
-	}
-
-	// Inside transaction: bypass cache
-	if cc.inTransaction {
-		return cc.realQueryRow(ctx, sql, args...)
-	}
-
+	// Cacheable read path. Use the pre-call hash so a same-body SET
+	// (which routes through the bypass above anyway) doesn't influence
+	// the cache slot for non-SET reads.
 	stateHash := cc.ensureGucState().Hash()
 
 	// Read path: check L1 cache
 	entry := cc.cache.Get(sql, args, stateHash)
 	if entry != nil {
 		rows, ok := entry.Rows.([][]interface{})
+		// Cache hit — we never sent SQL to the wire. Settle as success
+		// (no-op for non-SET SQL).
+		cc.settle(pending, nil)
 		if ok && len(rows) > 0 {
 			return &cachedRow{values: rows[0]}
 		}
 		return &cachedRow{values: nil}
 	}
 
-	// Cache miss: use Query to fetch, cache, and return first row.
-	// Query() will re-observe and re-hash; that's idempotent for the
-	// already-applied SET above (Apply on the same (name, value) pair
-	// leaves the hash unchanged) so we don't double-count.
+	// Cache miss: route through Query so the cache populates uniformly
+	// with the multi-row path. Query owns its OWN pending observation
+	// over the same SQL — it parses, settles, applies idempotently. We
+	// settle THIS layer's pending alongside Query's err, which has
+	// already been settled inside Query; the double-settle is safe
+	// because Apply on already-applied commands is a hash-stable no-op
+	// (sorted-key recomputeHashLocked produces the same hash from the
+	// same value map). DiscardAfterError is also idempotent.
 	rows, err := cc.Query(ctx, sql, args...)
+	cc.settle(pending, err)
 	if err != nil {
 		return &cachedRow{err: err}
 	}
@@ -738,10 +806,18 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 // that does `conn.Exec("SET app.user_id = '42'")` followed by
 // `conn.Query("SELECT ...")` would never have moved the state hash before
 // the cache lookup.
+//
+// SET-actually-applied protocol: the SET / RESET / DISCARD parsing and
+// the inTransaction flip are STAGED in `pending` and committed only
+// after the underlying Querier reports nil err. On err, the staged
+// effects are discarded; if any state-mutation command was observed,
+// the GUC state is marked dirty so the next checkout's verify-against-
+// pg_settings reconciles authoritatively (the right safety net for
+// multi-statement bodies that may have applied earlier segments
+// before the failing one).
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
 	cc.maybeVerifyOnCheckout(ctx)
-	cc.ensureGucState().ObserveSQL(sql)
-	cc.observeForPool(sql)
+	pending := cc.preparePending(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
@@ -749,6 +825,10 @@ func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{})
 
 	// Multi-statement-aware write detection — runs ahead of tx tracking
 	// so a `BEGIN; INSERT INTO t ...; COMMIT` body still invalidates t.
+	// Cache invalidation fires unconditionally (even for failed writes):
+	// over-invalidation is safe — the next read just reloads from the
+	// origin — whereas under-invalidation could serve stale data, which
+	// is the unsafe direction.
 	writeTables, ddlHit := detectWriteMulti(sql)
 	if ddlHit {
 		cc.cache.InvalidateAll()
@@ -758,11 +838,43 @@ func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{})
 		}
 	}
 
-	// Transaction tracking — multi-statement-aware. See Query() for the
-	// full rationale.
-	cc.inTransaction = applyTxState(sql, cc.inTransaction)
+	result, err := cc.realExec(ctx, sql, args...)
+	cc.settle(pending, err)
+	return result, err
+}
 
-	return cc.realExec(ctx, sql, args...)
+// settlingRow wraps a Row so that the underlying Querier's deferred
+// Scan-time error can drive the SET-actually-applied protocol — the
+// settle hook fires on the FIRST Scan call, applying or discarding
+// the staged pending observation based on the scan err.
+//
+// Why first Scan: pgx.Row.Scan is the canonical materialisation point
+// for the underlying conn's response. Before Scan, the conn may not
+// have read the response yet; after Scan, the err is authoritative.
+// Multiple Scan calls on the same Row are supported by pgx (the
+// second returns the same err), so settlingRow guards the settle so
+// it fires exactly once (further Scans are pass-through).
+type settlingRow struct {
+	row     Row
+	cc      *CachedConn
+	pending *pendingObservation
+	settled atomic.Bool
+}
+
+func (sr *settlingRow) Scan(dest ...interface{}) error {
+	err := sr.row.Scan(dest...)
+	// Settle on first Scan only. Any err — including pgx.ErrNoRows /
+	// sql.ErrNoRows surfaced for SETs routed through QueryRow — is
+	// treated as "discard staged pending + mark dirty if mutating".
+	// For non-SET SQL the discard is a no-op (pending has no cmds),
+	// so legitimate "no rows matched" SELECTs are unaffected. For the
+	// rare SET-via-QueryRow path, the dirty flag triggers a verify on
+	// the next checkout that reseeds against pg_settings — at the
+	// cost of one extra roundtrip on an already-pathological route.
+	if sr.settled.CompareAndSwap(false, true) {
+		sr.cc.settle(sr.pending, err)
+	}
+	return err
 }
 
 // --- Cached result types ---
