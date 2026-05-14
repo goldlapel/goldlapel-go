@@ -648,20 +648,33 @@ type ConnectionGucState struct {
 	mu sync.RWMutex
 	// Lowercased GUC name → raw value string. Only unsafe GUCs.
 	values map[string]string
-	// Cached hash of values, recomputed on every mutation. 0 for the
-	// empty (default) state, which means a fresh CachedConn's state
-	// hash matches "no GUCs set" cache slots from peer connections —
-	// exactly what we want for the common case of a wrapper user who
-	// never SETs anything unsafe.
+	// Cached hash of values mixed with dmlSeq, recomputed on every
+	// mutation. 0 for the empty (default) state — a fresh CachedConn's
+	// state hash matches "no GUCs set" cache slots from peer connections,
+	// which is exactly what we want for the common case of a wrapper
+	// user who never SETs anything unsafe.
 	hash uint64
+	// dmlSeq is a monotonic counter bumped by BumpDmlSeq after every
+	// observed INSERT / UPDATE / DELETE / MERGE / TRUNCATE when the
+	// aggressive-verify mode is on (Auto or On). Mixed into the state
+	// hash so each post-DML cache lookup lands in a fresh slot —
+	// preventing a cached pre-DML response from being served to this
+	// connection if a server-side trigger SET-mutated the connection's
+	// session GUCs (the trigger-internal-SET correctness gap documented
+	// at docs/todos/aggressive-verify-flag.md). Reset to 0 whenever the
+	// rest of the state is wiped (RESET ALL / DISCARD ALL / Reseed) so a
+	// recycled connection re-converges to a peer-shareable baseline.
+	dmlSeq uint64
 	// dirty signals "wire-layer observation may be stale". Set when a
 	// top-level SELECT <function>(...) lands (the function may have
 	// done a server-side SET we didn't see); cleared by MarkClean (run
 	// after a successful verify) or by an observed DISCARD / RESET ALL.
-	// atomic.Bool so IsDirty() / MarkDirty() / ClearDirty() never have
-	// to take s.mu — they sit on a hot path (every wrapper call inspects
-	// the flag) and we don't want to contend with concurrent state-hash
-	// readers.
+	// While dirty, the wrapper's read path bypasses L1 — every read
+	// routes to the proxy until an authoritative refresh (Reseed) or
+	// session-clearing command resolves the uncertainty. atomic.Bool so
+	// IsDirty() / MarkDirty() / ClearDirty() never have to take s.mu —
+	// they sit on a hot path (every wrapper call inspects the flag) and
+	// we don't want to contend with concurrent state-hash readers.
 	dirty atomic.Bool
 }
 
@@ -702,13 +715,48 @@ func (s *ConnectionGucState) MarkClean() {
 	s.dirty.Store(false)
 }
 
+// BumpDmlSeq advances the post-DML sequence counter so the next
+// cache-key computation on this connection produces a fresh slot.
+// Called from the wrapper's read path after every observed INSERT /
+// UPDATE / DELETE / MERGE / TRUNCATE when aggressive-verify mode is on
+// (Auto / On). The bump means: any subsequent cacheable read on this
+// connection cannot share a cache slot with a pre-DML read from this
+// same connection — closing the trigger-internal-SET correctness gap
+// (a server-side trigger that did `SET app.user_id = ...` would
+// otherwise be invisible to the wire-side state observer).
+//
+// This is the v1 mitigation: cache-key isolation, not actual
+// observation of the new GUC values. A trigger that mutated state
+// produces correct results from PG itself (PG always knows its own
+// session state); the wrapper just guarantees the cache can't hand
+// back a stale response keyed on the previous state.
+//
+// Wraparound at uint64 max is well-defined arithmetic and not a
+// concern in practice — billions of DMLs per connection still produce
+// unique slots in the wraparound window.
+func (s *ConnectionGucState) BumpDmlSeq() {
+	s.mu.Lock()
+	s.dmlSeq++
+	s.recomputeHashLocked()
+	s.mu.Unlock()
+}
+
+// DmlSeq returns the current post-DML sequence counter. Exposed for
+// tests; production callers don't need to introspect.
+func (s *ConnectionGucState) DmlSeq() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dmlSeq
+}
+
 // Reseed replaces the entire unsafe-GUC value set in one critical
 // section. Used by the verify path: the verify query yields a fresh
 // authoritative snapshot of `pg_settings WHERE source='session'`, the
 // caller passes the (name, value) pairs as a map, and Reseed swaps the
 // whole map after filtering to unsafe-only names. Returns the new
 // hash. Always clears the dirty flag — Reseed represents an
-// authoritative refresh.
+// authoritative refresh — and resets dmlSeq to 0 (authoritative state
+// supersedes any post-DML uncertainty).
 func (s *ConnectionGucState) Reseed(values map[string]string) uint64 {
 	s.mu.Lock()
 	if values == nil {
@@ -724,6 +772,7 @@ func (s *ConnectionGucState) Reseed(values map[string]string) uint64 {
 		}
 		s.values = next
 	}
+	s.dmlSeq = 0
 	s.recomputeHashLocked()
 	h := s.hash
 	s.mu.Unlock()
@@ -760,8 +809,13 @@ func (s *ConnectionGucState) Apply(cmd SetCommand) {
 		s.mu.Unlock()
 	case SetCmdResetAll:
 		s.mu.Lock()
-		if len(s.values) > 0 {
+		// RESET ALL / DISCARD ALL drops every non-default GUC AND
+		// resets the post-DML sequence — a recycled connection
+		// returns to the peer-shareable baseline so its cache slots
+		// can be hit by any other connection.
+		if len(s.values) > 0 || s.dmlSeq != 0 {
 			s.values = make(map[string]string)
+			s.dmlSeq = 0
 			s.recomputeHashLocked()
 		}
 		s.mu.Unlock()
@@ -1004,9 +1058,12 @@ func IsTopLevelFunctionCall(sql string) bool {
 // the values map in sorted key order so the hash is stable across
 // permutations of insertion order — the same set of (name, value) pairs
 // always produces the same hash, regardless of the sequence in which the
-// SETs arrived. Empty state hashes to 0 by definition.
+// SETs arrived. Empty values + zero dmlSeq is the canonical "fresh
+// connection" baseline and hashes to 0 by definition — keep the hash
+// exactly 0 so cache-slot-sharing semantics hold for the common case (no
+// unsafe SETs, no DMLs yet).
 func (s *ConnectionGucState) recomputeHashLocked() {
-	if len(s.values) == 0 {
+	if len(s.values) == 0 && s.dmlSeq == 0 {
 		s.hash = 0
 		return
 	}
@@ -1025,5 +1082,14 @@ func (s *ConnectionGucState) recomputeHashLocked() {
 		h.Write([]byte(s.values[k]))
 		h.Write([]byte{0x00})
 	}
+	// Mix dmlSeq AFTER the value bytes with its own separator so a
+	// connection with no SETs but a non-zero dmlSeq still produces a
+	// unique hash. Length-prefixed by the separator above for the same
+	// adjacency-distinction reason.
+	var seqBuf [8]byte
+	for i := 0; i < 8; i++ {
+		seqBuf[i] = byte(s.dmlSeq >> (8 * i))
+	}
+	h.Write(seqBuf[:])
 	s.hash = h.Sum64()
 }
