@@ -101,98 +101,117 @@ func setupVerifyWrapped(t *testing.T) (*CachedConn, *verifyMockQuerier) {
 	return cc, mock
 }
 
-// --- Verify-on-checkout (concern 5) ---
+// --- Dirty-flag bypass (replaces the legacy synchronous
+//     verify-on-checkout; see wrap.go's Verify lifecycle doc) ---
 
-func TestVerify_OnCheckoutFiresWhenDirty(t *testing.T) {
+func TestVerify_DirtyBypassesL1AndDoesNotFireSyncVerify(t *testing.T) {
 	cc, mock := setupVerifyWrapped(t)
 	ctx := context.Background()
 
-	// Simulate a server-side state we couldn't observe on the wire.
-	mock.setVerifyResult(map[string]string{
-		"app.user_id": "99",
-	})
+	// Prime L1 with a cached row for SELECT * FROM accounts so a
+	// subsequent same-key read WOULD hit if the dirty bypass weren't
+	// active.
+	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark the connection dirty.
 	cc.ensureGucState().MarkDirty()
 
-	// Next call should trigger verify before doing anything else.
+	// Next call must NOT fire a synchronous verify — the new model
+	// routes around L1 instead. The mock observes the user SQL but
+	// not the verify SQL.
+	preHits := cc.cache.StatsHits()
 	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
 		t.Fatal(err)
 	}
-	if mock.verifyCount.Load() != 1 {
-		t.Fatalf("expected exactly 1 verify call, got %d", mock.verifyCount.Load())
+	postHits := cc.cache.StatsHits()
+
+	if mock.verifyCount.Load() != 0 {
+		t.Errorf("dirty-bypass must NOT fire a synchronous verify, got %d", mock.verifyCount.Load())
 	}
-	if cc.ensureGucState().IsDirty() {
-		t.Error("dirty flag should be cleared after verify")
+	if postHits != preHits {
+		t.Errorf("dirty-bypass must skip L1 (hits before=%d after=%d)", preHits, postHits)
 	}
-	// State map should now reflect the simulated server-side SET.
-	want := NewConnectionGucState()
-	want.ObserveSQL("SET app.user_id = '99'")
-	if cc.GucStateHash() != want.Hash() {
-		t.Errorf("verify should have reseeded state: got %d, want %d",
-			cc.GucStateHash(), want.Hash())
+	// Dirty stays set — only an async verify or a session-clearing
+	// command (RESET ALL / DISCARD ALL) clears it.
+	if !cc.ensureGucState().IsDirty() {
+		t.Error("dirty flag must remain set until async verify / RESET ALL resolves it")
 	}
 }
 
-func TestVerify_OnCheckoutNoOpWhenClean(t *testing.T) {
+func TestVerify_CleanStateAllowsCacheHit(t *testing.T) {
 	cc, mock := setupVerifyWrapped(t)
 	ctx := context.Background()
 
-	// State is clean; no verify should fire.
+	// Prime L1.
 	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
 		t.Fatal(err)
 	}
+	// Second same-key read on a CLEAN state must hit L1.
+	preHits := cc.cache.StatsHits()
+	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
+		t.Fatal(err)
+	}
+	postHits := cc.cache.StatsHits()
+	if postHits != preHits+1 {
+		t.Errorf("clean-state read must hit L1 (delta=%d, want 1)", postHits-preHits)
+	}
 	if mock.verifyCount.Load() != 0 {
-		t.Fatalf("expected 0 verify calls, got %d", mock.verifyCount.Load())
+		t.Fatalf("clean state must not fire any verify, got %d", mock.verifyCount.Load())
 	}
 }
 
-func TestVerify_OnCheckoutSkippedInsideTransaction(t *testing.T) {
+func TestVerify_DirtyInsideTransactionStillBypasses(t *testing.T) {
 	cc, mock := setupVerifyWrapped(t)
 	ctx := context.Background()
 
 	cc.Exec(ctx, "BEGIN")
 	cc.ensureGucState().MarkDirty()
 
-	// Verify must NOT fire inside a transaction — the cache is bypassed
-	// regardless, so verify is wasted work AND could conflict with a
-	// user transaction.
+	// Inside a transaction the cache is bypassed regardless of dirty,
+	// and the new model never fires a synchronous verify either.
 	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
 		t.Fatal(err)
 	}
 	if mock.verifyCount.Load() != 0 {
-		t.Fatalf("expected 0 verify calls inside tx, got %d", mock.verifyCount.Load())
+		t.Fatalf("no sync verify should ever fire under the new model, got %d", mock.verifyCount.Load())
 	}
-	// Dirty flag should still be set — verify will fire after COMMIT.
 	if !cc.ensureGucState().IsDirty() {
 		t.Error("dirty flag should remain set inside tx")
 	}
 
 	cc.Exec(ctx, "COMMIT")
-	cc.Query(ctx, "SELECT * FROM accounts")
-	if mock.verifyCount.Load() != 1 {
-		t.Errorf("expected verify after COMMIT, got %d calls", mock.verifyCount.Load())
+	// Post-commit, the dirty flag still routes reads around L1; the
+	// async verify path (function-call observation) is what eventually
+	// clears it.
+	if !cc.ensureGucState().IsDirty() {
+		t.Error("dirty flag still set after COMMIT (no SELECT <fn> observed)")
 	}
 }
 
-func TestVerify_ReseedFiltersOnlyUnsafeGUCs(t *testing.T) {
+func TestVerify_AsyncReseedFiltersOnlyUnsafeGUCs(t *testing.T) {
 	cc, mock := setupVerifyWrapped(t)
 	ctx := context.Background()
 
 	// pg_settings would yield every session-modified GUC; the wrapper
-	// must keep only unsafe ones in its state map.
+	// must keep only unsafe ones in its state map. Drive the reseed
+	// via the async path: a top-level SELECT <fn>() marks dirty and
+	// schedules verify; Close() drains the verify goroutine.
 	mock.setVerifyResult(map[string]string{
 		"app.tenant":          "acme",     // unsafe (namespaced)
 		"work_mem":            "64MB",     // safe — must not enter map
 		"search_path":         "tenant_a", // unsafe
 		"client_min_messages": "warning",  // safe
 	})
-	cc.ensureGucState().MarkDirty()
-	cc.Query(ctx, "SELECT 1")
+	cc.Query(ctx, "SELECT my_func()")
+	cc.Close() // waits for the async verify to land
 
 	want := NewConnectionGucState()
 	want.ObserveSQL("SET app.tenant = 'acme'")
 	want.ObserveSQL("SET search_path = 'tenant_a'")
 	if cc.GucStateHash() != want.Hash() {
-		t.Errorf("verify should drop safe GUCs from the map: got %d, want %d",
+		t.Errorf("async verify should drop safe GUCs from the map: got %d, want %d",
 			cc.GucStateHash(), want.Hash())
 	}
 }

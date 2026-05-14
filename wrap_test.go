@@ -819,10 +819,13 @@ func TestStateHash_SameStateOnTwoConnectionsCanShareCache(t *testing.T) {
 	connA.Exec(ctx, "SET app.user_id = '42'")
 	connB.Exec(ctx, "SET app.user_id = '42'")
 
-	connA.Query(ctx, "SELECT shared_value()")
+	// Use a plain projection — a top-level function-call shape
+	// (SELECT my_func()) would mark dirty + bypass L1 under the new
+	// model, defeating the shared-slot assertion.
+	connA.Query(ctx, "SELECT v FROM shared_table WHERE id = 1")
 	// connB should hit the cache populated by connA — same SQL, same
 	// state hash. selectCount(mockB) stays at 0.
-	connB.Query(ctx, "SELECT shared_value()")
+	connB.Query(ctx, "SELECT v FROM shared_table WHERE id = 1")
 
 	if selectCount(mockB) != 0 {
 		t.Fatalf("connB should have hit the singleton cache (same state hash as connA); got %d real SELECTs on B",

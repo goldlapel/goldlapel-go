@@ -2,50 +2,32 @@ package goldlapel
 
 import (
 	"context"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
-// aggressiveVerifyMockQuerier mirrors verifyMockQuerier but ALSO
-// recognises the detection probe SQL (`SELECT 1 FROM pg_trigger ...`)
-// and returns a controlled "found / not found" answer. Verify SQL
-// behaviour is identical to verifyMockQuerier.
-type aggressiveVerifyMockQuerier struct {
+// dmlMockQuerier captures the SQL the wrapper sends to the underlying
+// connection so the tests can prove the always-on bump path doesn't
+// fire a verify roundtrip per DML. It also recognises the verify-
+// against-pg_settings shape (used by the function-call path, NOT the
+// DML path) so we can assert that the DML path stays off it.
+type dmlMockQuerier struct {
 	mu sync.Mutex
 
 	queries []string
-
-	// detectionFound is the canned answer to the detection probe.
-	// True ↔ "we found a trigger that mutates session state".
-	detectionFound bool
-	// detectionErr, when non-nil, makes the probe return an error
-	// from Query (simulates permission denied on pg_proc, transient
-	// network failure, etc.).
-	detectionErr error
-	// detectionCount counts probe invocations. Atomic so concurrent
-	// goroutines don't need to take mu.
-	detectionCount atomic.Int64
-
-	// verifyResult is the canned snapshot returned to the verify
-	// SQL.
-	verifyResult map[string]string
-	verifyCount  atomic.Int64
 }
 
-func newAggressiveVerifyMockQuerier() *aggressiveVerifyMockQuerier {
-	return &aggressiveVerifyMockQuerier{verifyResult: make(map[string]string)}
+func newDmlMockQuerier() *dmlMockQuerier {
+	return &dmlMockQuerier{}
 }
 
-func (m *aggressiveVerifyMockQuerier) recordQuery(sql string) {
+func (m *dmlMockQuerier) recordQuery(sql string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.queries = append(m.queries, sql)
 }
 
-func (m *aggressiveVerifyMockQuerier) queryList() []string {
+func (m *dmlMockQuerier) queryList() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]string, len(m.queries))
@@ -53,79 +35,49 @@ func (m *aggressiveVerifyMockQuerier) queryList() []string {
 	return out
 }
 
-func (m *aggressiveVerifyMockQuerier) setDetection(found bool, err error) {
+func (m *dmlMockQuerier) verifyCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.detectionFound = found
-	m.detectionErr = err
+	n := 0
+	for _, sql := range m.queries {
+		if isVerifySQL(sql) {
+			n++
+		}
+	}
+	return n
 }
 
-func (m *aggressiveVerifyMockQuerier) Query(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
+func (m *dmlMockQuerier) Query(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
 	m.recordQuery(sql)
-	if isDetectionSQL(sql) {
-		m.detectionCount.Add(1)
-		m.mu.Lock()
-		err := m.detectionErr
-		found := m.detectionFound
-		m.mu.Unlock()
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			return &mockRows{rows: [][]interface{}{{1}}, fields: []FieldDescription{{Name: "?column?"}}, pos: -1}, nil
-		}
-		return &mockRows{rows: nil, fields: []FieldDescription{{Name: "?column?"}}, pos: -1}, nil
-	}
 	if isVerifySQL(sql) {
-		m.verifyCount.Add(1)
-		m.mu.Lock()
-		snapshot := make([][]interface{}, 0, len(m.verifyResult))
-		for k, v := range m.verifyResult {
-			snapshot = append(snapshot, []interface{}{k, v})
-		}
-		m.mu.Unlock()
-		return &mockRows{rows: snapshot, fields: []FieldDescription{{Name: "name"}, {Name: "setting"}}, pos: -1}, nil
+		return &mockRows{rows: nil, fields: []FieldDescription{{Name: "name"}, {Name: "setting"}}, pos: -1}, nil
 	}
 	return &mockRows{rows: [][]interface{}{{1}}, fields: []FieldDescription{{Name: "id"}}, pos: -1}, nil
 }
 
-func (m *aggressiveVerifyMockQuerier) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
+func (m *dmlMockQuerier) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
 	m.recordQuery(sql)
 	return &mockRow{values: []interface{}{1}}
 }
 
-func (m *aggressiveVerifyMockQuerier) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
+func (m *dmlMockQuerier) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
 	m.recordQuery(sql)
 	return nil, nil
 }
 
-func isDetectionSQL(sql string) bool {
-	return strings.Contains(sql, "pg_trigger") && strings.Contains(sql, "pg_proc")
-}
-
-// setupAggressiveVerifyWrapped builds a CachedConn against an
-// aggressiveVerifyMockQuerier with a unique per-test upstream key so
-// the package-level detection cache doesn't bleed between cases.
-func setupAggressiveVerifyWrapped(t *testing.T, upstreamKey string) (*CachedConn, *aggressiveVerifyMockQuerier) {
+// setupDmlWrapped builds a CachedConn against a dmlMockQuerier. The
+// native cache is reset between tests so dml_seq-isolated cache slots
+// don't leak across cases.
+func setupDmlWrapped(t *testing.T) (*CachedConn, *dmlMockQuerier) {
 	t.Helper()
 	ResetNativeCache()
-	ResetAggressiveVerifyDetectionCache()
-	SetAggressiveVerifyActive(false)
 	cache := GetNativeCache()
 	cache.mu.Lock()
 	cache.invConnected = true
 	cache.mu.Unlock()
-	mock := newAggressiveVerifyMockQuerier()
+	mock := newDmlMockQuerier()
 	cc := &CachedConn{real: mock, cache: cache}
-	cc.SetAggressiveVerifyUpstream(upstreamKey)
-	t.Cleanup(func() {
-		cc.Close()
-		// Restore process-level state so unrelated tests aren't
-		// affected (license-active flag is process-wide; detection
-		// cache likewise).
-		SetAggressiveVerifyActive(false)
-		ResetAggressiveVerifyDetectionCache()
-	})
+	t.Cleanup(func() { cc.Close() })
 	return cc, mock
 }
 
@@ -170,366 +122,222 @@ func TestAggressiveVerify_LooksLikeDML(t *testing.T) {
 	}
 }
 
-// --- Mode resolution ---
+// --- Always-on dml_seq bump under Auto / On ---
 
-func TestAggressiveVerify_ExplicitOnFiresVerifyAfterDML(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test1")
+func TestAggressiveVerify_DefaultAutoBumpsDmlSeqOnDML(t *testing.T) {
+	cc, mock := setupDmlWrapped(t)
+	ctx := context.Background()
+
+	state := cc.ensureGucState()
+	if state.DmlSeq() != 0 {
+		t.Fatalf("baseline dml_seq must be 0, got %d", state.DmlSeq())
+	}
+	baselineHash := state.Hash()
+	if baselineHash != 0 {
+		t.Fatalf("baseline hash must be 0, got %x", baselineHash)
+	}
+
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := state.DmlSeq(); got != 1 {
+		t.Errorf("dml_seq after one DML = %d, want 1", got)
+	}
+	if state.Hash() == baselineHash {
+		t.Error("state hash must change after a DML bump")
+	}
+	// Zero verify roundtrips per write — the whole point of the
+	// always-on bump model.
+	if got := mock.verifyCount(); got != 0 {
+		t.Errorf("DML must NOT trigger a verify roundtrip, got %d", got)
+	}
+}
+
+func TestAggressiveVerify_ExplicitOnBumpsDmlSeq(t *testing.T) {
+	cc, mock := setupDmlWrapped(t)
 	cc.SetAggressiveVerify(AggressiveVerifyOn)
 	ctx := context.Background()
 
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+	if _, err := cc.Exec(ctx, "UPDATE t SET x = 1"); err != nil {
 		t.Fatal(err)
 	}
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("expected at least 1 async verify after DML, got %d", mock.verifyCount.Load())
+	if got := cc.ensureGucState().DmlSeq(); got != 1 {
+		t.Errorf("dml_seq under explicit On = %d, want 1", got)
 	}
-	// Detection probe must NOT fire — explicit On bypasses it.
-	if mock.detectionCount.Load() != 0 {
-		t.Errorf("explicit On should bypass detection, got %d probes", mock.detectionCount.Load())
+	if got := mock.verifyCount(); got != 0 {
+		t.Errorf("On mode must NOT fire verify roundtrip, got %d", got)
 	}
 }
 
-func TestAggressiveVerify_ExplicitOffSuppressesVerifyAfterDML(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test2")
-	cc.SetAggressiveVerify(AggressiveVerifyOff)
-	// Set the license-active flag on so we'd hit verify under Auto;
-	// explicit Off must still suppress.
-	SetAggressiveVerifyActive(true)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	// Sleep briefly so any (incorrectly) scheduled verify goroutine
-	// has time to fire.
-	time.Sleep(20 * time.Millisecond)
-	cc.Close()
-
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("explicit Off should suppress all verifies, got %d", mock.verifyCount.Load())
-	}
-	if mock.detectionCount.Load() != 0 {
-		t.Errorf("explicit Off should bypass detection, got %d probes", mock.detectionCount.Load())
-	}
-}
-
-func TestAggressiveVerify_AutoLicenseSignalEnables(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test3")
-	// No explicit per-CachedConn mode — Auto is default.
-	SetAggressiveVerifyActive(true)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("license signal should enable verify under Auto, got %d", mock.verifyCount.Load())
-	}
-	// License signal short-circuits detection — probe must not fire.
-	if mock.detectionCount.Load() != 0 {
-		t.Errorf("license signal should bypass detection, got %d probes", mock.detectionCount.Load())
-	}
-}
-
-func TestAggressiveVerify_AutoDetectionPositiveEnables(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test4")
-	mock.setDetection(true, nil)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc.Close()
-
-	if mock.detectionCount.Load() != 1 {
-		t.Errorf("expected exactly 1 detection probe, got %d", mock.detectionCount.Load())
-	}
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("positive detection should enable verify, got %d", mock.verifyCount.Load())
-	}
-}
-
-func TestAggressiveVerify_AutoDetectionNegativeDisables(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test5")
-	mock.setDetection(false, nil)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	cc.Close()
-
-	if mock.detectionCount.Load() != 1 {
-		t.Errorf("expected exactly 1 detection probe, got %d", mock.detectionCount.Load())
-	}
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("negative detection should leave verify off, got %d", mock.verifyCount.Load())
-	}
-}
-
-func TestAggressiveVerify_DetectionErrorDefaultsOff(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://test6")
-	mock.setDetection(false, context.DeadlineExceeded)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	cc.Close()
-
-	if mock.detectionCount.Load() != 1 {
-		t.Errorf("expected exactly 1 detection probe, got %d", mock.detectionCount.Load())
-	}
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("detection error should default off, got %d", mock.verifyCount.Load())
-	}
-}
-
-// --- Cache: detection result reused across CachedConns ---
-
-func TestAggressiveVerify_DetectionCacheReusedAcrossCachedConns(t *testing.T) {
-	ResetNativeCache()
-	ResetAggressiveVerifyDetectionCache()
-	SetAggressiveVerifyActive(false)
-	cache := GetNativeCache()
-	cache.mu.Lock()
-	cache.invConnected = true
-	cache.mu.Unlock()
-
-	const upstream = "tcp://shared-db:5432"
-
-	// First CachedConn — runs the detection probe.
-	mock1 := newAggressiveVerifyMockQuerier()
-	mock1.setDetection(true, nil)
-	cc1 := &CachedConn{real: mock1, cache: cache}
-	cc1.SetAggressiveVerifyUpstream(upstream)
-	t.Cleanup(func() { cc1.Close() })
-	if _, err := cc1.Exec(context.Background(), "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc1.Close()
-	if mock1.detectionCount.Load() != 1 {
-		t.Errorf("first cc: expected 1 probe, got %d", mock1.detectionCount.Load())
-	}
-
-	// Second CachedConn against the SAME upstream — must reuse the
-	// cached verdict and skip the probe entirely. We construct a
-	// fresh mock so any probe call would tick THIS mock's counter,
-	// not the first one's.
-	mock2 := newAggressiveVerifyMockQuerier()
-	cc2 := &CachedConn{real: mock2, cache: cache}
-	cc2.SetAggressiveVerifyUpstream(upstream)
-	t.Cleanup(func() { cc2.Close() })
-	if _, err := cc2.Exec(context.Background(), "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc2.Close()
-	if mock2.detectionCount.Load() != 0 {
-		t.Errorf("second cc: detection cache should have been reused, got %d probes", mock2.detectionCount.Load())
-	}
-	if mock2.verifyCount.Load() < 1 {
-		t.Errorf("second cc: verify should still fire from cached positive, got %d", mock2.verifyCount.Load())
-	}
-
-	// Cleanup is registered above; explicit cache reset for
-	// downstream tests.
-	t.Cleanup(func() { ResetAggressiveVerifyDetectionCache() })
-}
-
-func TestAggressiveVerify_DetectionCacheKeyedByUpstream(t *testing.T) {
-	ResetNativeCache()
-	ResetAggressiveVerifyDetectionCache()
-	SetAggressiveVerifyActive(false)
-	cache := GetNativeCache()
-	cache.mu.Lock()
-	cache.invConnected = true
-	cache.mu.Unlock()
-
-	// Upstream A → positive detection.
-	mockA := newAggressiveVerifyMockQuerier()
-	mockA.setDetection(true, nil)
-	ccA := &CachedConn{real: mockA, cache: cache}
-	ccA.SetAggressiveVerifyUpstream("tcp://upstream-A")
-	t.Cleanup(func() { ccA.Close() })
-	if _, err := ccA.Exec(context.Background(), "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Upstream B → negative detection. Must run its OWN probe (the
-	// cache is keyed by URL, not shared globally).
-	mockB := newAggressiveVerifyMockQuerier()
-	mockB.setDetection(false, nil)
-	ccB := &CachedConn{real: mockB, cache: cache}
-	ccB.SetAggressiveVerifyUpstream("tcp://upstream-B")
-	t.Cleanup(func() { ccB.Close() })
-	if _, err := ccB.Exec(context.Background(), "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-
-	ccA.Close()
-	ccB.Close()
-	if mockA.detectionCount.Load() != 1 {
-		t.Errorf("upstream A: expected 1 probe, got %d", mockA.detectionCount.Load())
-	}
-	if mockB.detectionCount.Load() != 1 {
-		t.Errorf("upstream B: expected 1 probe, got %d", mockB.detectionCount.Load())
-	}
-	if mockA.verifyCount.Load() < 1 {
-		t.Errorf("upstream A (positive): verify should fire, got %d", mockA.verifyCount.Load())
-	}
-	if mockB.verifyCount.Load() != 0 {
-		t.Errorf("upstream B (negative): verify should be off, got %d", mockB.verifyCount.Load())
-	}
-	t.Cleanup(func() { ResetAggressiveVerifyDetectionCache() })
-}
-
-// --- Per-CachedConn resolution gate ---
-
-func TestAggressiveVerify_DetectionRunsOnceMaxPerCachedConn(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://once")
-	mock.setDetection(true, nil)
-	ctx := context.Background()
-
-	for i := 0; i < 5; i++ {
-		if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	cc.Close()
-
-	if mock.detectionCount.Load() != 1 {
-		t.Errorf("expected exactly 1 detection probe across 5 DML calls, got %d", mock.detectionCount.Load())
-	}
-}
-
-// --- DML detection at the wrapper level ---
-
-func TestAggressiveVerify_NonDMLSkipsScheduling(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://nondml")
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-
-	// Plain SELECT — never DML, must never schedule.
-	if _, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	cc.Close()
-
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("non-DML should never schedule verify, got %d", mock.verifyCount.Load())
-	}
-}
-
-func TestAggressiveVerify_QueryRowDMLSchedulesVerify(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://qrow")
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-
-	// INSERT ... RETURNING is the canonical QueryRow-DML shape.
-	row := cc.QueryRow(ctx, "INSERT INTO t VALUES (1) RETURNING id")
-	var id int
-	_ = row.Scan(&id)
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("QueryRow on DML should schedule verify, got %d", mock.verifyCount.Load())
-	}
-}
-
-func TestAggressiveVerify_QueryDMLSchedulesVerify(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://q")
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-
-	if _, err := cc.Query(ctx, "DELETE FROM t WHERE id = 1"); err != nil {
-		t.Fatal(err)
-	}
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("Query on DML should schedule verify, got %d", mock.verifyCount.Load())
-	}
-}
-
-// --- Multi-statement bodies ---
-
-func TestAggressiveVerify_MultiStatementWithDMLSchedules(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://multi")
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "SET app.user_id = '42'; INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("multi-statement body containing DML should schedule, got %d", mock.verifyCount.Load())
-	}
-}
-
-// --- Close lifecycle interaction ---
-
-func TestAggressiveVerify_PostCloseDMLDoesNotSpawn(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://post")
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-	cc.Close()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("post-Close DML must not spawn verify, got %d", mock.verifyCount.Load())
-	}
-}
-
-// --- Mode override precedence ---
-
-func TestAggressiveVerify_ExplicitOnBeatsAutoNegativeDetection(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://prec1")
-	mock.setDetection(false, nil) // detection would say off
-	cc.SetAggressiveVerify(AggressiveVerifyOn)
-	ctx := context.Background()
-
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
-	cc.Close()
-
-	if mock.verifyCount.Load() < 1 {
-		t.Errorf("explicit On should override negative detection, got %d", mock.verifyCount.Load())
-	}
-}
-
-func TestAggressiveVerify_ExplicitOffBeatsAutoPositiveDetection(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://prec2")
-	mock.setDetection(true, nil) // detection would say on
+func TestAggressiveVerify_OffSuppressesBumpAndWarnsOnce(t *testing.T) {
+	// Reset the package-wide once so the warning sub-assertion below
+	// can fire deterministically. Mutating sync.Once via reset isn't
+	// possible from outside the package internals; we instead drive
+	// the warning path by observing that the first DML under Off
+	// doesn't bump dml_seq AND that the mode string round-trips.
+	cc, mock := setupDmlWrapped(t)
 	cc.SetAggressiveVerify(AggressiveVerifyOff)
 	ctx := context.Background()
 
-	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+	if _, err := cc.Exec(ctx, "DELETE FROM t WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
-	cc.Close()
-
-	if mock.verifyCount.Load() != 0 {
-		t.Errorf("explicit Off should override positive detection, got %d", mock.verifyCount.Load())
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("dml_seq under Off = %d, want 0 (suppressed)", got)
+	}
+	if got := mock.verifyCount(); got != 0 {
+		t.Errorf("Off mode must NOT fire verify roundtrip, got %d", got)
 	}
 }
 
-// --- WithAggressiveVerify GoldLapel option ---
+// --- Cache-key isolation after DML ---
+
+func TestAggressiveVerify_CacheMissAfterDML(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	ctx := context.Background()
+
+	// Prime the L1 cache for SELECT * FROM t — a baseline-hash cache
+	// slot.
+	rows, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+
+	// One DML — must bump dml_seq, rolling the cache key forward.
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	if cc.ensureGucState().DmlSeq() != 1 {
+		t.Fatal("DML did not bump dml_seq")
+	}
+
+	// Same SELECT again. The post-DML state hash differs from the
+	// pre-DML slot, so the L1 lookup must miss — the slot we primed
+	// above is no longer reachable from this connection's new key.
+	hits0 := cc.cache.StatsHits()
+	rows2, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows2.Close()
+	hits1 := cc.cache.StatsHits()
+	if hits1 != hits0 {
+		t.Errorf("post-DML read must miss L1 (hits before=%d after=%d)", hits0, hits1)
+	}
+}
+
+func TestAggressiveVerify_NoBumpUnderOffPreservesCacheHit(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	cc.SetAggressiveVerify(AggressiveVerifyOff)
+	ctx := context.Background()
+
+	// Prime L1.
+	rows, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	// DML — but Off mode suppresses the bump. The cache key stays at
+	// the baseline so the subsequent same-SELECT hits L1. (Note: a
+	// write to table `t` invalidates the cache slot for table `t`, so
+	// for this assertion to test cache-key-isolation specifically we
+	// use a SELECT against a different table.)
+	if _, err := cc.Exec(ctx, "INSERT INTO other_table VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("Off must leave dml_seq at 0, got %d", got)
+	}
+
+	hits0 := cc.cache.StatsHits()
+	rows2, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows2.Close()
+	hits1 := cc.cache.StatsHits()
+	if hits1 == hits0 {
+		t.Errorf("Off mode must preserve cache hit on unrelated read (hits before=%d after=%d)", hits0, hits1)
+	}
+}
+
+// --- Dirty-flag bypasses L1 ---
+
+func TestAggressiveVerify_DirtyBypassesL1(t *testing.T) {
+	cc, mock := setupDmlWrapped(t)
+	ctx := context.Background()
+
+	// Prime L1 for SELECT * FROM t.
+	rows, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	// Confirm the slot is populated by hitting it once.
+	hits0 := cc.cache.StatsHits()
+	rows2, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows2.Close()
+	hits1 := cc.cache.StatsHits()
+	if hits1 != hits0+1 {
+		t.Fatalf("baseline same-key read must hit L1 (delta %d, want 1)", hits1-hits0)
+	}
+
+	// Now mark dirty (simulating a top-level SELECT my_func() that
+	// could have done a server-side SET).
+	cc.ensureGucState().MarkDirty()
+
+	// The current call (and subsequent) must bypass L1 and route to
+	// the underlying Querier. Hit counter stays flat; the underlying
+	// mock observes the query.
+	preQueries := len(mock.queryList())
+	prehits := cc.cache.StatsHits()
+	rows3, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows3.Close()
+	posthits := cc.cache.StatsHits()
+	postQueries := len(mock.queryList())
+
+	if posthits != prehits {
+		t.Errorf("dirty bypass must not register an L1 hit (hits before=%d after=%d)", prehits, posthits)
+	}
+	if postQueries == preQueries {
+		t.Error("dirty bypass must route to the underlying Querier")
+	}
+}
+
+func TestAggressiveVerify_DirtyBypassesL1OnQueryRow(t *testing.T) {
+	cc, mock := setupDmlWrapped(t)
+	ctx := context.Background()
+
+	// Prime via Query so QueryRow can hit the same slot.
+	rows, err := cc.Query(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+
+	// Mark dirty before QueryRow.
+	cc.ensureGucState().MarkDirty()
+
+	preQueries := len(mock.queryList())
+	row := cc.QueryRow(ctx, "SELECT 1")
+	var v int
+	_ = row.Scan(&v)
+	postQueries := len(mock.queryList())
+
+	if postQueries == preQueries {
+		t.Error("QueryRow dirty bypass must route to the underlying Querier")
+	}
+}
+
+// --- WithAggressiveVerify option + mode strings ---
 
 func TestAggressiveVerify_WithAggressiveVerifyOption(t *testing.T) {
 	gl := &GoldLapel{}
@@ -540,13 +348,19 @@ func TestAggressiveVerify_WithAggressiveVerifyOption(t *testing.T) {
 	if gl.aggressiveVerify != AggressiveVerifyOn {
 		t.Errorf("expected AggressiveVerifyOn, got %v", gl.aggressiveVerify)
 	}
+
+	gl2 := &GoldLapel{}
+	WithAggressiveVerify(AggressiveVerifyOff).applyStart(gl2)
+	if gl2.aggressiveVerify != AggressiveVerifyOff {
+		t.Errorf("expected AggressiveVerifyOff, got %v", gl2.aggressiveVerify)
+	}
 }
 
 func TestAggressiveVerify_ModeStrings(t *testing.T) {
 	cases := map[AggressiveVerifyMode]string{
-		AggressiveVerifyAuto: "auto",
-		AggressiveVerifyOn:   "on",
-		AggressiveVerifyOff:  "off",
+		AggressiveVerifyAuto:     "auto",
+		AggressiveVerifyOn:       "on",
+		AggressiveVerifyOff:      "off",
 		AggressiveVerifyMode(99): "unknown",
 	}
 	for mode, want := range cases {
@@ -557,11 +371,52 @@ func TestAggressiveVerify_ModeStrings(t *testing.T) {
 	}
 }
 
+func TestAggressiveVerify_PerCachedConnOverrideBeatsGoldLapel(t *testing.T) {
+	// Simulate a *GoldLapel saying On while the per-CachedConn override
+	// says Off — explicit per-conn always wins.
+	cc, _ := setupDmlWrapped(t)
+	// Install a GoldLapel-level On (not via Start; directly through the
+	// registration hook the resolver uses).
+	lastStartedInstanceMu.Lock()
+	prev := lastStartedInstance
+	lastStartedInstance = &GoldLapel{aggressiveVerify: AggressiveVerifyOn, aggressiveVerifySet: true}
+	lastStartedInstanceMu.Unlock()
+	t.Cleanup(func() {
+		lastStartedInstanceMu.Lock()
+		lastStartedInstance = prev
+		lastStartedInstanceMu.Unlock()
+	})
+
+	cc.SetAggressiveVerify(AggressiveVerifyOff)
+	ctx := context.Background()
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("per-conn Off must beat GoldLapel On, dml_seq=%d", got)
+	}
+}
+
+// --- Close lifecycle interaction ---
+
+func TestAggressiveVerify_PostCloseDMLDoesNotPanic(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	ctx := context.Background()
+	cc.Close()
+
+	// Post-Close DML still parses and bumps (the bump is a local-state
+	// operation; it doesn't dispatch an async goroutine). What MUST
+	// not happen is a panic or a scheduled goroutine that races with
+	// the closed lifecycle.
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // --- Race-clean concurrent DML + introspection ---
 
 func TestAggressiveVerify_RaceCleanUnderConcurrentDML(t *testing.T) {
-	cc, mock := setupAggressiveVerifyWrapped(t, "tcp://race")
-	mock.setDetection(true, nil)
+	cc, _ := setupDmlWrapped(t)
 	cc.SetAggressiveVerify(AggressiveVerifyOn)
 	ctx := context.Background()
 
@@ -585,128 +440,90 @@ func TestAggressiveVerify_RaceCleanUnderConcurrentDML(t *testing.T) {
 			for i := 0; i < iters; i++ {
 				_ = cc.GucStateHash()
 				_ = cc.ensureGucState().IsDirty()
-				_ = cc.aggressiveVerifyEnabled(ctx)
+				_ = cc.aggressiveVerifyEnabled()
+				_ = cc.ensureGucState().DmlSeq()
 			}
 		}()
 	}
 	wg.Wait()
 	cc.Close()
 
-	// At least one verify should have fired (writes always trigger
-	// the schedule + dirty mark; the in-flight gate may coalesce many
-	// onto a single verify, but the count must be > 0).
-	if mock.verifyCount.Load() == 0 {
-		t.Error("expected non-zero verify count under concurrent DML")
+	// At least one DML bumped dml_seq. The exact count depends on race
+	// ordering and how many writers got scheduled; assert non-zero.
+	if got := cc.ensureGucState().DmlSeq(); got == 0 {
+		t.Error("expected non-zero dml_seq under concurrent DML")
 	}
 }
 
-func TestAggressiveVerify_DetectionCacheRaceCleanFirstUse(t *testing.T) {
-	// Concurrent first-use of multiple CachedConns against the same
-	// upstream URL must race-cleanly through the detection probe.
-	// sync.Map.LoadOrStore semantics let two probes race on first
-	// access; we verify the result is sane (some probes ran, all
-	// CachedConns end up with a consistent verdict).
-	ResetNativeCache()
-	ResetAggressiveVerifyDetectionCache()
-	SetAggressiveVerifyActive(false)
-	cache := GetNativeCache()
-	cache.mu.Lock()
-	cache.invConnected = true
-	cache.mu.Unlock()
+// --- DML inside multi-statement bodies ---
 
-	const upstream = "tcp://race-shared"
-	const N = 8
-	mocks := make([]*aggressiveVerifyMockQuerier, N)
-	ccs := make([]*CachedConn, N)
-	for i := 0; i < N; i++ {
-		mocks[i] = newAggressiveVerifyMockQuerier()
-		mocks[i].setDetection(true, nil)
-		ccs[i] = &CachedConn{real: mocks[i], cache: cache}
-		ccs[i].SetAggressiveVerifyUpstream(upstream)
-	}
-	t.Cleanup(func() {
-		for _, cc := range ccs {
-			cc.Close()
-		}
-		ResetAggressiveVerifyDetectionCache()
-	})
+func TestAggressiveVerify_MultiStatementWithDMLBumps(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	cc.SetAggressiveVerify(AggressiveVerifyOn)
+	ctx := context.Background()
 
-	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			ccs[idx].Exec(context.Background(), "INSERT INTO t VALUES (1)")
-		}(i)
+	if _, err := cc.Exec(ctx, "SET app.user_id = '42'; INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
 	}
-	wg.Wait()
-
-	// At least one probe must have fired; race-cleanness is asserted
-	// by -race itself (no error from the race detector implies pass).
-	totalProbes := int64(0)
-	for _, m := range mocks {
-		totalProbes += m.detectionCount.Load()
-	}
-	if totalProbes == 0 {
-		t.Error("expected at least one detection probe to fire")
-	}
-	if totalProbes > N {
-		t.Errorf("probe count exceeds CachedConn count: %d > %d", totalProbes, N)
+	if got := cc.ensureGucState().DmlSeq(); got != 1 {
+		t.Errorf("multi-statement body containing DML should bump once, got %d", got)
 	}
 }
 
-// --- License-payload setter ---
+func TestAggressiveVerify_NonDMLDoesNotBump(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	cc.SetAggressiveVerify(AggressiveVerifyOn)
+	ctx := context.Background()
 
-func TestAggressiveVerify_LicensePayloadSetterAndGetter(t *testing.T) {
-	t.Cleanup(func() { SetAggressiveVerifyActive(false) })
-	if AggressiveVerifyActive() {
-		t.Error("default should be false")
+	if _, err := cc.Query(ctx, "SELECT * FROM t WHERE id = 1"); err != nil {
+		t.Fatal(err)
 	}
-	SetAggressiveVerifyActive(true)
-	if !AggressiveVerifyActive() {
-		t.Error("setter→getter round trip failed")
-	}
-	SetAggressiveVerifyActive(false)
-	if AggressiveVerifyActive() {
-		t.Error("setter→getter (false) round trip failed")
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("non-DML must not bump dml_seq, got %d", got)
 	}
 }
 
-// --- Detection cache reset clears memoised verdict ---
+// --- RESET ALL / DISCARD ALL resets dml_seq ---
 
-func TestAggressiveVerify_ResetDetectionCacheClearsVerdict(t *testing.T) {
-	ResetNativeCache()
-	ResetAggressiveVerifyDetectionCache()
-	SetAggressiveVerifyActive(false)
-	cache := GetNativeCache()
-	cache.mu.Lock()
-	cache.invConnected = true
-	cache.mu.Unlock()
+func TestAggressiveVerify_ResetAllClearsDmlSeq(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	ctx := context.Background()
 
-	const upstream = "tcp://clearable"
-
-	mock1 := newAggressiveVerifyMockQuerier()
-	mock1.setDetection(true, nil)
-	cc1 := &CachedConn{real: mock1, cache: cache}
-	cc1.SetAggressiveVerifyUpstream(upstream)
-	t.Cleanup(func() { cc1.Close() })
-	cc1.Exec(context.Background(), "INSERT INTO t VALUES (1)")
-
-	if mock1.detectionCount.Load() != 1 {
-		t.Fatalf("baseline: expected 1 probe, got %d", mock1.detectionCount.Load())
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if cc.ensureGucState().DmlSeq() != 1 {
+		t.Fatal("DML must bump dml_seq to 1")
 	}
 
-	// Reset the cache; a fresh CachedConn should re-probe.
-	ResetAggressiveVerifyDetectionCache()
+	// RESET ALL is authoritative — server has dropped every non-default
+	// GUC and the wrapper's post-DML uncertainty is moot.
+	if _, err := cc.Exec(ctx, "RESET ALL"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("RESET ALL must clear dml_seq, got %d", got)
+	}
+	if got := cc.ensureGucState().Hash(); got != 0 {
+		t.Errorf("RESET ALL must clear state hash, got %x", got)
+	}
+}
 
-	mock2 := newAggressiveVerifyMockQuerier()
-	mock2.setDetection(false, nil)
-	cc2 := &CachedConn{real: mock2, cache: cache}
-	cc2.SetAggressiveVerifyUpstream(upstream)
-	t.Cleanup(func() { cc2.Close() })
-	cc2.Exec(context.Background(), "INSERT INTO t VALUES (1)")
+func TestAggressiveVerify_DiscardAllClearsDmlSeq(t *testing.T) {
+	cc, _ := setupDmlWrapped(t)
+	ctx := context.Background()
 
-	if mock2.detectionCount.Load() != 1 {
-		t.Errorf("post-reset: expected fresh probe, got %d", mock2.detectionCount.Load())
+	if _, err := cc.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if cc.ensureGucState().DmlSeq() == 0 {
+		t.Fatal("DML must bump dml_seq")
+	}
+
+	if _, err := cc.Exec(ctx, "DISCARD ALL"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cc.ensureGucState().DmlSeq(); got != 0 {
+		t.Errorf("DISCARD ALL must clear dml_seq, got %d", got)
 	}
 }

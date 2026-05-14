@@ -53,18 +53,17 @@ type FieldDescription struct {
 //
 // Verify lifecycle:
 //
-//   - Every Query/QueryRow/Exec runs maybeVerifyOnCheckout before touching
-//     the cache. If gucState.IsDirty() returns true (a prior call observed
-//     a top-level SELECT <ident>(...) that may have done a server-side
-//     SET) the wrapper re-reads pg_settings on the same connection and
-//     Reseeds the unsafe-GUC value map. This is the safety net for
-//     stored-function SETs the wire layer can't see.
-//
 //   - After observing a top-level SELECT <ident>(...) the wrapper marks
 //     dirty and schedules an async verify in a background goroutine
 //     (verifyWG / verifyCtx). The async path keeps the user's hot path
-//     unblocked; the next checkout still re-runs verify if the async
-//     path lost the race or hadn't completed yet.
+//     unblocked.
+//
+//   - While gucState.IsDirty() is true, Query/QueryRow bypass the L1
+//     cache and route directly to the underlying Querier. The dirty
+//     window closes when the async verify Reseeds state from
+//     pg_settings, or when a session-clearing command (RESET ALL /
+//     DISCARD ALL) lands. No synchronous verify-on-checkout — the hot
+//     path never blocks on a verify roundtrip.
 //
 //   - Close() cancels the in-flight verify goroutines via verifyCancel
 //     and waits on verifyWG. Users that rely on pgx.Conn's own Close()
@@ -128,26 +127,13 @@ type CachedConn struct {
 	// users, the mutex is what makes the async verify path safe.
 	realMu sync.Mutex
 
-	// Aggressive post-DML verify state. See aggressive_verify.go for
-	// the full design. Per-CachedConn override (mode + Set sentinel)
-	// piggybacks on atomic.Int32 / atomic.Bool so the read path
-	// (Query/QueryRow/Exec) doesn't need a mutex; the resolved
-	// "should we schedule?" verdict is cached in
-	// aggressiveVerifyEnabledFlag once aggressiveVerifyResolveOnce
-	// has run the detection probe.
-	aggressiveVerifyMode        atomic.Int32 // AggressiveVerifyMode value when aggressiveVerifyModeSet=true
-	aggressiveVerifyModeSet     atomic.Bool  // true once SetAggressiveVerify has been called
-	aggressiveVerifyResolveOnce sync.Once
-	aggressiveVerifyResolved    atomic.Bool
-	aggressiveVerifyEnabledFlag atomic.Bool
-
-	// aggressiveVerifyUpstream is the cache-key for the per-database
-	// detection result. Set by Wrap()-via-*GoldLapel and by the
-	// SetAggressiveVerifyUpstream method. The mutex protects the
-	// read+write because the string is set lazily after construction;
-	// resolution holds the mutex briefly.
-	aggressiveVerifyUpstreamMu sync.Mutex
-	aggressiveVerifyUpstream   string
+	// Aggressive post-DML mode. See aggressive_verify.go for the full
+	// design. Per-CachedConn override (mode + Set sentinel) piggybacks
+	// on atomic.Int32 / atomic.Bool so the read path
+	// (Query/QueryRow/Exec) doesn't need a mutex. Resolution falls back
+	// to the *GoldLapel option and finally the package default (Auto).
+	aggressiveVerifyMode    atomic.Int32 // AggressiveVerifyMode value when aggressiveVerifyModeSet=true
+	aggressiveVerifyModeSet atomic.Bool  // true once SetAggressiveVerify has been called
 }
 
 // Wrap wraps a Querier with the wrapper's native cache and starts the
@@ -168,17 +154,6 @@ func Wrap(conn Querier, invalidationPort int) *CachedConn {
 		cache:    cache,
 		gucState: NewConnectionGucState(),
 	}
-	// Best-effort upstream stamp for the aggressive-verify detection
-	// cache. Mirrors detectInvalidationPort's lastStartedInstance
-	// fallback — if the user spawned a *GoldLapel, the wrapper picks up
-	// the upstream URL automatically so the per-database detection
-	// memo is shared across CachedConns. Out-of-process / hand-rolled
-	// callers can use SetAggressiveVerifyUpstream to set it manually.
-	lastStartedInstanceMu.Lock()
-	if inst := lastStartedInstance; inst != nil {
-		cc.aggressiveVerifyUpstream = inst.upstream
-	}
-	lastStartedInstanceMu.Unlock()
 	return cc
 }
 
@@ -245,39 +220,15 @@ func (cc *CachedConn) Close() {
 	cc.verifyWG.Wait()
 }
 
-// maybeVerifyOnCheckout runs a synchronous verify if the connection's
-// GUC state is dirty. Called from Query/QueryRow/Exec immediately
-// before the cache lookup — the verify rebuilds state from
-// pg_settings so the cache key reflects the server's actual session
-// state, not stale wire-side observations.
-//
-// Verify failure (the underlying connection errors out) is logged
-// implicitly via the error path of cc.real.Query; we treat the state
-// as untrustworthy and leave the dirty flag set. The caller's query
-// then proceeds against the same Querier — if the connection is
-// genuinely broken, the user's call will surface the same error. We
-// never block the user on a verify error.
-//
-// Inside a transaction the cache is bypassed regardless of state, so
-// verify is skipped — the dirty flag will be re-evaluated on the next
-// post-commit checkout.
-func (cc *CachedConn) maybeVerifyOnCheckout(ctx context.Context) {
-	if cc.inTransaction {
-		return
-	}
-	state := cc.ensureGucState()
-	if !state.IsDirty() {
-		return
-	}
-	cc.runVerify(ctx)
-}
-
 // runVerify reads `pg_settings WHERE source = 'session'` directly from
-// the underlying Querier and Reseeds the GUC state map. Synchronous —
-// callers that need the async variant call scheduleAsyncVerify
-// instead. Returns nothing because errors are intentionally swallowed:
-// a transient verify failure leaves the dirty flag set so the next
-// checkout retries.
+// the underlying Querier and Reseeds the GUC state map. Runs in the
+// background async-verify goroutine (see scheduleAsyncVerify); the
+// hot path no longer fires a synchronous verify — instead, the dirty
+// flag steers reads to bypass L1 until this async refresh clears it.
+// Returns nothing because errors are intentionally swallowed: a
+// transient verify failure leaves the dirty flag set so subsequent
+// reads continue to bypass L1 until a later verify succeeds or a
+// session-clearing command resolves the uncertainty.
 //
 // The verify SQL filters to source='session' so we only see GUCs the
 // user actually changed (default values stay out of the map).
@@ -560,24 +511,27 @@ func (cc *CachedConn) shouldScheduleVerifyAfter(sql string) bool {
 	return true
 }
 
-// shouldScheduleAggressiveVerifyAfter reports whether the wrapper
-// should mark the connection dirty + schedule an async verify after
-// this DML completes. True when (a) sql looks like a DML statement
-// (INSERT/UPDATE/DELETE/MERGE/TRUNCATE — see looksLikeDML) and (b) the
-// effective aggressive-verify mode for this CachedConn is on
-// (explicit override, license-payload signal, or detection-probe hit;
-// see aggressive_verify.go for the resolution order).
+// maybeBumpDmlSeq advances the per-connection dml_seq counter when
+// `sql` looks like a DML statement (INSERT/UPDATE/DELETE/MERGE/TRUNCATE
+// — see looksLikeDML) and the effective aggressive-verify mode for
+// this CachedConn is on (Auto/On). The bump rolls the connection's
+// state hash forward so any subsequent cacheable read on this
+// connection lands in a fresh cache slot — closing the
+// trigger-internal-SET correctness gap at zero round-trip cost. See
+// aggressive_verify.go for the resolution order.
 //
-// Called from Query/QueryRow/Exec right after preparePending — the
-// caller pairs it with `defer cc.scheduleAsyncVerify()` and a dirty
-// mark, mirroring the shouldScheduleVerifyAfter pattern for the
-// function-call path so the goroutine spawn lands after the user's
-// call has returned.
-func (cc *CachedConn) shouldScheduleAggressiveVerifyAfter(ctx context.Context, sql string) bool {
+// Called from Query/QueryRow/Exec right after preparePending. Returns
+// true if a bump fired (purely informational; the wrapper doesn't
+// branch on the return value).
+func (cc *CachedConn) maybeBumpDmlSeq(sql string) bool {
 	if !looksLikeDML(sql) {
 		return false
 	}
-	return cc.aggressiveVerifyEnabled(ctx)
+	if !cc.aggressiveVerifyEnabled() {
+		return false
+	}
+	cc.ensureGucState().BumpDmlSeq()
+	return true
 }
 
 // scheduleAsyncVerify spawns a background goroutine that calls
@@ -662,14 +616,6 @@ func (cc *CachedConn) Unwrap() Querier {
 // Query intercepts SQL queries. Writes trigger invalidation and are forwarded.
 // Reads check the L1 cache first, falling back to the real connection on miss.
 func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}) (Rows, error) {
-	// Verify-on-checkout — if a prior call observed a SQL shape that
-	// could have moved server state without us seeing the SET (e.g.
-	// `SELECT my_func()` whose body did `SET app.user_id`), the dirty
-	// flag is set and we re-read pg_settings before the cache lookup.
-	// No-op outside a transaction with a clean state. Inside a tx the
-	// cache is bypassed regardless, so verify is also skipped.
-	cc.maybeVerifyOnCheckout(ctx)
-
 	// Per-connection unsafe-GUC tracking. Every wire-bound SQL string is
 	// parsed for SET / RESET / DISCARD, but mutations are STAGED rather
 	// than applied — settle commits on Querier success, discards (and
@@ -691,14 +637,12 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
 	}
-	// Aggressive-verify (smart-auto-enable): when active, every DML
-	// statement schedules the same async verify the function-call
-	// path uses, closing the trigger-internal-SET coverage gap. See
-	// aggressive_verify.go.
-	if cc.shouldScheduleAggressiveVerifyAfter(ctx, sql) {
-		cc.ensureGucState().MarkDirty()
-		defer cc.scheduleAsyncVerify()
-	}
+	// Aggressive-verify (always-on under Auto/On): every DML statement
+	// bumps the per-connection dml_seq, rolling the state hash forward
+	// so subsequent cacheable reads on this connection can't share a
+	// cache slot with a pre-DML peer. Closes the trigger-internal-SET
+	// coverage gap at zero round-trip cost. See aggressive_verify.go.
+	cc.maybeBumpDmlSeq(sql)
 
 	// Multi-statement-aware write detection runs before any short-circuit
 	// — a body like `BEGIN; INSERT INTO orders VALUES (1); COMMIT` must
@@ -723,11 +667,28 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 		return rows, err
 	}
 
+	// Dirty-flag bypass: when the wrapper has any uncertainty about the
+	// connection's session state (a recent top-level SELECT my_func()
+	// could have done a server-side SET; an errored SET observation may
+	// have left server state diverged from wire-side tracking), route
+	// this read AND every subsequent read directly to the proxy until
+	// an authoritative refresh resolves the uncertainty. Skipping L1
+	// here means a current-call cache hit can't serve stale rows under
+	// possibly-mutated server state. The proxy has its own GUC-aware
+	// state-hash + cache so we don't lose all caching — just the L1
+	// layer's slot, which is the only one with stale information.
+	state := cc.ensureGucState()
+	if state.IsDirty() {
+		rows, err := cc.realQuery(ctx, sql, args...)
+		cc.settle(pending, err)
+		return rows, err
+	}
+
 	// Cacheable read path: use the pre-call hash (settle hasn't run yet).
 	// Same-call SETs route through the bypass branches above; this branch
 	// only runs for non-SET, non-tx-control, non-write SQL where the
 	// pre-call hash IS the right cache slot.
-	stateHash := cc.ensureGucState().Hash()
+	stateHash := state.Hash()
 
 	// Read path: check L1 cache
 	entry := cc.cache.Get(sql, args, stateHash)
@@ -791,16 +752,12 @@ func (cc *CachedConn) Query(ctx context.Context, sql string, args ...interface{}
 // committed/discarded synchronously alongside the inner Query call
 // (no settlingRow needed there).
 func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interface{}) Row {
-	cc.maybeVerifyOnCheckout(ctx)
 	pending := cc.preparePending(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
 	}
-	if cc.shouldScheduleAggressiveVerifyAfter(ctx, sql) {
-		cc.ensureGucState().MarkDirty()
-		defer cc.scheduleAsyncVerify()
-	}
+	cc.maybeBumpDmlSeq(sql)
 
 	// Multi-statement-aware write detection runs ahead of any short-circuit
 	// — see Query() for the full rationale.
@@ -821,10 +778,19 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 		return &settlingRow{row: row, cc: cc, pending: pending}
 	}
 
+	// Dirty-flag bypass: see Query() for the full rationale. Skipping
+	// L1 here means a current-call cache hit can't serve stale rows
+	// under possibly-mutated server state.
+	state := cc.ensureGucState()
+	if state.IsDirty() {
+		row := cc.realQueryRow(ctx, sql, args...)
+		return &settlingRow{row: row, cc: cc, pending: pending}
+	}
+
 	// Cacheable read path. Use the pre-call hash so a same-body SET
 	// (which routes through the bypass above anyway) doesn't influence
 	// the cache slot for non-SET reads.
-	stateHash := cc.ensureGucState().Hash()
+	stateHash := state.Hash()
 
 	// Read path: check L1 cache
 	entry := cc.cache.Get(sql, args, stateHash)
@@ -881,16 +847,12 @@ func (cc *CachedConn) QueryRow(ctx context.Context, sql string, args ...interfac
 // multi-statement bodies that may have applied earlier segments
 // before the failing one).
 func (cc *CachedConn) Exec(ctx context.Context, sql string, args ...interface{}) (interface{}, error) {
-	cc.maybeVerifyOnCheckout(ctx)
 	pending := cc.preparePending(sql)
 	if cc.shouldScheduleVerifyAfter(sql) {
 		cc.ensureGucState().MarkDirty()
 		defer cc.scheduleAsyncVerify()
 	}
-	if cc.shouldScheduleAggressiveVerifyAfter(ctx, sql) {
-		cc.ensureGucState().MarkDirty()
-		defer cc.scheduleAsyncVerify()
-	}
+	cc.maybeBumpDmlSeq(sql)
 
 	// Multi-statement-aware write detection — runs ahead of tx tracking
 	// so a `BEGIN; INSERT INTO t ...; COMMIT` body still invalidates t.

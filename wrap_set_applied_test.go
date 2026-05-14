@@ -295,17 +295,28 @@ func TestSetApplied_BeginRollbackSuccessRoundTrip(t *testing.T) {
 // like `SET app.user_id='42'; INSERT INTO t VALUES (1)` may have
 // applied the SET server-side before the INSERT failed. pgx returns
 // a single err and we can't tell which segments landed. The wrapper
-// drops the staged apply AND marks dirty so the next checkout
-// reconciles via verify.
+// drops the staged apply AND marks dirty so subsequent reads bypass
+// L1 until an authoritative refresh resolves the uncertainty.
+//
+// Note: the body contains a DML segment, which always-on
+// aggressive-verify bumps dml_seq for (independent of the SET
+// observation). The assertion below verifies the unsafe-GUC values
+// map wasn't mutated — comparing the wrapper's hash against a
+// reference state built with the same dml_seq increment.
 func TestSetApplied_MultiStmtExecErrMarksDirty(t *testing.T) {
 	cc, _ := setupErrWrapped(t, "INSERT", errors.New("constraint violation"))
 	ctx := context.Background()
 
 	cc.Exec(ctx, "SET app.user_id = '42'; INSERT INTO orders VALUES (1)")
 
-	if cc.GucStateHash() != 0 {
-		t.Fatalf("errored multi-stmt body must not optimistically commit SET: hash %d",
-			cc.GucStateHash())
+	// The errored SET must NOT have entered the unsafe-GUC values map.
+	// We compare the wrapper's hash to a baseline that only carries
+	// the post-DML bump — same dml_seq increment, no SETs.
+	want := NewConnectionGucState()
+	want.BumpDmlSeq()
+	if cc.GucStateHash() != want.Hash() {
+		t.Fatalf("errored multi-stmt body must not optimistically commit SET: got %d, want (dml-bumped only) %d",
+			cc.GucStateHash(), want.Hash())
 	}
 	if !cc.ensureGucState().IsDirty() {
 		t.Fatal("errored multi-stmt body with embedded SET must mark dirty")
@@ -492,19 +503,19 @@ func TestSetApplied_ConcurrentSettleNoDoubleApply(t *testing.T) {
 	}
 }
 
-// --- Verify-on-checkout reconciliation after err ---
+// --- Dirty-after-err drives L1 bypass on subsequent reads ---
 
-// TestSetApplied_DirtyAfterErrTriggersVerifyOnNextCheckout: end-to-
-// end with a verifyMockQuerier — an errored SET marks dirty, and
-// the next checkout fires the verify SQL against pg_settings. The
-// verify reseeds, clearing dirty.
-func TestSetApplied_DirtyAfterErrTriggersVerifyOnNextCheckout(t *testing.T) {
+// TestSetApplied_DirtyAfterErrBypassesL1OnNextCheckout: end-to-end
+// with a verifyMockQuerier — an errored SET marks dirty, and the
+// next read routes around L1 (no synchronous verify SQL fires).
+// The dirty window stays open until an authoritative refresh
+// (async verify via SELECT my_func() / RESET ALL / DISCARD ALL)
+// resolves it.
+func TestSetApplied_DirtyAfterErrBypassesL1OnNextCheckout(t *testing.T) {
 	// Wrap an existing verifyMockQuerier and override Exec to selectively
 	// fail. Doing it inline rather than building a 4th mock keeps the
 	// test fixture footprint small.
 	base := newVerifyMockQuerier()
-	base.setVerifyResult(map[string]string{"app.user_id": "99"})
-
 	failingMock := &errOnExecMock{base: base, failSubstr: "SET"}
 
 	ResetNativeCache()
@@ -527,21 +538,17 @@ func TestSetApplied_DirtyAfterErrTriggersVerifyOnNextCheckout(t *testing.T) {
 		t.Fatal("errored SET must mark dirty")
 	}
 
-	// 2) Next call (a SELECT) triggers verify-on-checkout. Verify
-	// reads the mock's verifyResult → reseeds with app.user_id='99'.
+	// 2) Next call (a SELECT) under the new model bypasses L1
+	// because dirty is set. No synchronous verify SQL fires — the
+	// new contract avoids the verify roundtrip on the hot path.
 	if _, err := cc.Query(ctx, "SELECT * FROM accounts"); err != nil {
 		t.Fatal(err)
 	}
-	if base.verifyCount.Load() != 1 {
-		t.Fatalf("expected verify to fire once on dirty checkout; got %d", base.verifyCount.Load())
+	if base.verifyCount.Load() != 0 {
+		t.Fatalf("dirty-bypass model must not fire a synchronous verify; got %d", base.verifyCount.Load())
 	}
-	if cc.ensureGucState().IsDirty() {
-		t.Fatal("verify reseed must clear dirty flag")
-	}
-	// Hash should now reflect the verify-reseeded state ('99'), NOT
-	// the optimistic '42' (which never landed server-side).
-	if cc.GucStateHash() == 0 {
-		t.Fatal("post-verify hash should reflect reseeded server state (app.user_id=99)")
+	if !cc.ensureGucState().IsDirty() {
+		t.Fatal("dirty must persist until async verify / RESET ALL resolves it")
 	}
 }
 

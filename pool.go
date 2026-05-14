@@ -33,10 +33,10 @@
 //
 // For `database/sql` callers (which expose no per-pool hook —
 // sql.DB.Conn → sql.Conn provides only a Close that returns the
-// connection to the pool), the verify-on-checkout fallback in
-// CachedConn.maybeVerifyOnCheckout is the safety net: a connection
-// recycled with stale state will trigger a verify on the next
-// CachedConn checkout that observes IsDirty.
+// connection to the pool), the dirty-flag bypass in CachedConn's read
+// path is the safety net: a connection recycled with stale state will
+// route every read around L1 until an async verify or a session-
+// clearing command (RESET ALL / DISCARD ALL) reseeds state.
 
 package goldlapel
 
