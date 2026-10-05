@@ -46,6 +46,35 @@ itself is versioned via git tags — there is no in-file `Version` constant.
   options (e.g. `unlogged: true` for doc_store). Existing call sites that
   pass no options compile unchanged.
 
+- **`gl.URL()` no longer carries the upstream's TLS / GSS parameters.**
+  `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, `channel_binding`,
+  `gssencmode` and the rest stay on the proxy's upstream hop; the app's
+  URL gets `sslmode=disable` (lib/pq otherwise assumes `require`). The
+  proxy declines TLS from the app, so a hosted-Postgres URL with
+  `?sslmode=require` used to make every app connection fail. With
+  `tls_cert` / `tls_key` set, the URL keeps them.
+- **The `*Set` fields behind `WithDisableProxyCache`,
+  `WithDisableSqloptimize` and `WithDisableAutoIndexes` are gone** (they
+  were never read).
+
+### Fixed
+
+- **Several databases in one process now each get their own proxy.**
+  Without `WithProxyPort`, Start used to put every proxy on 7932, and the
+  second one's queries could run against the first one's database. Start
+  now picks the first port pair (proxy + dashboard) from 7932 up that no
+  other proxy of this process holds and nothing else has bound. Starting
+  the same upstream again returns a new handle on the same proxy (with its
+  own pool); the proxy stops when the last handle is stopped. An explicit
+  port another of this process's proxies holds is an error naming that
+  upstream (password redacted).
+- **Start fails if the proxy exits during startup**, with its exit status
+  and the end of its stderr — e.g. the proxy's own "port already in use"
+  message. Before, a port answering for another process passed the
+  readiness check.
+- Removed `WithConfig` keys now say why they went (in-process cache or
+  materialized views) instead of "unknown config key".
+
 ### Added
 
 - `*Documents` and `*Streams` sub-API types, plus `gl.Documents` /

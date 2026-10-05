@@ -64,6 +64,23 @@ var (
 	// Pre-existing application_name in a query string — match against either
 	// `?application_name=` or `&application_name=`.
 	appNameRe = regexp.MustCompile(`[?&]application_name=`)
+	// The userinfo password of a URL, for redactPassword.
+	passwordRe = regexp.MustCompile(`^([^:/?#]+://[^:/?#@]*:).*@`)
+
+	// upstreamOnlyParams are connection parameters for the TLS / GSS hop to
+	// the upstream. The proxy keeps using them (its --upstream URL is
+	// unchanged) but they are stripped from the URL handed to the app: the
+	// proxy declines TLS from the app unless started with its own
+	// certificate, so e.g. ?sslmode=require would make every app
+	// connection fail. Keys are matched case-insensitively.
+	upstreamOnlyParams = map[string]bool{
+		"sslmode": true, "sslcert": true, "sslkey": true, "sslrootcert": true,
+		"sslcrl": true, "sslcrldir": true, "sslpassword": true, "sslsni": true,
+		"sslnegotiation": true, "ssl_min_protocol_version": true,
+		"ssl_max_protocol_version": true, "requiressl": true,
+		"channel_binding": true, "gssencmode": true, "krbsrvname": true,
+		"gsslib": true,
+	}
 
 	// validConfigKeys enumerates the tuning knobs still accepted inside the
 	// structured `config` map. Top-level concepts (proxy_port, dashboard_port,
@@ -94,6 +111,25 @@ var (
 	listKeys = map[string]bool{
 		"replica":        true,
 		"exclude_tables": true,
+	}
+
+	// removedConfigKeys are former config keys, mapped to why they went, so
+	// a stale caller gets a better answer than "unknown".
+	removedConfigKeys = map[string]string{
+		"invalidation_port":     "was removed with the in-process cache",
+		"native_cache_size":     "was removed with the in-process cache",
+		"disable_native_cache":  "was removed with the in-process cache",
+		"aggressive_verify":     "was removed with the in-process cache",
+		"report_stats":          "was removed with the in-process cache",
+		"disable_matviews":      "was removed with the proxy's materialized views",
+		"refresh_interval_secs": "was removed with the proxy's materialized views",
+		"pattern_ttl_secs":      "was removed with the proxy's materialized views",
+		"max_tables_per_view":   "was removed with the proxy's materialized views",
+		"max_columns_per_view":  "was removed with the proxy's materialized views",
+		"disable_consolidation": "was removed with the proxy's materialized views",
+		"disable_rewrite":       "was removed with the proxy's materialized views",
+		"disable_shadow_mode":   "was removed with the proxy's materialized views",
+		"enable_coalescing":     "was replaced by disable_coalescing (coalescing is on by default)",
 	}
 )
 
@@ -171,7 +207,11 @@ type callOptions struct {
 	tx *sql.Tx
 }
 
-// WithProxyPort sets the proxy listen port. Construction-time only.
+// WithProxyPort sets the proxy listen port. When unset (or 0), Start picks
+// the smallest free port from 7932 up whose dashboard port (port + 1) is
+// free too, skipping ports this process's other proxies hold. An explicit
+// port another proxy of this process holds is an error. Construction-time
+// only.
 func WithProxyPort(port int) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.proxyPort = port
@@ -281,14 +321,14 @@ func WithMeshTag(tag string) Option {
 func WithDisableProxyCache(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.disableProxyCache = disable
-		gl.disableProxyCacheSet = true
 	})
 }
 
-// WithDisableSqloptimize turns off the proxy's SQL-rewrite optimisation
-// pipeline (shadow-mode + coalescing). When true, the proxy emits
-// --disable-sqloptimize and per-kind rewrite/optimisation strategies are
-// skipped. Default (option omitted): proxy decides (today: enabled).
+// WithDisableSqloptimize turns off the proxy's whole SQL Optimizer: COPY
+// rewrite, expression rewrite, N+1 detection (per-connection and
+// cross-connection) and query coalescing. When true, the proxy emits
+// --disable-sqloptimize and each of those is skipped whatever its own flag
+// says. Default (option omitted): proxy decides (today: enabled).
 // Construction-time only.
 //
 // Equivalent CLI flag: --disable-sqloptimize.
@@ -296,7 +336,6 @@ func WithDisableProxyCache(disable bool) Option {
 func WithDisableSqloptimize(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.disableSqloptimize = disable
-		gl.disableSqloptimizeSet = true
 	})
 }
 
@@ -311,7 +350,6 @@ func WithDisableSqloptimize(disable bool) Option {
 func WithDisableAutoIndexes(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.disableAutoIndexes = disable
-		gl.disableAutoIndexesSet = true
 	})
 }
 
@@ -388,6 +426,9 @@ func ConfigToArgs(config map[string]interface{}) ([]string, error) {
 	var args []string
 	for _, key := range keys {
 		if !validConfigKeys[key] {
+			if why, ok := removedConfigKeys[key]; ok {
+				return nil, fmt.Errorf("config key %q %s", key, why)
+			}
 			return nil, fmt.Errorf("unknown config key: %q", key)
 		}
 
@@ -454,28 +495,19 @@ type GoldLapel struct {
 	configFile       string
 	config           map[string]interface{}
 	extraArgs        []string
-	cmd              *exec.Cmd
+	proc             *proxyProcess // the running proxy this handle holds; nil before Start and after Stop
 	proxyURL         string
-	stderr           string
-	done             chan struct{} // closed when process exits
-	waitErr          error         // set by spawn's reaper goroutine before closing done
-	weSignaled       bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
 	db               *sql.DB
 	tx               *sql.Tx // non-nil only for GoldLapel instances returned by InTx
 	silent           bool    // when true, printBanner is a no-op
 	mesh             bool    // startup mesh intent (emits --mesh)
 	meshTag          string  // optional mesh tag (emits --mesh-tag <tag>)
-	// Proxy-side disable flags promoted out of the structured config map (Wave 3
-	// of the canonical surface). Each pairs with an *Set sentinel so spawn()
-	// can distinguish "user explicitly opted out" from "user left it alone";
-	// only set values are emitted to the binary, leaving the proxy free to
-	// honour its own defaults / env-var fallbacks.
-	disableProxyCache     bool
-	disableProxyCacheSet  bool
-	disableSqloptimize    bool
-	disableSqloptimizeSet bool
-	disableAutoIndexes    bool
-	disableAutoIndexesSet bool
+	// Proxy-side disable flags promoted out of the structured config map.
+	// Only true is emitted, leaving the proxy free to honour its own
+	// defaults / env-var fallbacks.
+	disableProxyCache  bool
+	disableSqloptimize bool
+	disableAutoIndexes bool
 
 	mu sync.Mutex
 	// DDL API state — see ddl.go.
@@ -515,64 +547,103 @@ func (gl *GoldLapel) attachNamespaces() {
 	gl.Geos = &Geos{gl: gl}
 }
 
+// proxyProcess is one running proxy binary. Every Start for the same
+// upstream in this process shares it (each Start returns its own handle);
+// the last handle's Stop terminates it.
+type proxyProcess struct {
+	upstream       string
+	proxyPort      int
+	dashboardPort  int // 0 when the dashboard is off
+	proxyURL       string
+	dashboardToken string
+	cmd            *exec.Cmd
+	ready          chan struct{} // closed once the start attempt has finished, ok or not
+	done           chan struct{} // closed by the reaper once the process has exited
+	waitErr        error         // cmd.Wait()'s result; read only after done is closed
+	stderr         string        // everything the process wrote to stderr; likewise
+	refs           int           // handles holding this proxy; guarded by proxiesMu
+}
+
+// exited reports whether the process has exited.
+func (p *proxyProcess) exited() bool {
+	return isClosed(p.done)
+}
+
+// proxies holds every proxy this process has started or is starting, so a
+// second Start for the same upstream reuses the first proxy and a different
+// upstream never lands on a port another proxy here already holds.
+var (
+	proxiesMu sync.Mutex
+	proxies   = map[*proxyProcess]struct{}{}
+)
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // Start spawns the Gold Lapel proxy against the given upstream, waits for it
 // to accept connections, opens a pooled database/sql connection, and returns
 // a ready-to-use *GoldLapel. Call gl.Stop(ctx) to terminate — typically via
 // defer gl.Stop(ctx).
 //
+// Each upstream gets one proxy per process. If this process already runs a
+// proxy for the same upstream, Start returns a new handle on it (with its
+// own pool) instead of spawning another — that Start's other options are
+// ignored — and the proxy stops when the last handle is stopped.
+//
 // Options may include construction-time settings (WithProxyPort, WithLogLevel,
 // WithConfig, WithExtraArgs, WithDashboardPort, ...).
 func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, error) {
-	gl := &GoldLapel{
-		upstream:  upstream,
-		proxyPort: DefaultProxyPort,
-	}
+	gl := &GoldLapel{upstream: upstream}
 	gl.attachNamespaces()
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
-	// The dashboard port defaults to proxy port + 1 (matches what the Rust
-	// binary binds when no --dashboard-port is passed). WithDashboardPort sets
-	// dashboardPortSet to signal an explicit override — that value is then
-	// emitted verbatim at spawn time, including 0 which disables the
-	// dashboard entirely.
-	if !gl.dashboardPortSet {
-		gl.dashboardPort = gl.proxyPort + 1
-	}
 
-	if err := gl.spawn(ctx); err != nil {
+	// Validate every option before claiming ports or spawning anything.
+	args, err := gl.buildArgs()
+	if err != nil {
 		return nil, err
 	}
+
+	proc, reused, err := gl.acquireProxy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if reused {
+		gl.attachProxy(ctx, proc)
+		return gl, nil
+	}
+
+	err = gl.spawn(ctx, proc, args)
+	proxiesMu.Lock()
+	if err != nil {
+		delete(proxies, proc)
+	}
+	close(proc.ready)
+	proxiesMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	gl.attachProxy(ctx, proc)
+	gl.printBanner(os.Stderr)
 	return gl, nil
 }
 
-// spawn boots the underlying binary and opens the database pool. Called
-// exclusively from Start.
-//
-// No gl.mu lock is held across spawn: the *GoldLapel being constructed is
-// not yet visible to any other goroutine (Start hasn't returned, so no
-// public method has a receiver yet, and registerStartedInstance runs only
-// after spawn returns). Holding the mutex across the 10s port poll + 5s
-// ping would serialise any concurrent accessor for the entire startup
-// window once gl became visible — it was guarding against nothing and
-// penalising every path that sees the instance after Start returns.
-func (gl *GoldLapel) spawn(ctx context.Context) error {
-	bin, err := FindBinary()
-	if err != nil {
-		return err
-	}
-
-	args := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.proxyPort)}
-	// Top-level options (promoted out of the config map by the canonical
-	// surface) emit their own CLI flags. Each is suppressed when the user
-	// hasn't set it, so the binary applies its own defaults.
-	if gl.dashboardPortSet {
-		args = append(args, "--dashboard-port", fmt.Sprintf("%d", gl.dashboardPort))
-	}
+// buildArgs turns the options into the binary's argv, minus --upstream and
+// the port flags, which spawn adds once the ports are settled. Every option
+// error surfaces here.
+func (gl *GoldLapel) buildArgs() ([]string, error) {
+	var args []string
 	if gl.logLevel != "" {
 		flag, err := LogLevelToVerboseFlag(gl.logLevel)
 		if err != nil {
-			return fmt.Errorf("invalid log_level: %w", err)
+			return nil, fmt.Errorf("invalid log_level: %w", err)
 		}
 		if flag != "" {
 			args = append(args, flag)
@@ -599,9 +670,7 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	// Promoted disable-flag options. Each emits a bare presence-flag when
 	// true — the proxy CLI surface doesn't have an "enable-X" counterpart,
 	// so WithDisable*(false) is a no-op (the proxy's default applies,
-	// modulo the corresponding GOLDLAPEL_DISABLE_X env var). The *Set
-	// sentinel is still tracked on the struct for diagnostic / future use
-	// (e.g. surfacing "user explicitly left it on" to telemetry).
+	// modulo the corresponding GOLDLAPEL_DISABLE_X env var).
 	if gl.disableProxyCache {
 		args = append(args, "--disable-proxy-cache")
 	}
@@ -614,72 +683,156 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	if gl.config != nil {
 		configArgs, err := ConfigToArgs(gl.config)
 		if err != nil {
-			return fmt.Errorf("invalid config: %w", err)
+			return nil, fmt.Errorf("invalid config: %w", err)
 		}
 		args = append(args, configArgs...)
 	}
-	args = append(args, gl.extraArgs...)
+	return append(args, gl.extraArgs...), nil
+}
 
-	gl.cmd = exec.Command(bin, args...)
-	gl.cmd.Env = os.Environ()
-	// GOLDLAPEL_CLIENT env var is only set when the caller hasn't supplied
-	// --client via WithClient (explicit --client flag takes precedence) and
-	// the env var isn't already set by the surrounding shell.
-	if gl.client == "" && os.Getenv("GOLDLAPEL_CLIENT") == "" {
-		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_CLIENT=go")
-	}
-	// Provision a session-scoped dashboard token so ddl.go can authenticate
-	// against /api/ddl/*. Pre-set env wins.
-	if t := os.Getenv("GOLDLAPEL_DASHBOARD_TOKEN"); t != "" {
-		gl.dashboardToken = t
-	} else {
-		buf := make([]byte, 32)
-		if _, err := rand.Read(buf); err != nil {
-			return fmt.Errorf("generate dashboard token: %w", err)
+// acquireProxy finds this process's live proxy for gl.upstream and takes a
+// reference on it (reused = true), or settles gl's ports and registers a new,
+// not-yet-spawned proxy for Start to spawn. A Start already in flight for
+// the same upstream is waited for, so concurrent Starts share one proxy.
+func (gl *GoldLapel) acquireProxy(ctx context.Context) (proc *proxyProcess, reused bool, err error) {
+	for {
+		proxiesMu.Lock()
+		var starting *proxyProcess
+		for p := range proxies {
+			// refs == 0 means its last Stop is tearing it down.
+			if p.upstream != gl.upstream || p.refs == 0 {
+				continue
+			}
+			if !isClosed(p.ready) {
+				starting = p
+				break
+			}
+			if !p.exited() {
+				p.refs++
+				proxiesMu.Unlock()
+				return p, true, nil
+			}
 		}
-		gl.dashboardToken = hex.EncodeToString(buf)
-		gl.cmd.Env = append(gl.cmd.Env, "GOLDLAPEL_DASHBOARD_TOKEN="+gl.dashboardToken)
+		if starting == nil {
+			proc, err = gl.claimPortsLocked()
+			if err == nil {
+				proxies[proc] = struct{}{}
+			}
+			proxiesMu.Unlock()
+			return proc, false, err
+		}
+		proxiesMu.Unlock()
+		select {
+		case <-starting.ready:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+}
+
+// portClaim is a port a live proxy of this process holds.
+type portClaim struct {
+	proc *proxyProcess
+	role string // "proxy" or "dashboard"
+}
+
+// claimPortsLocked settles gl.proxyPort and gl.dashboardPort and returns
+// the proxy that will hold them. An explicit port another live proxy of
+// this process holds is an error; otherwise the proxy port is the smallest
+// P >= DefaultProxyPort such that neither P nor its dashboard port is held
+// here or busy at the OS level. An explicit dashboard port is the caller's
+// choice, so only P is searched. Caller holds proxiesMu.
+func (gl *GoldLapel) claimPortsLocked() (*proxyProcess, error) {
+	claimed := map[int]portClaim{}
+	for p := range proxies {
+		if isClosed(p.ready) && p.exited() {
+			continue
+		}
+		claimed[p.proxyPort] = portClaim{p, "proxy"}
+		if p.dashboardPort > 0 {
+			claimed[p.dashboardPort] = portClaim{p, "dashboard"}
+		}
+	}
+	collision := func(port int, role string) error {
+		c, ok := claimed[port]
+		if port <= 0 || !ok {
+			return nil
+		}
+		return fmt.Errorf("Gold Lapel cannot use port %d as the %s port: this process's proxy for %s already holds it as its %s port. Choose another port, or omit WithProxyPort and WithDashboardPort to have a free pair assigned",
+			port, role, redactPassword(c.proc.upstream), c.role)
 	}
 
-	stderrPipe, err := gl.cmd.StderrPipe()
+	if gl.proxyPort != 0 {
+		if !gl.dashboardPortSet {
+			gl.dashboardPort = gl.proxyPort + 1
+		}
+		if err := collision(gl.proxyPort, "proxy"); err != nil {
+			return nil, err
+		}
+		if err := collision(gl.dashboardPort, "dashboard"); err != nil {
+			return nil, err
+		}
+	} else {
+		if gl.dashboardPortSet {
+			if err := collision(gl.dashboardPort, "dashboard"); err != nil {
+				return nil, err
+			}
+		}
+		for port := DefaultProxyPort; port < 65535; port++ {
+			dash := gl.dashboardPort
+			if !gl.dashboardPortSet {
+				dash = port + 1
+			}
+			if _, held := claimed[port]; held || port == dash || !portBindable(port) {
+				continue
+			}
+			if !gl.dashboardPortSet {
+				if _, held := claimed[dash]; held || !portBindable(dash) {
+					continue
+				}
+			}
+			gl.proxyPort, gl.dashboardPort = port, dash
+			break
+		}
+		if gl.proxyPort == 0 {
+			return nil, fmt.Errorf("Gold Lapel could not find a free proxy port from %d up", DefaultProxyPort)
+		}
+	}
+
+	return &proxyProcess{
+		upstream:      gl.upstream,
+		proxyPort:     gl.proxyPort,
+		dashboardPort: gl.dashboardPort,
+		ready:         make(chan struct{}),
+		done:          make(chan struct{}),
+		refs:          1,
+	}, nil
+}
+
+// portBindable reports whether port can be bound on every interface right
+// now — the same check the proxy makes before it starts.
+func portBindable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
+		return false
 	}
+	ln.Close()
+	return true
+}
 
-	if err := gl.cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start Gold Lapel: %w", err)
-	}
+// redactPassword returns url with the password in its userinfo replaced by
+// "***", for error messages.
+func redactPassword(url string) string {
+	return passwordRe.ReplaceAllString(url, "${1}***@")
+}
 
-	var stderrBuf strings.Builder
-	stderrDone := make(chan struct{})
-	go func() {
-		io.Copy(&stderrBuf, stderrPipe)
-		close(stderrDone)
-	}()
-
-	if !waitForPortCtx(ctx, "127.0.0.1", gl.proxyPort, startupTimeout) {
-		gl.cmd.Process.Kill()
-		gl.cmd.Wait()
-		<-stderrDone
-		gl.stderr = stderrBuf.String()
-		gl.cmd = nil
-		return fmt.Errorf("Gold Lapel failed to start on port %d within %ds.\nstderr: %s",
-			gl.proxyPort, int(startupTimeout.Seconds()), gl.stderr)
-	}
-
-	gl.done = make(chan struct{})
-	go func() {
-		<-stderrDone
-		gl.stderr = stderrBuf.String()
-		// Capture Wait()'s error so Stop can surface it (E2). Stop
-		// synchronises on <-gl.done, so the write here happens-before any
-		// read of gl.waitErr on the Stop side — no additional locking
-		// is needed for this field.
-		gl.waitErr = gl.cmd.Wait()
-		close(gl.done)
-	}()
-
-	gl.proxyURL = MakeProxyURL(gl.upstream, gl.proxyPort)
+// attachProxy points gl at a running proxy and opens gl's own pool on it.
+func (gl *GoldLapel) attachProxy(ctx context.Context, proc *proxyProcess) {
+	gl.proc = proc
+	gl.proxyPort = proc.proxyPort
+	gl.dashboardPort = proc.dashboardPort
+	gl.proxyURL = proc.proxyURL
+	gl.dashboardToken = proc.dashboardToken
 
 	// Eagerly open a database/sql pool against the proxy. The user may
 	// register any Postgres driver — we prefer "pgx" (from
@@ -697,10 +850,105 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 		cancel()
 	}
 	gl.db = db
+}
 
-	gl.printBanner(os.Stderr)
+// spawn boots the binary for proc on gl's settled ports and waits until it
+// answers. Called exclusively from Start. proc is already registered, but
+// other goroutines read only its ports and done channel until Start closes
+// proc.ready, so the fields set here need no lock.
+func (gl *GoldLapel) spawn(ctx context.Context, proc *proxyProcess, args []string) error {
+	bin, err := FindBinary()
+	if err != nil {
+		return err
+	}
 
+	portArgs := []string{"--upstream", gl.upstream, "--proxy-port", fmt.Sprintf("%d", gl.proxyPort)}
+	if gl.dashboardPortSet {
+		portArgs = append(portArgs, "--dashboard-port", fmt.Sprintf("%d", gl.dashboardPort))
+	}
+	cmd := exec.Command(bin, append(portArgs, args...)...)
+	cmd.Env = os.Environ()
+	// GOLDLAPEL_CLIENT env var is only set when the caller hasn't supplied
+	// --client via WithClient (explicit --client flag takes precedence) and
+	// the env var isn't already set by the surrounding shell.
+	if gl.client == "" && os.Getenv("GOLDLAPEL_CLIENT") == "" {
+		cmd.Env = append(cmd.Env, "GOLDLAPEL_CLIENT=go")
+	}
+	// Provision a session-scoped dashboard token so ddl.go can authenticate
+	// against /api/ddl/*. Pre-set env wins.
+	if t := os.Getenv("GOLDLAPEL_DASHBOARD_TOKEN"); t != "" {
+		proc.dashboardToken = t
+	} else {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Errorf("generate dashboard token: %w", err)
+		}
+		proc.dashboardToken = hex.EncodeToString(buf)
+		cmd.Env = append(cmd.Env, "GOLDLAPEL_DASHBOARD_TOKEN="+proc.dashboardToken)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// If something already listens on the proxy port, a connect succeeds
+	// whether or not our proxy is up — see waitForProxy.
+	portWasBusy := !portBindable(gl.proxyPort)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start Gold Lapel: %w", err)
+	}
+	proc.cmd = cmd
+
+	// Reaper: collects stderr, then the exit status. Stop and the readiness
+	// wait synchronise on proc.done, so the writes here happen-before any
+	// read of proc.stderr / proc.waitErr.
+	go func() {
+		var stderrBuf strings.Builder
+		io.Copy(&stderrBuf, stderrPipe)
+		proc.stderr = stderrBuf.String()
+		proc.waitErr = cmd.Wait()
+		close(proc.done)
+	}()
+
+	if !waitForProxy(ctx, gl.proxyPort, proc.done, portWasBusy) {
+		if proc.exited() {
+			return fmt.Errorf("Gold Lapel exited during startup (%v).\nstderr: %s", proc.waitErr, stderrTail(proc.stderr))
+		}
+		cmd.Process.Kill()
+		<-proc.done
+		return fmt.Errorf("Gold Lapel failed to start on port %d within %ds.\nstderr: %s",
+			gl.proxyPort, int(startupTimeout.Seconds()), stderrTail(proc.stderr))
+	}
+
+	proc.proxyURL = makeProxyURL(gl.upstream, gl.proxyPort, gl.clientTLS())
 	return nil
+}
+
+// clientTLS reports whether the proxy is being started with its own TLS
+// certificate, i.e. it accepts TLS from the app.
+func (gl *GoldLapel) clientTLS() bool {
+	if gl.config["tls_cert"] != nil && gl.config["tls_key"] != nil {
+		return true
+	}
+	for _, a := range gl.extraArgs {
+		if a == "--tls-cert" || strings.HasPrefix(a, "--tls-cert=") {
+			return true
+		}
+	}
+	return false
+}
+
+// stderrTail returns the last few KB of a process's stderr — enough for the
+// proxy's own error message without flooding the caller's error.
+func stderrTail(stderr string) string {
+	const max = 4096
+	stderr = strings.TrimSpace(stderr)
+	if len(stderr) > max {
+		stderr = "…" + stderr[len(stderr)-max:]
+	}
+	return stderr
 }
 
 // printBanner writes the one-line startup banner to w. Library code should
@@ -736,14 +984,16 @@ func openDB(url string) (*sql.DB, error) {
 	return nil, lastErr
 }
 
-// Stop terminates the proxy process and closes the database pool.
-// Safe to call multiple times. The context is honoured during the graceful
-// shutdown wait — if ctx is cancelled the process is killed immediately.
+// Stop releases this handle: it closes the handle's database pool and, if
+// no other handle from Start still holds the proxy, terminates the proxy
+// process. Safe to call multiple times. The context is honoured during the
+// graceful shutdown wait — if ctx is cancelled the process is killed
+// immediately.
 //
 // Return value contract:
 //   - nil when the proxy shut down as expected — including the normal case
 //     where Stop itself signalled SIGTERM/Kill (the resulting non-zero exit
-//     is expected, not an error).
+//     is expected, not an error) — or is still serving other handles.
 //   - non-nil when the subprocess exited on its own before Stop was called
 //     (e.g. crashed with a non-zero status, OOM-killed) — in that case the
 //     exit error from cmd.Wait() is surfaced so callers checking the return
@@ -763,82 +1013,72 @@ func (gl *GoldLapel) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	// Drop cached DDL patterns — they're tied to the proxy we're tearing
-	// down. sync.Map has no clear, so walk + delete.
+	// Drop cached DDL patterns — they're tied to the proxy we're releasing.
+	// sync.Map has no clear, so walk + delete.
 	gl.ddlCache.Range(func(k, _ any) bool {
 		gl.ddlCache.Delete(k)
 		return true
 	})
 	gl.dashboardToken = ""
+	gl.proxyURL = ""
+	if gl.db != nil {
+		gl.db.Close()
+		gl.db = nil
+	}
 
-	// Unstarted / already-stopped: nothing to do.
-	//
-	// F: the guard chain used to have a third path (cmd != nil && done == nil)
-	// that returned without nilling cmd — harmless in practice because
-	// spawn's port-poll timeout path already nils cmd, but fragile if a
-	// future spawn error path left cmd set without installing a reaper.
-	// The check below consolidates to a single exit: if there's no reaper
-	// channel to wait on, we clear any stale cmd defensively and return.
-	// Callers never see such an instance today (Start returns nil on
-	// failure), but this keeps Stop reliably idempotent under any
-	// construction path (including hand-rolled test harnesses).
-	if gl.done == nil {
-		gl.cmd = nil
+	proc := gl.proc
+	gl.proc = nil
+	if proc == nil {
+		// Unstarted / already stopped: nothing to do.
 		return nil
 	}
 
+	proxiesMu.Lock()
+	proc.refs--
+	last := proc.refs == 0
+	proxiesMu.Unlock()
+
+	if !last {
+		if proc.exited() {
+			return filterStopExit(proc.waitErr, false)
+		}
+		return nil
+	}
+
+	err := proc.terminate(ctx)
+	proxiesMu.Lock()
+	delete(proxies, proc)
+	proxiesMu.Unlock()
+	return err
+}
+
+// terminate stops the process and waits for the reaper. If the process had
+// already exited on its own, its exit error is returned; the non-zero exit
+// our own signal causes is not.
+func (p *proxyProcess) terminate(ctx context.Context) error {
 	// Fast path: process exited on its own before Stop was called. This
 	// is NOT an our-signal shutdown — surface any Wait() error so callers
 	// see e.g. a non-zero crash exit.
-	select {
-	case <-gl.done:
-		gl.teardownLocked()
-		return filterStopExit(gl.waitErr, gl.weSignaled)
-	default:
+	if p.exited() {
+		return filterStopExit(p.waitErr, false)
 	}
-
-	if gl.db != nil {
-		gl.db.Close()
-		gl.db = nil
-	}
-
-	// Mark that we're about to issue a signal so the resulting ExitError
-	// from cmd.Wait() can be filtered as expected-shutdown rather than
-	// surfaced to the caller.
-	gl.weSignaled = true
 
 	if runtime.GOOS == "windows" {
-		gl.cmd.Process.Kill()
+		p.cmd.Process.Kill()
 	} else {
-		gl.cmd.Process.Signal(syscall.SIGTERM)
+		p.cmd.Process.Signal(syscall.SIGTERM)
 	}
 
 	select {
-	case <-gl.done:
+	case <-p.done:
 	case <-ctx.Done():
-		gl.cmd.Process.Kill()
-		<-gl.done
+		p.cmd.Process.Kill()
+		<-p.done
 	case <-time.After(shutdownTimeout):
-		gl.cmd.Process.Kill()
-		<-gl.done
+		p.cmd.Process.Kill()
+		<-p.done
 	}
-
-	gl.teardownLocked()
-	return filterStopExit(gl.waitErr, gl.weSignaled)
-}
-
-// teardownLocked nils out the process/pool state after the reaper has
-// completed. Caller must hold gl.mu. Centralising this in one helper
-// keeps Stop's two return paths (already-exited fast path, post-signal
-// path) in sync — previously they diverged on whether gl.cmd was cleared.
-func (gl *GoldLapel) teardownLocked() {
-	if gl.db != nil {
-		gl.db.Close()
-		gl.db = nil
-	}
-	gl.done = nil
-	gl.cmd = nil
-	gl.proxyURL = ""
+	return filterStopExit(p.waitErr, true)
 }
 
 // filterStopExit classifies cmd.Wait()'s error and decides whether to
@@ -892,22 +1132,14 @@ func (gl *GoldLapel) ProxyPort() int {
 func (gl *GoldLapel) Running() bool {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
-	if gl.done == nil {
-		return false
-	}
-	select {
-	case <-gl.done:
-		return false
-	default:
-		return true
-	}
+	return gl.proc != nil && !gl.proc.exited()
 }
 
 // DashboardURL returns the dashboard URL while the proxy is running, or "".
 func (gl *GoldLapel) DashboardURL() string {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
-	if gl.dashboardPort > 0 && gl.cmd != nil && gl.cmd.Process != nil {
+	if gl.dashboardPort > 0 && gl.proc != nil {
 		return fmt.Sprintf("http://127.0.0.1:%d", gl.dashboardPort)
 	}
 	return ""
@@ -1045,9 +1277,8 @@ func (gl *GoldLapel) InTx(ctx context.Context, db *sql.DB, fn func(*GoldLapel) e
 		upstream:      gl.upstream,
 		proxyPort:     gl.proxyPort,
 		dashboardPort: gl.dashboardPort,
-		cmd:           gl.cmd,
+		proc:          gl.proc,
 		proxyURL:      gl.proxyURL,
-		done:          gl.done,
 		db:            gl.db,
 		tx:            tx,
 		// Inherit the dashboard token so DDL fetches inside the tx work
@@ -1256,49 +1487,104 @@ func injectApplicationName(url string) string {
 	return url + sep + "application_name=" + ApplicationNameMarker()
 }
 
-// MakeProxyURL rewrites an upstream connection string to point at the local proxy.
+// MakeProxyURL rewrites an upstream connection string to point at the local
+// proxy. The upstream's TLS / GSS parameters (sslmode, sslrootcert,
+// channel_binding, ...) are dropped and sslmode=disable is set instead: the
+// proxy talks plaintext to the app unless it was started with its own
+// certificate, and lib/pq treats a missing sslmode as require. Other query
+// parameters are kept.
 func MakeProxyURL(upstream string, port int) string {
+	return makeProxyURL(upstream, port, false)
+}
+
+// makeProxyURL is MakeProxyURL; with clientTLS (the proxy has its own
+// certificate) the query string is left as the upstream had it.
+func makeProxyURL(upstream string, port int, clientTLS bool) string {
 	portStr := fmt.Sprintf("%d", port)
 
+	var prefix, rest string
 	if m := withPortRe.FindStringSubmatch(upstream); m != nil {
-		return injectApplicationName(m[1] + "localhost:" + portStr + m[4])
-	}
-
-	if m := withoutPortRe.FindStringSubmatch(upstream); m != nil {
-		return injectApplicationName(m[1] + "localhost:" + portStr + m[3])
-	}
-
-	// Bare-host form skips the marker — atypical caller path.
-	if !strings.Contains(upstream, "://") && strings.Contains(upstream, ":") {
+		prefix, rest = m[1], m[4]
+	} else if m := withoutPortRe.FindStringSubmatch(upstream); m != nil {
+		prefix, rest = m[1], m[3]
+	} else {
+		// Bare-host form skips the marker — atypical caller path.
 		return "localhost:" + portStr
 	}
+	if !clientTLS {
+		rest = plaintextClientParams(rest)
+	}
+	return injectApplicationName(prefix + "localhost:" + portStr + rest)
+}
 
-	return "localhost:" + portStr
+// plaintextClientParams drops upstreamOnlyParams from the query string in
+// rest (the part of a URL after host:port) and appends sslmode=disable.
+func plaintextClientParams(rest string) string {
+	path, query, _ := strings.Cut(rest, "?")
+	var kept []string
+	for _, kv := range strings.Split(query, "&") {
+		key, _, _ := strings.Cut(kv, "=")
+		if kv == "" || upstreamOnlyParams[strings.ToLower(key)] {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	return path + "?" + strings.Join(append(kept, "sslmode=disable"), "&")
 }
 
 // --- Port readiness ---
 
 // WaitForPort polls until a TCP connection succeeds or the timeout expires.
 func WaitForPort(host string, port int, timeout time.Duration) bool {
-	return waitForPortCtx(context.Background(), host, port, timeout)
-}
-
-func waitForPortCtx(ctx context.Context, host string, port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-
 	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
-		if err == nil {
+		if conn, err := net.DialTimeout("tcp", addr, dialTimeout); err == nil {
 			conn.Close()
 			return true
 		}
 		time.Sleep(startupPollInterval)
+	}
+	return false
+}
+
+// busyPortGrace is how long a proxy started on a port something else
+// already held must survive after the port answers: the proxy refuses a
+// busy port within moments of starting.
+const busyPortGrace = time.Second
+
+// waitForProxy polls until the proxy answers on 127.0.0.1:port while its
+// process is still alive. It gives up when the process exits (closing
+// exited), ctx is done, or startupTimeout passes. If the port was already
+// held when the proxy was spawned, an answer may come from the other holder,
+// so the proxy must also outlive busyPortGrace.
+func waitForProxy(ctx context.Context, port int, exited chan struct{}, portWasBusy bool) bool {
+	deadline := time.Now().Add(startupTimeout)
+	addr := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", port))
+
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+		if err == nil {
+			conn.Close()
+			if !portWasBusy {
+				return !isClosed(exited)
+			}
+			select {
+			case <-exited:
+				return false
+			case <-ctx.Done():
+				return false
+			case <-time.After(busyPortGrace):
+				return !isClosed(exited)
+			}
+		}
+		select {
+		case <-exited:
+			return false
+		case <-ctx.Done():
+			return false
+		case <-time.After(startupPollInterval):
+		}
 	}
 	return false
 }

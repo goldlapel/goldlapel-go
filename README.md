@@ -56,7 +56,9 @@ func main() {
 
 Point `database/sql` at `gl.URL()`. Gold Lapel sits between your app and your DB, caching results and creating indexes from your query patterns. Connections are tagged `application_name=goldlapel:go:<version>` so they're recognisable in `pg_stat_activity`.
 
-The proxy listens on two ports: the proxy itself (`WithProxyPort`, default 7932) and the dashboard (`WithDashboardPort`, default proxy port + 1; `0` disables it).
+The proxy listens on two ports: the proxy itself (`WithProxyPort`) and the dashboard (`WithDashboardPort`, default proxy port + 1; `0` disables it). Without `WithProxyPort`, Start picks the first free pair from 7932 up, so several databases in one process each get their own proxy. Starting the same upstream twice shares one proxy; it stops when the last handle is stopped. An explicit port another of your proxies already holds is an error, and a port some other process holds makes the proxy refuse to start, with its message in the error.
+
+`gl.URL()` is plaintext to the local proxy: the upstream's TLS parameters (`sslmode`, `sslrootcert`, `channel_binding`, …) stay on the proxy's upstream hop and the app's URL carries `sslmode=disable` instead — unless you give the proxy its own certificate (`tls_cert` / `tls_key`), in which case the parameters are kept.
 
 Scoped transactions via `gl.InTx(ctx, db, fn)`, per-call `WithTx(tx)`, and the document-store / search / Redis-replacement wrapper methods are in the docs.
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -63,9 +64,10 @@ func withSSLDisabled(url string) string {
 }
 
 // openIntegrationDB opens a fresh pool of its own, separate from gl.DB().
+// gl.URL() already carries sslmode=disable, which lib/pq needs.
 func openIntegrationDB(t *testing.T, gl *GoldLapel) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("postgres", withSSLDisabled(gl.URL()))
+	db, err := sql.Open("postgres", gl.URL())
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
@@ -92,8 +94,8 @@ func nextTestPort() int {
 // through it.
 func startForIntegration(t *testing.T) *GoldLapel {
 	t.Helper()
-	// sslmode=disable carries into gl.URL(), so the pool Start opens for
-	// gl.Documents etc. can reach the proxy.
+	// The test Postgres doesn't speak TLS, so the proxy's upstream hop
+	// mustn't ask for it.
 	upstream := withSSLDisabled(integrationEnv(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -123,6 +125,31 @@ func startForIntegration(t *testing.T) *GoldLapel {
 	return gl
 }
 
+// dropCollectionOnCleanup drops a doc-store collection the proxy created
+// (its _goldlapel.doc_<name> table and its schema_meta row) when the test
+// ends, so runs don't pile up timestamped tables.
+func dropCollectionOnCleanup(t *testing.T, gl *GoldLapel, db *sql.DB, collection string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		table, err := gl.Documents.resolveTable(ctx, collection)
+		if err != nil {
+			t.Errorf("cleanup: resolve %s: %v", collection, err)
+			return
+		}
+		meta := "_goldlapel_schema_meta"
+		if strings.HasPrefix(table, "_goldlapel.") {
+			meta = "_goldlapel.schema_meta"
+		}
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Errorf("cleanup: drop %s: %v", table, err)
+		}
+		if _, err := db.ExecContext(ctx, "DELETE FROM "+meta+" WHERE family = 'doc_store' AND name = $1", collection); err != nil {
+			t.Errorf("cleanup: forget %s: %v", collection, err)
+		}
+	})
+}
+
 func TestIntegration_StartReturnsReadyInstance(t *testing.T) {
 	gl := startForIntegration(t)
 	db := openIntegrationDB(t, gl)
@@ -146,6 +173,7 @@ func TestIntegration_InTxCommits(t *testing.T) {
 
 	ctx := context.Background()
 	collection := fmt.Sprintf("gltest_intx_commit_%d", time.Now().UnixNano())
+	dropCollectionOnCleanup(t, gl, db, collection)
 
 	// Create the collection outside the tx: the proxy creates collections
 	// through its own connection, which can't see an uncommitted one.
@@ -226,6 +254,7 @@ func TestIntegration_WithTxOverride(t *testing.T) {
 
 	ctx := context.Background()
 	collection := fmt.Sprintf("gltest_withtx_%d", time.Now().UnixNano())
+	dropCollectionOnCleanup(t, gl, db, collection)
 
 	// First, create the collection outside the tx so the rollback doesn't
 	// also wipe the DDL.
@@ -397,4 +426,133 @@ func TestIntegration_DocFilter_Text(t *testing.T) {
 	if len(hits) != 0 {
 		t.Fatalf("expected 0 hits for 'unobtanium', got %d", len(hits))
 	}
+}
+
+// --- Several proxies in one process ---
+
+// queryOne runs SELECT 1 through url.
+func queryOne(t *testing.T, url string) {
+	t.Helper()
+	db, err := sql.Open("postgres", url)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var one int
+	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+		t.Fatalf("SELECT 1 via %s: %v", redactPassword(url), err)
+	}
+}
+
+// TestIntegration_TwoUpstreamsGetTheirOwnPorts starts two upstreams without
+// WithProxyPort. Before port allocation both landed on 7932 and the second
+// proxy's queries could run against the first one's upstream.
+func TestIntegration_TwoUpstreamsGetTheirOwnPorts(t *testing.T) {
+	first := withSSLDisabled(integrationEnv(t))
+	second := first + "&application_name=gltest_second"
+	ctx := context.Background()
+
+	a, err := Start(ctx, first, WithSilent(true))
+	if err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+	defer a.Stop(ctx)
+	b, err := Start(ctx, second, WithSilent(true))
+	if err != nil {
+		t.Fatalf("Start second: %v", err)
+	}
+	defer b.Stop(ctx)
+
+	ports := map[int]bool{a.ProxyPort(): true, a.DashboardPort(): true}
+	if ports[b.ProxyPort()] || ports[b.DashboardPort()] {
+		t.Fatalf("second proxy %d/%d overlaps the first %d/%d",
+			b.ProxyPort(), b.DashboardPort(), a.ProxyPort(), a.DashboardPort())
+	}
+	queryOne(t, a.URL())
+	queryOne(t, b.URL())
+}
+
+// TestIntegration_SameUpstreamSharesProxy starts the same upstream twice:
+// one proxy, stopped by the last Stop.
+func TestIntegration_SameUpstreamSharesProxy(t *testing.T) {
+	upstream := withSSLDisabled(integrationEnv(t))
+	ctx := context.Background()
+	port := nextTestPort()
+
+	a, err := Start(ctx, upstream, WithProxyPort(port), WithSilent(true))
+	if err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+	b, err := Start(ctx, upstream, WithSilent(true))
+	if err != nil {
+		a.Stop(ctx)
+		t.Fatalf("Start second: %v", err)
+	}
+	if b.ProxyPort() != port {
+		a.Stop(ctx)
+		b.Stop(ctx)
+		t.Fatalf("second Start should reuse the proxy on %d, got %d", port, b.ProxyPort())
+	}
+
+	if err := a.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	queryOne(t, b.URL())
+
+	if err := b.Stop(ctx); err != nil {
+		t.Fatalf("Stop second: %v", err)
+	}
+	if !portBindable(port) {
+		t.Fatalf("port %d still held after the last Stop", port)
+	}
+}
+
+// TestIntegration_ExplicitPortBusyElsewhere holds a port outside the
+// wrapper's knowledge: the proxy refuses it and Start surfaces why.
+func TestIntegration_ExplicitPortBusyElsewhere(t *testing.T) {
+	upstream := withSSLDisabled(integrationEnv(t))
+	port := nextTestPort()
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	gl, err := Start(context.Background(), upstream, WithProxyPort(port), WithSilent(true))
+	if err == nil {
+		gl.Stop(context.Background())
+		t.Fatal("expected Start to fail on a port another process holds")
+	}
+	if !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("expected the proxy's refusal in the error, got %q", err)
+	}
+}
+
+// TestIntegration_UpstreamTLSParamsStayUpstream gives the upstream URL the
+// TLS parameters a hosted Postgres URL carries; the app's URL must not, or
+// the app's connection to the (plaintext) proxy fails.
+func TestIntegration_UpstreamTLSParamsStayUpstream(t *testing.T) {
+	base := integrationEnv(t)
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	upstream := base + sep + "sslmode=prefer&channel_binding=prefer&connect_timeout=10"
+
+	gl, err := Start(context.Background(), upstream, WithProxyPort(nextTestPort()), WithSilent(true))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer gl.Stop(context.Background())
+
+	url := gl.URL()
+	if strings.Contains(url, "sslmode=prefer") || strings.Contains(url, "channel_binding") {
+		t.Fatalf("app URL kept upstream TLS params: %s", redactPassword(url))
+	}
+	if !strings.Contains(url, "connect_timeout=10") {
+		t.Fatalf("app URL dropped a non-TLS param: %s", redactPassword(url))
+	}
+	queryOne(t, url)
 }

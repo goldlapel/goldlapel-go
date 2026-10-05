@@ -26,7 +26,7 @@ import (
 // succeeded"; Go's Start does not return driver-connect errors (PingContext
 // failure is swallowed, gl.db stays nil and URL() is still returned — see
 // openDB + spawn), so the equivalent code path in Go is the port-readiness
-// timeout branch in spawn(): cmd.Start() succeeded, waitForPortCtx returned
+// timeout branch in spawn(): cmd.Start() succeeded, waitForProxy returned
 // false, cmd.Process.Kill() must fire. The test forces that branch with a
 // fake "goldlapel" shell script that starts successfully but never binds a
 // port, then confirms the recorded child PID is no longer alive after Start
@@ -44,7 +44,7 @@ func TestSubprocessCleanupOnConnectFailure(t *testing.T) {
 	//   2. exec's sleep 300, which inherits the PID (exec replaces the
 	//      process image without forking), so the sh PID == the sleep PID
 	//      == what cmd.Process.Pid sees in spawn().
-	// It never listens on a TCP port, so waitForPortCtx will time out.
+	// It never listens on a TCP port, so waitForProxy will time out.
 	script := `#!/bin/sh
 echo $$ > ` + pidFile + `
 exec sleep 300
@@ -55,7 +55,7 @@ exec sleep 300
 
 	t.Setenv("GOLDLAPEL_BINARY", binPath)
 	// Pick a port the fake never binds — anything unlikely to be in use.
-	// waitForPortCtx uses startupTimeout (10s) unless ctx expires sooner,
+	// waitForProxy uses startupTimeout (10s) unless ctx expires sooner,
 	// so we cap the test with a short context deadline.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

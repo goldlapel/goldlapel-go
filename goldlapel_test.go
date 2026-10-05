@@ -252,7 +252,7 @@ func withClearedPGAppName(t *testing.T, fn func()) {
 func TestMakeProxyURLPostgresqlWithPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 7932)
-		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:pass@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -262,7 +262,7 @@ func TestMakeProxyURLPostgresqlWithPort(t *testing.T) {
 func TestMakeProxyURLPostgresWithPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgres://user:pass@remote.aws.com:5432/mydb", 7932)
-		want := "postgres://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgres://user:pass@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -272,7 +272,7 @@ func TestMakeProxyURLPostgresWithPort(t *testing.T) {
 func TestMakeProxyURLWithoutPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:pass@host.aws.com/mydb", 7932)
-		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:pass@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -282,7 +282,7 @@ func TestMakeProxyURLWithoutPort(t *testing.T) {
 func TestMakeProxyURLWithoutPortOrPath(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:pass@host.aws.com", 7932)
-		want := "postgresql://user:pass@localhost:7932?" + appNameSuffix()
+		want := "postgresql://user:pass@localhost:7932?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -308,8 +308,8 @@ func TestMakeProxyURLBareHost(t *testing.T) {
 
 func TestMakeProxyURLPreservesQueryParams(t *testing.T) {
 	withClearedPGAppName(t, func() {
-		got := MakeProxyURL("postgresql://user:pass@remote:5432/mydb?sslmode=require", 7932)
-		want := "postgresql://user:pass@localhost:7932/mydb?sslmode=require&" + appNameSuffix()
+		got := MakeProxyURL("postgresql://user:pass@remote:5432/mydb?connect_timeout=5&application_name=app", 7932)
+		want := "postgresql://user:pass@localhost:7932/mydb?connect_timeout=5&application_name=app&sslmode=disable"
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -319,7 +319,7 @@ func TestMakeProxyURLPreservesQueryParams(t *testing.T) {
 func TestMakeProxyURLPreservesPercentEncoded(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:p%40ss@remote:5432/mydb", 7932)
-		want := "postgresql://user:p%40ss@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:p%40ss@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -329,7 +329,7 @@ func TestMakeProxyURLPreservesPercentEncoded(t *testing.T) {
 func TestMakeProxyURLWithoutUserinfo(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://dbhost:5432/mydb", 7932)
-		want := "postgresql://localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -339,7 +339,7 @@ func TestMakeProxyURLWithoutUserinfo(t *testing.T) {
 func TestMakeProxyURLLiteralAtInPasswordWithPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb", 7932)
-		want := "postgresql://user:p@ss@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:p@ss@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -349,7 +349,7 @@ func TestMakeProxyURLLiteralAtInPasswordWithPort(t *testing.T) {
 func TestMakeProxyURLLiteralAtInPasswordWithoutPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:p@ss@host/mydb", 7932)
-		want := "postgresql://user:p@ss@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:p@ss@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -359,7 +359,7 @@ func TestMakeProxyURLLiteralAtInPasswordWithoutPort(t *testing.T) {
 func TestMakeProxyURLLiteralAtWithQueryParams(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue", 7932)
-		want := "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&" + appNameSuffix()
+		want := "postgresql://user:p@ss@localhost:7932/mydb?param=val@ue&sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -369,7 +369,7 @@ func TestMakeProxyURLLiteralAtWithQueryParams(t *testing.T) {
 func TestMakeProxyURLLocalhostStaysLocalhost(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:pass@localhost:5432/mydb", 7932)
-		want := "postgresql://user:pass@localhost:7932/mydb?" + appNameSuffix()
+		want := "postgresql://user:pass@localhost:7932/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -379,7 +379,7 @@ func TestMakeProxyURLLocalhostStaysLocalhost(t *testing.T) {
 func TestMakeProxyURLCustomPort(t *testing.T) {
 	withClearedPGAppName(t, func() {
 		got := MakeProxyURL("postgresql://user:pass@dbhost:5432/mydb", 9000)
-		want := "postgresql://user:pass@localhost:9000/mydb?" + appNameSuffix()
+		want := "postgresql://user:pass@localhost:9000/mydb?sslmode=disable&" + appNameSuffix()
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -401,7 +401,7 @@ func TestApplicationNameMarkerHasGoldlapelGoShape(t *testing.T) {
 
 func TestApplicationNameMarkerAppendedWhenNoExistingQuery(t *testing.T) {
 	withClearedPGAppName(t, func() {
-		out := MakeProxyURL("postgresql://localhost:5432/mydb", 7932)
+		out := injectApplicationName("postgresql://localhost:7932/mydb")
 		if !strings.Contains(out, "?application_name=goldlapel:go:") {
 			t.Fatalf("expected marker in: %q", out)
 		}
@@ -410,8 +410,8 @@ func TestApplicationNameMarkerAppendedWhenNoExistingQuery(t *testing.T) {
 
 func TestApplicationNameMarkerAppendedWithExistingQuery(t *testing.T) {
 	withClearedPGAppName(t, func() {
-		out := MakeProxyURL("postgresql://localhost:5432/mydb?sslmode=require", 7932)
-		if !strings.Contains(out, "sslmode=require") {
+		out := MakeProxyURL("postgresql://localhost:5432/mydb?connect_timeout=5", 7932)
+		if !strings.Contains(out, "connect_timeout=5") {
 			t.Fatalf("existing query lost: %q", out)
 		}
 		if !strings.Contains(out, "&application_name=goldlapel:go:") {
@@ -963,17 +963,15 @@ func TestWithMesh_NotInConfigKeys(t *testing.T) {
 
 func TestWithDisableProxyCache_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableProxyCache || gl.disableProxyCacheSet {
-		t.Fatalf("expected disableProxyCache=false / set=false by default; got %v / %v",
-			gl.disableProxyCache, gl.disableProxyCacheSet)
+	if gl.disableProxyCache {
+		t.Fatalf("expected disableProxyCache=false by default")
 	}
 }
 
 func TestWithDisableProxyCache_TrueSetsField(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableProxyCache(true))
-	if !gl.disableProxyCache || !gl.disableProxyCacheSet {
-		t.Fatalf("expected disableProxyCache=true / set=true; got %v / %v",
-			gl.disableProxyCache, gl.disableProxyCacheSet)
+	if !gl.disableProxyCache {
+		t.Fatalf("expected disableProxyCache=true")
 	}
 }
 
@@ -998,17 +996,15 @@ func TestWithDisableProxyCache_RejectedFromConfigMap(t *testing.T) {
 
 func TestWithDisableSqloptimize_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableSqloptimize || gl.disableSqloptimizeSet {
-		t.Fatalf("expected disableSqloptimize=false / set=false; got %v / %v",
-			gl.disableSqloptimize, gl.disableSqloptimizeSet)
+	if gl.disableSqloptimize {
+		t.Fatalf("expected disableSqloptimize=false by default")
 	}
 }
 
 func TestWithDisableSqloptimize_TrueSetsField(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableSqloptimize(true))
-	if !gl.disableSqloptimize || !gl.disableSqloptimizeSet {
-		t.Fatalf("expected disableSqloptimize=true / set=true; got %v / %v",
-			gl.disableSqloptimize, gl.disableSqloptimizeSet)
+	if !gl.disableSqloptimize {
+		t.Fatalf("expected disableSqloptimize=true")
 	}
 }
 
@@ -1031,17 +1027,15 @@ func TestWithDisableSqloptimize_RejectedFromConfigMap(t *testing.T) {
 
 func TestWithDisableAutoIndexes_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableAutoIndexes || gl.disableAutoIndexesSet {
-		t.Fatalf("expected disableAutoIndexes=false / set=false; got %v / %v",
-			gl.disableAutoIndexes, gl.disableAutoIndexesSet)
+	if gl.disableAutoIndexes {
+		t.Fatalf("expected disableAutoIndexes=false by default")
 	}
 }
 
 func TestWithDisableAutoIndexes_TrueSetsField(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableAutoIndexes(true))
-	if !gl.disableAutoIndexes || !gl.disableAutoIndexesSet {
-		t.Fatalf("expected disableAutoIndexes=true / set=true; got %v / %v",
-			gl.disableAutoIndexes, gl.disableAutoIndexesSet)
+	if !gl.disableAutoIndexes {
+		t.Fatalf("expected disableAutoIndexes=true")
 	}
 }
 
@@ -1267,21 +1261,22 @@ func TestWithSilentFalseLeavesFieldOff(t *testing.T) {
 // binary is needed.
 
 // installFakeProcess sets up the subset of *GoldLapel state that Stop
-// expects: gl.cmd is a started process and gl.done is closed by a reaper
-// goroutine that captures Wait()'s error into gl.waitErr. Returns the
-// started *exec.Cmd so tests can inspect or manipulate it.
-func installFakeProcess(t *testing.T, gl *GoldLapel, cmd *exec.Cmd) *exec.Cmd {
+// expects: gl.proc holds a started process whose done channel is closed by
+// a reaper goroutine that captures Wait()'s error into proc.waitErr.
+// Returns the proc so tests can inspect or manipulate it.
+func installFakeProcess(t *testing.T, gl *GoldLapel, cmd *exec.Cmd) *proxyProcess {
 	t.Helper()
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fake process: %v", err)
 	}
-	gl.cmd = cmd
-	gl.done = make(chan struct{})
+	proc := &proxyProcess{upstream: gl.upstream, cmd: cmd, ready: make(chan struct{}), done: make(chan struct{}), refs: 1}
+	close(proc.ready)
 	go func() {
-		gl.waitErr = cmd.Wait()
-		close(gl.done)
+		proc.waitErr = cmd.Wait()
+		close(proc.done)
 	}()
-	return cmd
+	gl.proc = proc
+	return proc
 }
 
 func TestStop_NormalShutdownReturnsNil(t *testing.T) {
@@ -1303,15 +1298,11 @@ func TestStop_SubprocessCrashedSurfacesError(t *testing.T) {
 	}
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	// Short-lived subprocess that exits non-zero — mimics a crashed proxy.
-	installFakeProcess(t, gl, exec.Command("sh", "-c", "exit 7"))
+	proc := installFakeProcess(t, gl, exec.Command("sh", "-c", "exit 7"))
 
 	// Wait for the reaper to capture the exit before calling Stop, so
 	// Stop takes the already-exited fast path and surfaces waitErr.
-	<-gl.done
-
-	// Re-arm gl.done so the non-nil check in Stop survives; the reaper
-	// already ran, so we just need a channel that's already closed.
-	// (installFakeProcess's close(gl.done) already did that — no action needed.)
+	<-proc.done
 
 	err := gl.Stop(context.Background())
 	if err == nil {
@@ -1332,37 +1323,21 @@ func TestStop_SubprocessExitedCleanlyReturnsNil(t *testing.T) {
 	}
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	// Short-lived subprocess that exits zero — graceful self-shutdown.
-	installFakeProcess(t, gl, exec.Command("sh", "-c", "true"))
+	proc := installFakeProcess(t, gl, exec.Command("sh", "-c", "true"))
 
-	<-gl.done
+	<-proc.done
 
 	if err := gl.Stop(context.Background()); err != nil {
 		t.Fatalf("expected nil from Stop after clean self-exit, got %v", err)
 	}
 }
 
-// --- Stop() guard chain (F) ---
-//
-// Simulates a mid-spawn failure where gl.cmd is set but gl.done never was
-// (reaper not yet installed — e.g. StderrPipe or cmd.Start returned an
-// error). Stop must clean up cmd and return nil, leaving the instance in
-// a valid "unstarted" state that subsequent Stops treat as a no-op.
+// --- Stop() on an unstarted handle ---
 
-func TestStop_MidSpawnFailureClearsCmd(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("sh-based fake binary is POSIX-only")
-	}
+func TestStop_UnstartedIsNoOp(t *testing.T) {
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
-
-	// Mimic spawn's state immediately after exec.Command() but before
-	// the reaper goroutine was installed — cmd set, done still nil.
-	gl.cmd = exec.Command("sh", "-c", "true")
-
 	if err := gl.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop on mid-spawn-failed instance: expected nil, got %v", err)
-	}
-	if gl.cmd != nil {
-		t.Fatalf("expected gl.cmd cleared after Stop, still set to %v", gl.cmd)
+		t.Fatalf("Stop on unstarted handle: expected nil, got %v", err)
 	}
 	// Second Stop must remain a clean no-op.
 	if err := gl.Stop(context.Background()); err != nil {

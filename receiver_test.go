@@ -775,8 +775,8 @@ func TestScopedStopIsNoop(t *testing.T) {
 
 	// Simulate a running parent: give it a non-nil done channel so we can
 	// detect whether scoped.Stop would have closed it.
-	gl.done = make(chan struct{})
-	defer close(gl.done) // cleanup after the test
+	gl.proc = &proxyProcess{done: make(chan struct{})}
+	defer close(gl.proc.done) // cleanup after the test
 
 	ctx := context.Background()
 	err := gl.InTx(ctx, db, func(scoped *GoldLapel) error {
@@ -805,7 +805,7 @@ func TestScopedStopIsNoop(t *testing.T) {
 	// Parent's done channel must still be open — scoped.Stop must not
 	// have touched it.
 	select {
-	case <-gl.done:
+	case <-gl.proc.done:
 		t.Fatal("parent done was closed by scoped Stop — parent got torn down")
 	default:
 	}
@@ -826,8 +826,8 @@ func TestScopedStop_RetainedInstanceIsNoop(t *testing.T) {
 	db := openTxDB(t)
 	gl := buildForTest("postgresql://user:pass@localhost:5432/mydb")
 	gl.db = db
-	gl.done = make(chan struct{})
-	defer close(gl.done)
+	gl.proc = &proxyProcess{done: make(chan struct{})}
+	defer close(gl.proc.done)
 
 	var captured *GoldLapel
 	ctx := context.Background()
@@ -848,7 +848,7 @@ func TestScopedStop_RetainedInstanceIsNoop(t *testing.T) {
 
 	// Parent still alive.
 	select {
-	case <-gl.done:
+	case <-gl.proc.done:
 		t.Fatal("parent done closed by retained scoped Stop")
 	default:
 	}
