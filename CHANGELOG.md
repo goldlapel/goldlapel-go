@@ -7,6 +7,29 @@ itself is versioned via git tags — there is no in-file `Version` constant.
 
 ### Breaking
 
+- **The in-process cache (L1) is gone.** The proxy's result cache now
+  serves every client the same way, so the wrapper no longer carries its
+  own. Deleted with it: `NativeCache` / `GetNativeCache` /
+  `ResetNativeCache`, `Wrap` and `CachedConn` (plus the `Querier` / `Rows`
+  / `Row` / `FieldDescription` interfaces and `ErrNoRows` that existed only
+  for it), the session-settings tracker (`ConnectionGucState`,
+  `ParseSetCommand`, `SplitStatements`, `IsUnsafeGUC`, ...), aggressive
+  post-DML verify (`AggressiveVerifyMode`), the invalidation-socket client
+  and its stats reporting, and the pool DISCARD helpers
+  (`PoolReleaseDiscarder`, `OnAfterRelease`, `AttachDiscarderTo`). Use the
+  plain `*sql.DB` from your driver (`gl.DB()` or `sql.Open(..., gl.URL())`).
+- **Removed options, no aliases:** `WithInvalidationPort`,
+  `WithDisableNativeCache`, `WithReportStats`, `WithAggressiveVerify`,
+  `WithDisableMatviews`, and the `gl.InvalidationPort()` accessor. The
+  `GOLDLAPEL_NATIVE_CACHE`, `GOLDLAPEL_NATIVE_CACHE_SIZE` and
+  `GOLDLAPEL_REPORT_STATS` env vars are no longer read. The proxy now uses
+  two ports: proxy and dashboard (proxy + 1).
+- **Removed `WithConfig` keys** for materialized views, which the proxy no
+  longer has: `refresh_interval_secs`, `pattern_ttl_secs`,
+  `max_tables_per_view`, `max_columns_per_view`, `disable_consolidation`,
+  `disable_rewrite`, `disable_shadow_mode`. `enable_coalescing` is replaced
+  by `disable_coalescing`, matching the proxy (coalescing is on by default).
+  Passing a removed key fails at `Start`.
 - **Doc-store and streams moved to nested namespaces.** Replace
   `gl.Doc<Verb>(ctx, ...)` with `gl.Documents.<Verb>(ctx, ...)` and
   `gl.Stream<Verb>(ctx, ...)` with `gl.Streams.<Verb>(ctx, ...)`. The flat

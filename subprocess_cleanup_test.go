@@ -63,10 +63,9 @@ exec sleep 300
 	gl, err := Start(ctx, "postgresql://user:pass@localhost:5432/db",
 		WithProxyPort(17739),
 		WithSilent(true),
-		// Turn off the auto-derived dashboard + invalidation sockets so the
-		// fake doesn't have to claim them either; 0 means "don't bind".
+		// Turn off the auto-derived dashboard socket so the fake doesn't
+		// have to claim it either; 0 means "don't bind".
 		WithDashboardPort(0),
-		WithInvalidationPort(0),
 	)
 	if err == nil {
 		if gl != nil {

@@ -2,7 +2,9 @@
 
 [![Tests](https://github.com/goldlapel/goldlapel-go/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-go/actions/workflows/test.yml)
 
-The Go wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns and creates materialized views + indexes automatically. Zero code changes beyond the connection string.
+The Go wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that caches query results, creates indexes from your query patterns, and keeps the cache correct as your data changes. Zero code changes beyond the connection string.
+
+The wrapper runs the proxy as a managed subprocess: it finds the bundled binary, starts it with your app and stops it on `gl.Stop`, translates options into proxy flags, generates the dashboard token, and hands back a driver-ready URL. It also provides Postgres-backed helpers — search and percolator, a document store, streams, counters, sorted sets, hashes, queues, geo, and pub/sub. Caching happens in the proxy, which serves every client the same way; the `*sql.DB` you open (or `gl.DB()`) is a plain `database/sql` pool from your driver — pgx or lib/pq.
 
 ## Install
 
@@ -52,7 +54,9 @@ func main() {
 }
 ```
 
-Point `database/sql` at `gl.URL()`. Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
+Point `database/sql` at `gl.URL()`. Gold Lapel sits between your app and your DB, caching results and creating indexes from your query patterns. Connections are tagged `application_name=goldlapel:go:<version>` so they're recognisable in `pg_stat_activity`.
+
+The proxy listens on two ports: the proxy itself (`WithProxyPort`, default 7932) and the dashboard (`WithDashboardPort`, default proxy port + 1; `0` disables it).
 
 Scoped transactions via `gl.InTx(ctx, db, fn)`, per-call `WithTx(tx)`, and the document-store / search / Redis-replacement wrapper methods are in the docs.
 
@@ -89,7 +93,7 @@ Full API reference, configuration, transactions, document store, search, upgradi
 
 ## Uninstalling
 
-Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+Before removing the package, drop Gold Lapel's helper schema and indexes from your Postgres:
 
 ```bash
 goldlapel clean
@@ -103,7 +107,7 @@ rm -rf ~/.goldlapel
 rm -f goldlapel.toml     # only if you wrote one
 ```
 
-Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and indexes go away.
 
 ## License
 

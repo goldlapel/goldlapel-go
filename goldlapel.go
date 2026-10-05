@@ -67,34 +67,28 @@ var (
 
 	// validConfigKeys enumerates the tuning knobs still accepted inside the
 	// structured `config` map. Top-level concepts (proxy_port, dashboard_port,
-	// invalidation_port, log_level, mode, license, client, config_file) are
-	// exposed via their own With* functional options and are NOT valid keys
-	// here — passing them through WithConfig raises at argv build time.
+	// log_level, mode, license, client, config_file) are exposed via their own
+	// With* functional options and are NOT valid keys here — passing them
+	// through WithConfig raises at argv build time.
 	validConfigKeys = map[string]bool{
-		"min_pattern_count": true, "refresh_interval_secs": true,
-		"pattern_ttl_secs": true, "max_tables_per_view": true, "max_columns_per_view": true,
-		"deep_pagination_threshold": true, "report_interval_secs": true,
+		"min_pattern_count": true, "deep_pagination_threshold": true, "report_interval_secs": true,
 		"proxy_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
 		"pool_size": true, "pool_timeout_secs": true, "pool_mode": true,
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
 		"tls_cert": true, "tls_key": true, "tls_client_ca": true,
-		"disable_consolidation": true, "disable_btree_indexes": true,
-		"disable_trigram_indexes": true, "disable_expression_indexes": true,
-		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
-		"disable_pool": true,
-		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
-		"enable_coalescing": true,
-		"replica":           true, "exclude_tables": true,
+		"disable_btree_indexes": true, "disable_trigram_indexes": true,
+		"disable_expression_indexes": true, "disable_partial_indexes": true,
+		"disable_rewrite_prepared_cache": true, "disable_pool": true,
+		"disable_n1": true, "disable_n1_cross_connection": true, "disable_coalescing": true,
+		"replica": true, "exclude_tables": true,
 	}
 
 	booleanKeys = map[string]bool{
-		"disable_consolidation": true, "disable_btree_indexes": true,
-		"disable_trigram_indexes": true, "disable_expression_indexes": true,
-		"disable_partial_indexes": true, "disable_rewrite": true, "disable_rewrite_prepared_cache": true,
-		"disable_pool": true,
-		"disable_n1": true, "disable_n1_cross_connection": true, "disable_shadow_mode": true,
-		"enable_coalescing": true,
+		"disable_btree_indexes": true, "disable_trigram_indexes": true,
+		"disable_expression_indexes": true, "disable_partial_indexes": true,
+		"disable_rewrite_prepared_cache": true, "disable_pool": true,
+		"disable_n1": true, "disable_n1_cross_connection": true, "disable_coalescing": true,
 	}
 
 	listKeys = map[string]bool{
@@ -194,15 +188,6 @@ func WithDashboardPort(port int) Option {
 	})
 }
 
-// WithInvalidationPort sets the cache-invalidation listen port. When unset,
-// the port is derived as proxy_port + 2. Construction-time only.
-func WithInvalidationPort(port int) Option {
-	return startOnly(func(gl *GoldLapel) {
-		gl.invalidationPort = port
-		gl.invalidationPortSet = true
-	})
-}
-
 // WithLogLevel sets the proxy log level. Accepted values:
 // "trace", "debug", "info", "warn"/"warning", "error". Only trace/debug/info
 // produce additional output; warn/error are the binary's default level and
@@ -265,23 +250,6 @@ func WithSilent(silent bool) Option {
 	})
 }
 
-// WithReportStats toggles native-cache telemetry emission to the proxy. When true
-// (the default), the wrapper's local cache emits state-change events
-// (wrapper_connected, wrapper_disconnected, cache_full, cache_recovered)
-// and replies to ?:snapshot requests on the existing invalidation socket
-// — single-digit lines per minute under stable load. When false, every
-// emission path is a no-op; the cache continues to function (invalidation
-// continues to deliver write notifications), only telemetry output is
-// suppressed.
-//
-// Equivalent env var: GOLDLAPEL_REPORT_STATS=false. Construction-time only.
-func WithReportStats(enabled bool) Option {
-	return startOnly(func(gl *GoldLapel) {
-		gl.reportStats = enabled
-		gl.reportStatsSet = true
-	})
-}
-
 // WithMesh opts the proxy into the mesh at startup. HQ enforces the license:
 // if the current plan doesn't cover mesh, the proxy continues running normally
 // without clustering (concierge, not bouncer) — Start does not fail.
@@ -304,28 +272,7 @@ func WithMeshTag(tag string) Option {
 	})
 }
 
-// WithDisableNativeCache disables the wrapper's per-process native
-// cache without touching its tuned size. When true, NativeCache.Get
-// always misses (ticking the misses counter) and NativeCache.Put is a
-// silent no-op; hits and evictions stay at zero. The invalidation
-// goroutine continues to run so telemetry signal flow
-// (wrapper_connected, snapshot replies) keeps working — Manor and the
-// dashboard still see the wrapper even when the native cache is off.
-// Default (option omitted): false.
-//
-// Orthogonal to WithConfig("proxy_cache_size", 0): customers who want
-// to toggle the native cache off/on without losing their tuned cache
-// size should use this option. Construction-time only.
-func WithDisableNativeCache(disable bool) Option {
-	return startOnly(func(gl *GoldLapel) {
-		gl.disableNativeCache = disable
-		gl.disableNativeCacheSet = true
-	})
-}
-
-// WithDisableProxyCache turns off the proxy's shared proxy-cache layer
-// (the upstream-side cache that lives in the binary, distinct from the
-// wrapper's native cache). When true, the proxy emits --disable-proxy-cache
+// WithDisableProxyCache turns off the proxy's result cache. When true, the proxy emits --disable-proxy-cache
 // so cache-eligible queries are passed straight through to Postgres.
 // Default (option omitted): proxy decides (today: enabled). Construction-time only.
 //
@@ -335,22 +282,6 @@ func WithDisableProxyCache(disable bool) Option {
 	return startOnly(func(gl *GoldLapel) {
 		gl.disableProxyCache = disable
 		gl.disableProxyCacheSet = true
-	})
-}
-
-// WithDisableMatviews turns off the proxy's automatic materialised-view
-// rewrite layer. When true, the proxy emits --disable-matviews so no
-// materialised views are auto-created and existing rewrites do not fire.
-// Useful for low-write-pressure workloads where the matview maintenance
-// cost outweighs the read speedup. Default (option omitted): proxy
-// decides (today: enabled). Construction-time only.
-//
-// Equivalent CLI flag: --disable-matviews.
-// Equivalent env var: GOLDLAPEL_DISABLE_MATVIEWS.
-func WithDisableMatviews(disable bool) Option {
-	return startOnly(func(gl *GoldLapel) {
-		gl.disableMatviews = disable
-		gl.disableMatviewsSet = true
 	})
 }
 
@@ -386,9 +317,9 @@ func WithDisableAutoIndexes(disable bool) Option {
 
 // WithConfig passes structured configuration as CLI flags to the binary.
 // Keys are snake_case strings mapping to CLI flags (e.g. "pool_size" → "--pool-size").
-// Top-level concepts (proxy_port, dashboard_port, invalidation_port,
-// log_level, mode, license, client, config_file) must use their own
-// WithX option and are rejected from this map at Start time.
+// Top-level concepts (proxy_port, dashboard_port, log_level, mode, license,
+// client, config_file) must use their own WithX option and are rejected
+// from this map at Start time.
 // Construction-time only.
 func WithConfig(config map[string]interface{}) Option {
 	return startOnly(func(gl *GoldLapel) {
@@ -512,34 +443,28 @@ func ConfigKeys() []string {
 // (document store, search, pub/sub, queues, etc.) bound to a database/sql
 // connection pointed at the proxy.
 type GoldLapel struct {
-	upstream            string
-	proxyPort           int
-	dashboardPort       int
-	dashboardPortSet    bool // true once WithDashboardPort has overridden the derivation
-	invalidationPort    int
-	invalidationPortSet bool // true once WithInvalidationPort has overridden the derivation
-	logLevel            string
-	mode                string
-	license             string
-	client              string
-	configFile          string
-	config              map[string]interface{}
-	extraArgs           []string
-	cmd                 *exec.Cmd
-	proxyURL            string
-	stderr              string
-	done                chan struct{} // closed when process exits
-	waitErr             error         // set by spawn's reaper goroutine before closing done
-	weSignaled          bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
-	db                  *sql.DB
-	tx                  *sql.Tx // non-nil only for GoldLapel instances returned by InTx
-	silent              bool    // when true, printBanner is a no-op
-	mesh                bool    // startup mesh intent (emits --mesh)
-	meshTag             string  // optional mesh tag (emits --mesh-tag <tag>)
-	reportStats         bool    // native-cache telemetry emission switch (env GOLDLAPEL_REPORT_STATS=false to disable)
-	reportStatsSet      bool    // true once WithReportStats was applied; otherwise the env var wins
-	disableNativeCache          bool // when true, the wrapper's NativeCache acts as a no-op pass-through
-	disableNativeCacheSet       bool // true once WithDisableNativeCache was applied, so we know to push the value down to the cache singleton
+	upstream         string
+	proxyPort        int
+	dashboardPort    int
+	dashboardPortSet bool // true once WithDashboardPort has overridden the derivation
+	logLevel         string
+	mode             string
+	license          string
+	client           string
+	configFile       string
+	config           map[string]interface{}
+	extraArgs        []string
+	cmd              *exec.Cmd
+	proxyURL         string
+	stderr           string
+	done             chan struct{} // closed when process exits
+	waitErr          error         // set by spawn's reaper goroutine before closing done
+	weSignaled       bool          // set by Stop before issuing SIGTERM/Kill, so Stop can filter the resulting ExitError
+	db               *sql.DB
+	tx               *sql.Tx // non-nil only for GoldLapel instances returned by InTx
+	silent           bool    // when true, printBanner is a no-op
+	mesh             bool    // startup mesh intent (emits --mesh)
+	meshTag          string  // optional mesh tag (emits --mesh-tag <tag>)
 	// Proxy-side disable flags promoted out of the structured config map (Wave 3
 	// of the canonical surface). Each pairs with an *Set sentinel so spawn()
 	// can distinguish "user explicitly opted out" from "user left it alone";
@@ -547,21 +472,12 @@ type GoldLapel struct {
 	// honour its own defaults / env-var fallbacks.
 	disableProxyCache     bool
 	disableProxyCacheSet  bool
-	disableMatviews       bool
-	disableMatviewsSet    bool
 	disableSqloptimize    bool
 	disableSqloptimizeSet bool
 	disableAutoIndexes    bool
 	disableAutoIndexesSet bool
 
-	// Aggressive-verify mode (smart-auto-enable for the trigger-
-	// internal-SET coverage gap). Default is AggressiveVerifyAuto;
-	// WithAggressiveVerify(On/Off) overrides via the Set sentinel.
-	// See aggressive_verify.go for the full design.
-	aggressiveVerify    AggressiveVerifyMode
-	aggressiveVerifySet bool
-
-	mu                  sync.Mutex
+	mu sync.Mutex
 	// DDL API state — see ddl.go.
 	dashboardToken string    // provisioned on spawn; cleared on Stop
 	ddlCache       *sync.Map // per-instance cache keyed on "family:name" → *DdlEntry; shared with InTx scoped instances
@@ -605,7 +521,7 @@ func (gl *GoldLapel) attachNamespaces() {
 // defer gl.Stop(ctx).
 //
 // Options may include construction-time settings (WithProxyPort, WithLogLevel,
-// WithConfig, WithExtraArgs, WithDashboardPort, WithInvalidationPort, ...).
+// WithConfig, WithExtraArgs, WithDashboardPort, ...).
 func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, error) {
 	gl := &GoldLapel{
 		upstream:  upstream,
@@ -615,38 +531,18 @@ func Start(ctx context.Context, upstream string, opts ...Option) (*GoldLapel, er
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
-	// Dashboard and invalidation ports default to proxy port + 1 / + 2
-	// (matches what the Rust binary binds when no --dashboard-port /
-	// --invalidation-port is passed). WithDashboardPort / WithInvalidationPort
-	// set the `*Set` flag to signal an explicit override — those values are
-	// then emitted verbatim at spawn time, including 0 which disables the
+	// The dashboard port defaults to proxy port + 1 (matches what the Rust
+	// binary binds when no --dashboard-port is passed). WithDashboardPort sets
+	// dashboardPortSet to signal an explicit override — that value is then
+	// emitted verbatim at spawn time, including 0 which disables the
 	// dashboard entirely.
 	if !gl.dashboardPortSet {
 		gl.dashboardPort = gl.proxyPort + 1
-	}
-	if !gl.invalidationPortSet {
-		gl.invalidationPort = gl.proxyPort + 2
 	}
 
 	if err := gl.spawn(ctx); err != nil {
 		return nil, err
 	}
-	// Push the WithReportStats override down to the singleton cache so a
-	// subsequent Wrap() call emits (or stays silent) per the user's
-	// preference. We only stamp the cache when the option was explicitly
-	// passed — otherwise the cache's own GOLDLAPEL_REPORT_STATS env-var
-	// default takes effect at construction time.
-	if gl.reportStatsSet {
-		GetNativeCache().SetReportStats(gl.reportStats)
-	}
-	// Push WithDisableNativeCache down to the singleton cache so any
-	// subsequent Wrap() call observes the no-op pass-through behaviour.
-	// Same pattern as reportStats — only stamp when explicitly set so
-	// the cache's default (false) stands when the option wasn't passed.
-	if gl.disableNativeCacheSet {
-		GetNativeCache().SetDisableNativeCache(gl.disableNativeCache)
-	}
-	registerStartedInstance(gl)
 	return gl, nil
 }
 
@@ -672,9 +568,6 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	// hasn't set it, so the binary applies its own defaults.
 	if gl.dashboardPortSet {
 		args = append(args, "--dashboard-port", fmt.Sprintf("%d", gl.dashboardPort))
-	}
-	if gl.invalidationPortSet {
-		args = append(args, "--invalidation-port", fmt.Sprintf("%d", gl.invalidationPort))
 	}
 	if gl.logLevel != "" {
 		flag, err := LogLevelToVerboseFlag(gl.logLevel)
@@ -711,9 +604,6 @@ func (gl *GoldLapel) spawn(ctx context.Context) error {
 	// (e.g. surfacing "user explicitly left it on" to telemetry).
 	if gl.disableProxyCache {
 		args = append(args, "--disable-proxy-cache")
-	}
-	if gl.disableMatviews {
-		args = append(args, "--disable-matviews")
 	}
 	if gl.disableSqloptimize {
 		args = append(args, "--disable-sqloptimize")
@@ -998,14 +888,6 @@ func (gl *GoldLapel) ProxyPort() int {
 	return gl.proxyPort
 }
 
-// InvalidationPort returns the cache-invalidation port (proxy port + 2 by
-// default, overridden via WithInvalidationPort).
-func (gl *GoldLapel) InvalidationPort() int {
-	gl.mu.Lock()
-	defer gl.mu.Unlock()
-	return gl.invalidationPort
-}
-
 // Running reports whether the proxy process is still alive.
 func (gl *GoldLapel) Running() bool {
 	gl.mu.Lock()
@@ -1160,15 +1042,14 @@ func (gl *GoldLapel) InTx(ctx context.Context, db *sql.DB, fn func(*GoldLapel) e
 	// racing against Stop/Start.
 	gl.mu.Lock()
 	scoped := &GoldLapel{
-		upstream:         gl.upstream,
-		proxyPort:        gl.proxyPort,
-		dashboardPort:    gl.dashboardPort,
-		invalidationPort: gl.invalidationPort,
-		cmd:              gl.cmd,
-		proxyURL:         gl.proxyURL,
-		done:             gl.done,
-		db:               gl.db,
-		tx:               tx,
+		upstream:      gl.upstream,
+		proxyPort:     gl.proxyPort,
+		dashboardPort: gl.dashboardPort,
+		cmd:           gl.cmd,
+		proxyURL:      gl.proxyURL,
+		done:          gl.done,
+		db:            gl.db,
+		tx:            tx,
 		// Inherit the dashboard token so DDL fetches inside the tx work
 		// the same as on the parent — without this, gl.Documents.Insert
 		// inside InTx would fall back to env/file lookup.
@@ -1352,8 +1233,8 @@ func WrapperVersion() string {
 }
 
 // ApplicationNameMarker returns the application_name string the wrapper sets
-// on PG connections so the proxy can classify wrapper-vs-raw traffic and
-// gate the proxy cache (the wrapper has its own native cache; raw clients don't).
+// on PG connections so they're recognisable in pg_stat_activity. The proxy
+// doesn't treat them differently — its cache serves every client the same way.
 func ApplicationNameMarker() string {
 	return "goldlapel:go:" + WrapperVersion()
 }

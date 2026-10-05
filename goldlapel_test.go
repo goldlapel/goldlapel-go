@@ -225,9 +225,9 @@ func TestFindBinaryNotFoundError(t *testing.T) {
 // --- MakeProxyURL tests ---
 //
 // The wrapper appends `application_name=goldlapel:go:<version>` to every
-// rewritten URL so the proxy can classify wrapper-vs-raw traffic and skip
-// L2 result cache for wrappers (they have their own L1). PGAPPNAME is
-// cleared in each test so the marker is applied deterministically.
+// rewritten URL so the connections are recognisable in pg_stat_activity
+// (the proxy caches them like any other client). PGAPPNAME is cleared in
+// each test so the marker is applied deterministically.
 
 // appNameSuffix returns the query fragment the wrapper appends to every URL.
 func appNameSuffix() string {
@@ -388,9 +388,8 @@ func TestMakeProxyURLCustomPort(t *testing.T) {
 
 // --- ApplicationNameMarker tests ---
 //
-// L2-router architecture: wrappers identify themselves to the proxy via PG
-// `application_name` so the proxy can gate L2 result cache (wrappers have
-// L1; raw clients don't).
+// Wrappers tag their connections via PG `application_name` so they're
+// recognisable in pg_stat_activity; the proxy doesn't treat them differently.
 
 func TestApplicationNameMarkerHasGoldlapelGoShape(t *testing.T) {
 	m := ApplicationNameMarker()
@@ -485,13 +484,10 @@ func buildForTest(upstream string, opts ...Option) *GoldLapel {
 	for _, opt := range opts {
 		opt.applyStart(gl)
 	}
-	// Mirrors Start: default dashboard / invalidation ports derive from
-	// proxyPort unless WithDashboardPort / WithInvalidationPort set them.
+	// Mirrors Start: the dashboard port derives from proxyPort unless
+	// WithDashboardPort sets it.
 	if !gl.dashboardPortSet {
 		gl.dashboardPort = gl.proxyPort + 1
-	}
-	if !gl.invalidationPortSet {
-		gl.invalidationPort = gl.proxyPort + 2
 	}
 	return gl
 }
@@ -794,10 +790,10 @@ func TestConfigKeys_ContainsKnownKeys(t *testing.T) {
 	for _, k := range keys {
 		keySet[k] = true
 	}
-	// Tuning knobs still live in the structured config map. (disable_matviews
-	// and disable_proxy_cache used to be here but have been promoted to
-	// top-level WithDisable* options as part of Wave 3 of the canonical
-	// surface; disable_pool stays since there's no top-level wrapper for it.)
+	// Tuning knobs still live in the structured config map. (disable_proxy_cache
+	// used to be here but has been promoted to a top-level WithDisable* option
+	// as part of Wave 3 of the canonical surface; disable_pool stays since
+	// there's no top-level wrapper for it.)
 	for _, expected := range []string{"pool_size", "disable_pool", "replica"} {
 		if !keySet[expected] {
 			t.Fatalf("expected ConfigKeys() to contain %q", expected)
@@ -805,7 +801,7 @@ func TestConfigKeys_ContainsKnownKeys(t *testing.T) {
 	}
 	// Top-level concepts must NOT appear — passing them through the config
 	// map is a user error.
-	for _, promoted := range []string{"mode", "log_level", "dashboard_port", "invalidation_port", "config", "license", "client"} {
+	for _, promoted := range []string{"mode", "log_level", "dashboard_port", "config", "license", "client"} {
 		if keySet[promoted] {
 			t.Fatalf("ConfigKeys() unexpectedly contains promoted top-level key %q", promoted)
 		}
@@ -876,23 +872,6 @@ func TestExplicitDashboardPortOverridesDerivation(t *testing.T) {
 	)
 	if gl.dashboardPort != 9999 {
 		t.Fatalf("expected explicit dashboard port 9999, got %d", gl.dashboardPort)
-	}
-}
-
-func TestInvalidationPortDerivesFromCustomProxyPort(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithProxyPort(17932))
-	if gl.invalidationPort != 17934 {
-		t.Fatalf("expected invalidation port 17934 (proxy+2), got %d", gl.invalidationPort)
-	}
-}
-
-func TestExplicitInvalidationPortOverridesDerivation(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb",
-		WithProxyPort(17932),
-		WithInvalidationPort(9999),
-	)
-	if gl.invalidationPort != 9999 {
-		t.Fatalf("expected explicit invalidation port 9999, got %d", gl.invalidationPort)
 	}
 }
 
@@ -973,15 +952,14 @@ func TestWithMesh_NotInConfigKeys(t *testing.T) {
 	}
 }
 
-// --- WithDisableProxyCache / WithDisableMatviews / WithDisableSqloptimize / WithDisableAutoIndexes ---
+// --- WithDisableProxyCache / WithDisableSqloptimize / WithDisableAutoIndexes ---
 //
 // Each of these promotes a previously-config-map disable flag to a
 // top-level functional option, mapping 1:1 to the proxy CLI flag
-// (--disable-proxy-cache, --disable-matviews, --disable-sqloptimize,
-// --disable-auto-indexes). The structured config map no longer accepts
-// "disable_proxy_cache" / "disable_matviews" — they're handled at the
-// option layer, with sqloptimize and auto-indexes wired in for the first
-// time as part of the Wave 3 surface promotion.
+// (--disable-proxy-cache, --disable-sqloptimize, --disable-auto-indexes).
+// The structured config map no longer accepts "disable_proxy_cache" — it's
+// handled at the option layer, with sqloptimize and auto-indexes wired in
+// for the first time as part of the Wave 3 surface promotion.
 
 func TestWithDisableProxyCache_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
@@ -1018,36 +996,6 @@ func TestWithDisableProxyCache_RejectedFromConfigMap(t *testing.T) {
 	}
 }
 
-func TestWithDisableMatviews_Default(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableMatviews || gl.disableMatviewsSet {
-		t.Fatalf("expected disableMatviews=false / set=false; got %v / %v",
-			gl.disableMatviews, gl.disableMatviewsSet)
-	}
-}
-
-func TestWithDisableMatviews_TrueSetsField(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableMatviews(true))
-	if !gl.disableMatviews || !gl.disableMatviewsSet {
-		t.Fatalf("expected disableMatviews=true / set=true; got %v / %v",
-			gl.disableMatviews, gl.disableMatviewsSet)
-	}
-}
-
-func TestWithDisableMatviews_NotInConfigKeys(t *testing.T) {
-	for _, k := range ConfigKeys() {
-		if k == "disable_matviews" {
-			t.Fatalf("disable_matviews must not appear in ConfigKeys(); got %q", k)
-		}
-	}
-}
-
-func TestWithDisableMatviews_RejectedFromConfigMap(t *testing.T) {
-	if _, err := ConfigToArgs(map[string]interface{}{"disable_matviews": true}); err == nil {
-		t.Fatal("expected ConfigToArgs to reject disable_matviews")
-	}
-}
-
 func TestWithDisableSqloptimize_Default(t *testing.T) {
 	gl := buildForTest("postgresql://localhost:5432/mydb")
 	if gl.disableSqloptimize || gl.disableSqloptimizeSet {
@@ -1075,7 +1023,7 @@ func TestWithDisableSqloptimize_NotInConfigKeys(t *testing.T) {
 func TestWithDisableSqloptimize_RejectedFromConfigMap(t *testing.T) {
 	// disable_sqloptimize is a top-level option (not in validConfigKeys), so
 	// passing it through WithConfig must error at argv build time. Mirrors
-	// the matviews / proxy_cache rejection tests — atomic break, no aliases.
+	// the proxy_cache rejection test — atomic break, no aliases.
 	if _, err := ConfigToArgs(map[string]interface{}{"disable_sqloptimize": true}); err == nil {
 		t.Fatal("expected ConfigToArgs to reject disable_sqloptimize")
 	}
@@ -1108,54 +1056,26 @@ func TestWithDisableAutoIndexes_NotInConfigKeys(t *testing.T) {
 func TestWithDisableAutoIndexes_RejectedFromConfigMap(t *testing.T) {
 	// disable_auto_indexes is a top-level option (not in validConfigKeys), so
 	// passing it through WithConfig must error at argv build time. Mirrors
-	// the matviews / proxy_cache rejection tests — atomic break, no aliases.
+	// the proxy_cache rejection test — atomic break, no aliases.
 	if _, err := ConfigToArgs(map[string]interface{}{"disable_auto_indexes": true}); err == nil {
 		t.Fatal("expected ConfigToArgs to reject disable_auto_indexes")
 	}
 }
 
-// --- WithDisableNativeCache ---
+// --- Removed options ---
 
-func TestWithDisableNativeCache_Default(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb")
-	if gl.disableNativeCache {
-		t.Fatal("expected disableNativeCache=false by default")
-	}
-	if gl.disableNativeCacheSet {
-		t.Fatal("expected disableNativeCacheSet=false when option not provided")
-	}
-}
-
-func TestWithDisableNativeCache_TrueSetsField(t *testing.T) {
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableNativeCache(true))
-	if !gl.disableNativeCache {
-		t.Fatal("expected disableNativeCache=true")
-	}
-	if !gl.disableNativeCacheSet {
-		t.Fatal("expected disableNativeCacheSet=true after WithDisableNativeCache")
-	}
-}
-
-func TestWithDisableNativeCache_FalseStillStampsCache(t *testing.T) {
-	// Explicit WithDisableNativeCache(false) must mark disableNativeCacheSet so
-	// Start pushes the value down to the cache (re-enabling the native cache if
-	// a previous run had disabled it on the singleton).
-	gl := buildForTest("postgresql://localhost:5432/mydb", WithDisableNativeCache(false))
-	if gl.disableNativeCache {
-		t.Fatal("expected disableNativeCache=false")
-	}
-	if !gl.disableNativeCacheSet {
-		t.Fatal("expected disableNativeCacheSet=true even with explicit WithDisableNativeCache(false)")
-	}
-}
-
-func TestWithDisableNativeCache_NotInConfigKeys(t *testing.T) {
-	// disable_native_cache is a top-level option, not a tuning knob in the
-	// structured config map (mirroring WithSilent/WithMesh/etc.).
-	keys := ConfigKeys()
-	for _, k := range keys {
-		if k == "disable_native_cache" {
-			t.Fatalf("disable_native_cache must not appear in ConfigKeys(); got %q", k)
+func TestConfigToArgs_RejectsRemovedKeys(t *testing.T) {
+	// The wrappers' in-process cache and the proxy's materialized views are
+	// gone, along with their knobs. Atomic break, no aliases: a stale caller
+	// passing any of them through WithConfig fails loudly at argv build time.
+	for _, key := range []string{
+		"invalidation_port", "native_cache_size", "disable_native_cache",
+		"disable_matviews", "disable_consolidation", "disable_rewrite",
+		"disable_shadow_mode", "refresh_interval_secs", "pattern_ttl_secs",
+		"max_tables_per_view", "max_columns_per_view", "enable_coalescing",
+	} {
+		if _, err := ConfigToArgs(map[string]interface{}{key: 1}); err == nil {
+			t.Fatalf("expected ConfigToArgs to reject removed key %q", key)
 		}
 	}
 }
@@ -1208,19 +1128,6 @@ func TestStart_ErrorsOnDashboardPortInConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "dashboard_port") {
 		t.Fatalf("expected error to mention dashboard_port, got %q", err.Error())
-	}
-}
-
-func TestStart_ErrorsOnInvalidationPortInConfigMap(t *testing.T) {
-	// Regression guard: invalidation_port was promoted to a top-level option.
-	// Passing it via WithConfig must fail at argv build time.
-	_, err := Start(context.Background(), "postgresql://localhost:5432/mydb",
-		WithConfig(map[string]interface{}{"invalidation_port": 9090}))
-	if err == nil {
-		t.Fatal("expected Start to error when invalidation_port is passed via WithConfig")
-	}
-	if !strings.Contains(err.Error(), "invalidation_port") {
-		t.Fatalf("expected error to mention invalidation_port, got %q", err.Error())
 	}
 }
 

@@ -42,7 +42,6 @@ exec sleep 60
 		WithProxyPort(port),
 		WithSilent(true),
 		WithDashboardPort(0),
-		WithInvalidationPort(0),
 	}, opts...)
 
 	gl, err := Start(ctx, "postgresql://user:pass@localhost:5432/db", combined...)
@@ -94,22 +93,6 @@ func TestSpawnArgv_DisableProxyCache_FalseOmitted(t *testing.T) {
 	}
 }
 
-// --- WithDisableMatviews argv emission ---
-
-func TestSpawnArgv_DisableMatviews(t *testing.T) {
-	args := fakeBinaryArgvCapture(t, 17745, WithDisableMatviews(true))
-	if !containsArg(args, "--disable-matviews") {
-		t.Fatalf("expected --disable-matviews in spawned argv, got %v", args)
-	}
-}
-
-func TestSpawnArgv_DisableMatviews_DefaultOmitted(t *testing.T) {
-	args := fakeBinaryArgvCapture(t, 17746)
-	if containsArg(args, "--disable-matviews") {
-		t.Fatalf("did not expect --disable-matviews without WithDisableMatviews(true), got %v", args)
-	}
-}
-
 // --- WithDisableSqloptimize argv emission ---
 
 func TestSpawnArgv_DisableSqloptimize(t *testing.T) {
@@ -144,16 +127,14 @@ func TestSpawnArgv_DisableAutoIndexes_DefaultOmitted(t *testing.T) {
 
 // --- Combined: multiple disable options stack ---
 
-func TestSpawnArgv_AllFourDisableOptionsTogether(t *testing.T) {
+func TestSpawnArgv_AllThreeDisableOptionsTogether(t *testing.T) {
 	args := fakeBinaryArgvCapture(t, 17751,
 		WithDisableProxyCache(true),
-		WithDisableMatviews(true),
 		WithDisableSqloptimize(true),
 		WithDisableAutoIndexes(true),
 	)
 	for _, want := range []string{
 		"--disable-proxy-cache",
-		"--disable-matviews",
 		"--disable-sqloptimize",
 		"--disable-auto-indexes",
 	} {
@@ -163,19 +144,28 @@ func TestSpawnArgv_AllFourDisableOptionsTogether(t *testing.T) {
 	}
 }
 
-// --- Negative: the dropped option must not exist anywhere on the argv ---
+// --- Negative: dropped flags must not exist anywhere on the argv ---
 
-func TestSpawnArgv_NoEnableProxyCacheForWrappersFlagEverEmitted(t *testing.T) {
-	// Defensive: the previous --enable-proxy-cache-for-wrappers flag was
-	// removed in the Model B pivot. Confirm it never lands in argv even
-	// when every other surface option is exercised. (No WithEnableProxyCacheForWrappers
-	// option exists; this test guards against a future re-introduction
-	// via the structured config map.)
+func TestSpawnArgv_NoRemovedFlagsEverEmitted(t *testing.T) {
+	// Defensive: --enable-proxy-cache-for-wrappers went in the Model B
+	// pivot; --invalidation-port, --native-cache-size and --disable-matviews
+	// went with the wrappers' in-process cache and the proxy's materialized
+	// views. Confirm none lands in argv even when every other surface option
+	// is exercised.
 	args := fakeBinaryArgvCapture(t, 17752,
 		WithDisableProxyCache(true),
-		WithDisableMatviews(true),
+		WithDisableSqloptimize(true),
+		WithDisableAutoIndexes(true),
+		WithDashboardPort(17753),
 	)
-	if containsArg(args, "--enable-proxy-cache-for-wrappers") {
-		t.Fatalf("--enable-proxy-cache-for-wrappers must not be emitted; got %v", args)
+	for _, flag := range []string{
+		"--enable-proxy-cache-for-wrappers",
+		"--invalidation-port",
+		"--native-cache-size",
+		"--disable-matviews",
+	} {
+		if containsArg(args, flag) {
+			t.Fatalf("%s must not be emitted; got %v", flag, args)
+		}
 	}
 }

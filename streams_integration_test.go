@@ -24,11 +24,7 @@ func startForStreams(t *testing.T) *GoldLapel {
 	port := nextTestPort()
 	gl, err := Start(ctx, upstream,
 		WithProxyPort(port),
-		WithInvalidationPort(0),
 		WithDisableProxyCache(true),
-		WithConfig(map[string]interface{}{
-			"disable_consolidation": true,
-		}),
 	)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
