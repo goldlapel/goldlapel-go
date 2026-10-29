@@ -89,7 +89,7 @@ var (
 	// through WithConfig raises at argv build time.
 	validConfigKeys = map[string]bool{
 		"min_pattern_count": true, "deep_pagination_threshold": true, "report_interval_secs": true,
-		"proxy_cache_size": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
+		"proxy_cache_size": true, "proxy_cache_max_bytes": true, "proxy_cache_max_entry_bytes": true, "batch_cache_size": true, "batch_cache_ttl_secs": true,
 		"pool_size": true, "pool_timeout_secs": true, "pool_mode": true,
 		"mgmt_idle_timeout": true, "fallback": true, "read_after_write_secs": true,
 		"n1_threshold": true, "n1_window_ms": true, "n1_cross_threshold": true,
